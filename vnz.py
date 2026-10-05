@@ -11,6 +11,7 @@ import pickle
 import redis
 import re
 import gc
+import math
 import random
 from decimal import Decimal, ROUND_DOWN
 from urllib.parse import urlparse
@@ -40,7 +41,7 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-logger = logging.getLogger('CryptoBotV9.9.0')
+logger = logging.getLogger('CryptoBotV9.9.1')
 
 # زمن إقلاع العملية لحساب مدة التشغيل في لوحة التحكم
 BOOT_TIME = time.time()
@@ -130,12 +131,17 @@ USE_SHORT_TERM_MOMENTUM_FILTER: bool = config('USE_SHORT_TERM_MOMENTUM_FILTER', 
 # مدة تخزين نتيجة تأكيد الترند لكل عملة (بالثواني) لتقليل استهلاك API
 HTF_CONFIRMATION_CACHE_TTL: int = config('HTF_CONFIRMATION_CACHE_TTL', default=900, cast=int)
 
-# --- [تحسين V9.9] إعدادات حماية الحظر من Binance (خطأ -1003) ---
-# حد Binance الرسمي هو 6000 وزن/دقيقة لكل IP. نستخدم ميزانية متحفظة (افتراضي 2400)
-# لتجنب الاقتراب من الحظر مع الحفاظ على سلاسة التشغيل
-RATE_LIMIT_BUDGET_PER_MIN: int = config('RATE_LIMIT_BUDGET_PER_MIN', default=2400, cast=int)
+# --- [تحسين V9.9.1] إعدادات حماية الحظر من Binance (خطأ -1003) ---
+# حد Binance الرسمي 6000 وزن/دقيقة لكل IP — وعلى Render المجاني الـ IP مشترك مع خدمات أخرى،
+# لذا الميزانية الافتراضية متحفظة (1500) وتنخفض تلقائيًا 40% عند كل حظر ثم تتعافى تدريجيًا
+RATE_LIMIT_BUDGET_PER_MIN: int = config('RATE_LIMIT_BUDGET_PER_MIN', default=1500, cast=int)
 # الفاصل الأدنى بالثواني بين أي طلبين REST متتاليين
-API_MIN_SPACING_SEC: float = config('API_MIN_SPACING_SEC', default=0.08, cast=float)
+API_MIN_SPACING_SEC: float = config('API_MIN_SPACING_SEC', default=0.15, cast=float)
+# تبريد إضافي (ثوانٍ) بعد انتهاء الحظر قبل استئناف الطلبات — يمنع انفجار الخيوط
+# فور انتهاء الحظر (Thundering Herd) الذي كان يسبب التصعيد 30 ثانية → 16 دقيقة
+BAN_RESUME_COOLDOWN_SEC: int = config('BAN_RESUME_COOLDOWN_SEC', default=90, cast=int)
+# بعد الاستئناف: الفاصل الأدنى يتضاعف ×4 لمدة (ثوانٍ) ثم يعود تدريجيًا للطبيعي
+BAN_RESUME_RAMP_SEC: int = config('BAN_RESUME_RAMP_SEC', default=120, cast=int)
 # فاصل تحديث أسعار Redis بالثواني (كل طلب أسعار شامل وزنه 4)
 PRICE_UPDATE_INTERVAL_SEC: int = config('PRICE_UPDATE_INTERVAL_SEC', default=3, cast=int)
 
@@ -216,11 +222,20 @@ atr_trailing_lock = Lock()
 # الحل: حارس وزن يمنع تجاوز الحد أصلًا + انتظار ذكي بدل الانهيار.
 # ============================================================
 class BinanceRateGuard:
-    """حارس وزن الطلبات: يتتبع وزن الطلبات في نافذة دقيقة منزلقة (حد Binance = 6000/دقيقة)
-    ويوقف الطلبات تلقائيًا عند اقتراب الميزانية، مع كشف الحظر وتسجيل موعد انتهائه."""
-    def __init__(self, budget_per_min: int = 2400, min_spacing: float = 0.08):
-        self.budget = max(500, int(budget_per_min))
+    """حارس وزن الطلبات V9.9.1: نافذة دقيقة منزلقة (حد Binance = 6000/دقيقة) + ميزانية تكيفية.
+    دروس تصعيد الحظر (30 ثانية → 16 دقيقة) التي عولجت هنا:
+    1) محاسبة وزن الشموع الخاطئة (طلب واحد = عدة طلبات داخلية) → مقدّر وزن دقيق في safe_get_klines
+    2) انفجار الخيوط فور انتهاء الحظر Thundering Herd → تبريد استئناف + تدرج في الفاصل
+    3) ميزانية ثابتة تعيد ضرب الحظر على IP مشترك (Render مجاني) → ميزانية تكيفية:
+       تنخفض 40% عند كل حظر وتتعافى 8% كل 3 دقائق نظيفة حتى المستوى المُعدّ."""
+    def __init__(self, budget_per_min: int = 1500, min_spacing: float = 0.15):
+        self.configured_budget = max(400, int(budget_per_min))
+        self.budget = self.configured_budget
+        self.budget_floor = max(300, int(self.configured_budget * 0.25))
         self.min_spacing = max(0.0, float(min_spacing))
+        self.resume_cooldown = max(0, int(BAN_RESUME_COOLDOWN_SEC))
+        self.resume_ramp_sec = max(0, int(BAN_RESUME_RAMP_SEC))
+        self.resume_spacing_factor = 4.0
         self._lock = Lock()
         self._window: deque = deque()  # (timestamp, weight)
         self._last_call = 0.0
@@ -228,6 +243,11 @@ class BinanceRateGuard:
         self.last_error: str = ''
         self.total_requests = 0
         self.total_throttled_sec = 0.0
+        self.ban_count = 0
+        self._last_ban_ts = 0.0
+        self._last_recover_ts = 0.0
+        self._ramp_until = 0.0
+        self._resumed = False  # هل استُؤفي الطلبات بعد آخر حظر؟
 
     def _prune(self, now: float) -> None:
         while self._window and now - self._window[0][0] > 60:
@@ -238,24 +258,50 @@ class BinanceRateGuard:
             self._prune(time.time())
             return int(sum(w for _, w in self._window))
 
+    def _effective_resume_wait(self, now: float) -> float:
+        """الانتظار الفعلي: بقيّة الحظر + تبريد الاستئناف (إن وُجد حظر سابق).
+        عند لحظة الاستئناف بالضبط: يُفعّل تدرج الفاصل ×4 لمدة resume_ramp_sec مرة واحدة."""
+        with self._lock:
+            if self.banned_until <= 0:
+                return 0.0
+            wait = self.banned_until - now + float(self.resume_cooldown)
+            if wait <= 0 and not self._resumed:
+                # لحظة الاستئناف بعد الحظر: بدء فترة التدرج مرة واحدة فقط
+                self._resumed = True
+                self._ramp_until = now + float(self.resume_ramp_sec)
+                self._last_call = now
+            return wait
+
+    def _maybe_recover(self, now: float) -> None:
+        """تعافي تدريجي للميزانية: +8% كل 3 دقائق بلا حظر حتى المستوى المُعدّ."""
+        with self._lock:
+            if self.budget >= self.configured_budget:
+                return
+            anchor = max(self._last_ban_ts, self._last_recover_ts)
+            if now - anchor >= 180:
+                self._last_recover_ts = now
+                self.budget = min(self.configured_budget, int(self.budget * 1.08) + 1)
+
     def acquire(self, weight: int = 1) -> None:
-        """يُستدعى قبل كل طلب REST: يحجز الوزن مسبقًا وينتظر عند الحاجة."""
+        """يُستدعى قبل كل طلب REST: يحجز الوزن مسبقًا وينتظر عند الحاجة.
+        [V9.9.1] بعد الحظر: تبريد استئناف ثم فاصل متدرج ×4 يمنع انفجار الخيوط."""
         weight = max(1, int(weight))
         while True:
             now = time.time()
-            with self._lock:
-                ban_remain = self.banned_until - now
-            if ban_remain > 0:
-                time.sleep(min(ban_remain, 5.0))
+            resume_wait = self._effective_resume_wait(now)
+            if resume_wait > 0:
+                time.sleep(min(resume_wait, 5.0))
                 continue
+            self._maybe_recover(now)
             with self._lock:
                 now = time.time()
                 self._prune(now)
                 used = int(sum(w for _, w in self._window))
+                spacing = self.min_spacing * (self.resume_spacing_factor if now < self._ramp_until else 1.0)
                 if used + weight <= self.budget:
                     gap = now - self._last_call
-                    if gap < self.min_spacing:
-                        time.sleep(self.min_spacing - gap)
+                    if gap < spacing:
+                        time.sleep(spacing - gap)
                     self._window.append((time.time(), weight))
                     self._last_call = time.time()
                     self.total_requests += 1
@@ -267,17 +313,30 @@ class BinanceRateGuard:
     def register_ban(self, until_ms: Optional[int] = None, fallback_sec: float = 120.0) -> None:
         with self._lock:
             until = (until_ms / 1000.0) if until_ms else (time.time() + fallback_sec)
+            until += 5.0  # هامش أمان فوق موعد Binance (توقيتات الخادم قد تختلف ثوانٍ)
             self.banned_until = max(self.banned_until, until)
+            self.ban_count += 1
+            self._last_ban_ts = time.time()
+            self._ramp_until = 0.0
+            self._resumed = False  # سيُفعّل التدرج عند لحظة الاستئناف
+            old_budget = self.budget
+            self.budget = max(self.budget_floor, int(self.budget * 0.6))
         logger.warning(f"🚫 [حارس الطلبات] حظر مؤقت من Binance — الانتظار حتى: "
-                       f"{datetime.fromtimestamp(self.banned_until, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
+                       f"{datetime.fromtimestamp(self.banned_until, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')} "
+                       f"(+تبريد {self.resume_cooldown}ث) | الميزانية التكيفية: {old_budget} → {self.budget} وزن/دقيقة")
 
     def snapshot(self) -> Dict[str, Any]:
+        now = time.time()
         with self._lock:
-            self._prune(time.time())
+            self._prune(now)
+            banned = self.banned_until if self.banned_until > now else None
             return {
                 'used_weight_last_min': int(sum(w for _, w in self._window)),
                 'budget_per_min': self.budget,
-                'banned_until': self.banned_until if self.banned_until > time.time() else None,
+                'configured_budget': self.configured_budget,
+                'banned_until': banned,
+                'ban_remaining_sec': round(self.banned_until - now + self.resume_cooldown, 0) if banned else 0,
+                'ban_count': self.ban_count,
                 'last_error': self.last_error,
                 'total_requests': self.total_requests,
                 'throttled_sec_rounded': round(self.total_throttled_sec, 1),
@@ -321,8 +380,42 @@ def _sanitize_label(func) -> str:
     except Exception: return 'api_call'
 
 # --- أغلفة جاهزة (الوزن لكل نقطة حسب توثيق Binance الرسمي) ---
+# [تحسين V9.9.1] مقدّر الوزن الفعلي لطلبات الشموع:
+# python-binance يقسّم get_historical_klines داخليًا إلى صفحات limit=1000،
+# ووزن كل صفحة: ≤100 → 1، ≤500 → 2، ≤1000 → 5.
+# المحاسبة القديمة (وزن 2 ثابت) كانت تخفي حتى 10 أضعاف الوزن الفعلي — السبب الرئيسي لتصعيد الحظر
+_KLINE_PAGE_TIERS: Tuple[Tuple[int, int], ...] = ((100, 1), (500, 2), (10**9, 5))
+_INTERVAL_MINUTES: Dict[str, int] = {
+    '1m': 1, '3m': 3, '5m': 5, '15m': 15, '30m': 30, '1h': 60, '2h': 120,
+    '4h': 240, '6h': 360, '8h': 480, '12h': 720, '1d': 1440, '3d': 4320, '1w': 10080,
+}
+_LOOKBACK_UNIT_MINUTES: Dict[str, int] = {
+    'minute': 1, 'min': 1, 'm': 1, 'hour': 60, 'h': 60, 'day': 1440, 'd': 1440,
+    'week': 10080, 'w': 10080, 'month': 43200,
+}
+
+def estimate_klines_weight(interval: str, lookback_str: str, limit: int = 1000) -> int:
+    """يقدّر الوزن الفعلي الكامل لاستدعاء get_historical_klines شاملًا كل الصفحات الداخلية."""
+    try:
+        interval_min = _INTERVAL_MINUTES.get(str(interval).lower())
+        if not interval_min:
+            return 15  # تقدير متحفظ لفريم غير معروف
+        m = re.match(r'\s*(\d+)\s*([a-zA-Z]+)', str(lookback_str))
+        if not m:
+            return 15
+        qty = int(m.group(1))
+        unit_min = _LOOKBACK_UNIT_MINUTES.get(m.group(2).lower(), 1440)
+        page_limit = max(1, min(int(limit), 1000))
+        candles = qty * unit_min / float(interval_min)
+        pages = max(1, int(math.ceil(candles / page_limit)))
+        per_page = next((w for cap, w in _KLINE_PAGE_TIERS if page_limit <= cap), 5)
+        return per_page * pages
+    except Exception:
+        return 15
+
 def safe_get_klines(symbol: str, interval: str, lookback_str: str, **kw):
-    return safe_api_call(client.get_historical_klines, symbol, interval, lookback_str, weight=2, **kw)
+    w = estimate_klines_weight(interval, lookback_str, limit=int(kw.get('limit', 1000)))
+    return safe_api_call(client.get_historical_klines, symbol, interval, lookback_str, weight=w, **kw)
 
 def safe_get_symbol_ticker(symbol: Optional[str] = None):
     if symbol:
@@ -1647,7 +1740,7 @@ def get_dashboard_html():
 <html lang="ar" dir="rtl">
 <head>
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CryptoBot V9.9.0 // NEON TERMINAL</title>
+    <title>CryptoBot V9.9.1 // NEON TERMINAL</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
         // [تحسين V9.9] ألوان الثيم الهاكر: أخضر مصفوفة + سماوي سيبراني على أسود
@@ -1728,7 +1821,7 @@ def get_dashboard_html():
         <header class="mb-6 flex flex-wrap justify-between items-center gap-4">
             <div>
                 <div dir="ltr" class="font-mono text-xs md:text-sm text-text-secondary mb-1">&gt;&gt; root@crypto-bot:~$ ./trading_engine --live --region=eu-frankfurt<span class="cursor"></span></div>
-                <h1 class="text-2xl md:text-3xl font-extrabold flicker"><span class="text-accent-green neon-text">لوحة تحكم</span> <span class="font-mono text-text-secondary text-lg md:text-xl" dir="ltr">V9.9.0//NEON</span></h1>
+                <h1 class="text-2xl md:text-3xl font-extrabold flicker"><span class="text-accent-green neon-text">لوحة تحكم</span> <span class="font-mono text-text-secondary text-lg md:text-xl" dir="ltr">V9.9.1//NEON</span></h1>
             </div>
             <div id="trend-lights-container" class="flex items-center gap-x-6 bg-black/40 px-4 py-2 rounded-lg border border-border-color"></div>
         </header>
@@ -2094,7 +2187,7 @@ def home(): return render_template_string(get_dashboard_html())
 @app.route('/health')
 def health_check():
     """[تحسين V9.8] نقطة فحص صحة خفيفة لمراقبة الخدمة على Render وأدوات Uptime."""
-    return jsonify({"status": "ok", "version": "V9.9.0", "time": datetime.now(timezone.utc).isoformat()})
+    return jsonify({"status": "ok", "version": "V9.9.1", "time": datetime.now(timezone.utc).isoformat()})
 
 # --- [تحسين V9.9] نقطة حالة النظام: وزن الطلبات، الحظر، قاطع الحماية، التخزين ---
 @app.route('/api/system_status')
@@ -2113,7 +2206,7 @@ def api_system_status():
         except Exception:
             pass
         return jsonify({
-            'version': 'V9.9.0',
+            'version': 'V9.9.1',
             'client_ready': bool(client),
             'rate_guard': snap,
             'daily_pnl_usdt': pnl,
@@ -2501,7 +2594,8 @@ def trade_management_loop():
                         
                         journey_state['targets_hit'] = journey_state.get('targets_hit', 0) + 1
                         
-                        df_analysis = fetch_historical_data(symbol, SIGNAL_GENERATION_TIMEFRAME, 100)
+                        # [تحسين V9.9.1] 30 يومًا تكفي تمامًا لتحليل امتداد المسار (كانت 100 يومًا = 55 وزنًا لكل استدعاء!)
+                        df_analysis = fetch_historical_data(symbol, SIGNAL_GENERATION_TIMEFRAME, 30)
                         if df_analysis is not None:
                             df_with_features = calculate_all_features(df_analysis, None)
                             
@@ -2776,11 +2870,11 @@ def initialize_bot_services():
     Thread(target=price_update_loop, daemon=True).start()
     Thread(target=trade_management_loop, daemon=True).start()
     logger.info("✅ [خدمات البوت] تم بدء جميع الخدمات الخلفية بنجاح.")
-    send_telegram_message("✅ *البوت قيد التشغيل الآن (نسخة V9.9.0 - Neon Security)*")
+    send_telegram_message("✅ *البوت قيد التشغيل الآن (نسخة V9.9.1 - Neon Security)*")
 
 # ---------------------- نقطة الدخول ----------------------
 if __name__ == "__main__":
-    logger.info("🚀 إطلاق بوت التداول ولوحة التحكم (V9.9.0 - Neon Security) 🚀")
+    logger.info("🚀 إطلاق بوت التداول ولوحة التحكم (V9.9.1 - Neon Security) 🚀")
     Thread(target=initialize_bot_services, daemon=True).start()
     port = int(os.environ.get('PORT', 10000))
     host = "0.0.0.0"
