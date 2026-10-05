@@ -40,7 +40,10 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-logger = logging.getLogger('CryptoBotV9.8.0')
+logger = logging.getLogger('CryptoBotV9.9.0')
+
+# زمن إقلاع العملية لحساب مدة التشغيل في لوحة التحكم
+BOOT_TIME = time.time()
 
 # --- المشفر المخصص لأنواع بيانات NumPy ---
 class NpEncoder(json.JSONEncoder):
@@ -127,6 +130,15 @@ USE_SHORT_TERM_MOMENTUM_FILTER: bool = config('USE_SHORT_TERM_MOMENTUM_FILTER', 
 # مدة تخزين نتيجة تأكيد الترند لكل عملة (بالثواني) لتقليل استهلاك API
 HTF_CONFIRMATION_CACHE_TTL: int = config('HTF_CONFIRMATION_CACHE_TTL', default=900, cast=int)
 
+# --- [تحسين V9.9] إعدادات حماية الحظر من Binance (خطأ -1003) ---
+# حد Binance الرسمي هو 6000 وزن/دقيقة لكل IP. نستخدم ميزانية متحفظة (افتراضي 2400)
+# لتجنب الاقتراب من الحظر مع الحفاظ على سلاسة التشغيل
+RATE_LIMIT_BUDGET_PER_MIN: int = config('RATE_LIMIT_BUDGET_PER_MIN', default=2400, cast=int)
+# الفاصل الأدنى بالثواني بين أي طلبين REST متتاليين
+API_MIN_SPACING_SEC: float = config('API_MIN_SPACING_SEC', default=0.08, cast=float)
+# فاصل تحديث أسعار Redis بالثواني (كل طلب أسعار شامل وزنه 4)
+PRICE_UPDATE_INTERVAL_SEC: int = config('PRICE_UPDATE_INTERVAL_SEC', default=3, cast=int)
+
 
 BASE_ML_MODEL_NAME: str = 'LightGBM_Scalping_V9_With_Microstructure'
 MODEL_FOLDER: str = 'V9'
@@ -196,6 +208,144 @@ daily_loss_notified: bool = False
 daily_pnl_lock = Lock()
 ATR_TRAILING_CACHE: Dict[str, Tuple[float, float]] = {}
 atr_trailing_lock = Lock()
+
+# ============================================================
+# [تحسين V9.9] طبقة الحماية من حظر Binance (خطأ -1003)
+# المشكلة السابقة: البوت كان ينهار (exit) عند الحظر، وRender يعيد تشغيله
+# فورًا فيضرب Binance مرارًا أثناء الحظر فيطول مدته (Ban Escalation).
+# الحل: حارس وزن يمنع تجاوز الحد أصلًا + انتظار ذكي بدل الانهيار.
+# ============================================================
+class BinanceRateGuard:
+    """حارس وزن الطلبات: يتتبع وزن الطلبات في نافذة دقيقة منزلقة (حد Binance = 6000/دقيقة)
+    ويوقف الطلبات تلقائيًا عند اقتراب الميزانية، مع كشف الحظر وتسجيل موعد انتهائه."""
+    def __init__(self, budget_per_min: int = 2400, min_spacing: float = 0.08):
+        self.budget = max(500, int(budget_per_min))
+        self.min_spacing = max(0.0, float(min_spacing))
+        self._lock = Lock()
+        self._window: deque = deque()  # (timestamp, weight)
+        self._last_call = 0.0
+        self.banned_until = 0.0
+        self.last_error: str = ''
+        self.total_requests = 0
+        self.total_throttled_sec = 0.0
+
+    def _prune(self, now: float) -> None:
+        while self._window and now - self._window[0][0] > 60:
+            self._window.popleft()
+
+    def used_weight(self) -> int:
+        with self._lock:
+            self._prune(time.time())
+            return int(sum(w for _, w in self._window))
+
+    def acquire(self, weight: int = 1) -> None:
+        """يُستدعى قبل كل طلب REST: يحجز الوزن مسبقًا وينتظر عند الحاجة."""
+        weight = max(1, int(weight))
+        while True:
+            now = time.time()
+            with self._lock:
+                ban_remain = self.banned_until - now
+            if ban_remain > 0:
+                time.sleep(min(ban_remain, 5.0))
+                continue
+            with self._lock:
+                now = time.time()
+                self._prune(now)
+                used = int(sum(w for _, w in self._window))
+                if used + weight <= self.budget:
+                    gap = now - self._last_call
+                    if gap < self.min_spacing:
+                        time.sleep(self.min_spacing - gap)
+                    self._window.append((time.time(), weight))
+                    self._last_call = time.time()
+                    self.total_requests += 1
+                    return
+                wait = (61.0 - (now - self._window[0][0])) if self._window else 1.0
+                self.total_throttled_sec += min(wait, 5.0)
+            time.sleep(min(max(wait, 0.1), 5.0))
+
+    def register_ban(self, until_ms: Optional[int] = None, fallback_sec: float = 120.0) -> None:
+        with self._lock:
+            until = (until_ms / 1000.0) if until_ms else (time.time() + fallback_sec)
+            self.banned_until = max(self.banned_until, until)
+        logger.warning(f"🚫 [حارس الطلبات] حظر مؤقت من Binance — الانتظار حتى: "
+                       f"{datetime.fromtimestamp(self.banned_until, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            self._prune(time.time())
+            return {
+                'used_weight_last_min': int(sum(w for _, w in self._window)),
+                'budget_per_min': self.budget,
+                'banned_until': self.banned_until if self.banned_until > time.time() else None,
+                'last_error': self.last_error,
+                'total_requests': self.total_requests,
+                'throttled_sec_rounded': round(self.total_throttled_sec, 1),
+            }
+
+rate_guard = BinanceRateGuard(RATE_LIMIT_BUDGET_PER_MIN, API_MIN_SPACING_SEC)
+
+BAN_UNTIL_RE = re.compile(r'banned until (\d+)', re.IGNORECASE)
+
+def _is_rate_error(e: Exception) -> bool:
+    """يكشف أخطاء تجاوز الوزن/الحظر من Binance (-1003, -1015)"""
+    s = str(e)
+    return ('-1003' in s or '-1015' in s or
+            'Way too much request weight' in s or 'Too many requests' in s or 'banned until' in s.lower())
+
+def safe_api_call(func, *args, weight: int = 1, max_retries: int = 4, retry_on_ban: bool = True, **kwargs):
+    """غلاف موحد لكل استدعاءات REST: يحجز الوزن مسبقًا ويعيد المحاولة بعد انتهاء الحظر بدل الانهيار."""
+    last_exc = None
+    for attempt in range(1, max_retries + 1):
+        if not client:
+            raise RuntimeError("عميل Binance غير مهيأ بعد")
+        rate_guard.acquire(weight)
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            last_exc = e
+            if _is_rate_error(e) and retry_on_ban and attempt < max_retries:
+                m = BAN_UNTIL_RE.search(str(e))
+                if m:
+                    rate_guard.register_ban(int(m.group(1)))
+                else:
+                    rate_guard.register_ban(fallback_sec=30.0 * attempt)
+                rate_guard.last_error = str(e)[:160]
+                logger.warning(f"⚠️ [حارس الطلبات] تجاوز الوزن في {_sanitize_label(func)} (محاولة {attempt}/{max_retries}) — إعادة المحاولة بعد انتهاء الحظر...")
+                continue
+            raise
+    raise last_exc
+
+def _sanitize_label(func) -> str:
+    try: return getattr(func, '__name__', 'api_call')
+    except Exception: return 'api_call'
+
+# --- أغلفة جاهزة (الوزن لكل نقطة حسب توثيق Binance الرسمي) ---
+def safe_get_klines(symbol: str, interval: str, lookback_str: str, **kw):
+    return safe_api_call(client.get_historical_klines, symbol, interval, lookback_str, weight=2, **kw)
+
+def safe_get_symbol_ticker(symbol: Optional[str] = None):
+    if symbol:
+        return safe_api_call(lambda: client.get_symbol_ticker(symbol=symbol), weight=2)
+    return safe_api_call(lambda: client.get_symbol_ticker(), weight=4)
+
+def safe_get_exchange_info():
+    return safe_api_call(client.get_exchange_info, weight=20)
+
+def safe_get_order_book(symbol: str, limit: int = 100):
+    w = 5 if limit <= 100 else 25
+    return safe_api_call(client.get_order_book, symbol=symbol, limit=limit, weight=w)
+
+def safe_get_asset_balance(asset: str):
+    return safe_api_call(client.get_asset_balance, asset=asset, weight=5)
+
+def safe_get_order(symbol: str, order_id):
+    return safe_api_call(client.get_order, symbol=symbol, orderId=order_id, weight=2)
+
+def safe_create_order(**params):
+    """الأوامر الحقيقية: نحجز الوزن فقط ولا نعيد المحاولة تلقائيًا لتجنب ازدواجية الأوامر."""
+    rate_guard.acquire(weight=1)
+    return client.create_order(**params)
 
 # --- قاموس أسباب الرفض باللغة العربية ---
 REJECTION_REASONS_AR = {
@@ -370,7 +520,7 @@ def get_exchange_info_map() -> None:
     if not client: return
     logger.info("ℹ️ [معلومات المنصة] جاري جلب قواعد التداول...")
     try:
-        info = client.get_exchange_info()
+        info = safe_get_exchange_info()
         exchange_info_map = {s['symbol']: s for s in info['symbols']}
         logger.info(f"✅ [معلومات المنصة] تم تحميل القواعد لـ {len(exchange_info_map)} عملة.")
     except Exception as e:
@@ -418,7 +568,7 @@ def fetch_historical_data(symbol: str, interval: str, days: int) -> Optional[pd.
     try:
         lookback_str = f"{days + 50} day" if 'd' in interval.lower() else f"{days * 24 + 200} hour"
         
-        klines = client.get_historical_klines(symbol, interval, lookback_str)
+        klines = safe_get_klines(symbol, interval, lookback_str)
         if not klines: return None
         cols = ['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_volume', 'trades', 'taker_buy_base', 'taker_buy_quote', 'ignore']
         df = pd.DataFrame(klines, columns=cols)
@@ -1155,7 +1305,7 @@ def passes_final_order_book_check(symbol: str, entry_price: float) -> bool:
         with order_book_ratio_lock:
              current_ratio_threshold = ORDER_BOOK_MIN_BID_ASK_RATIO
 
-        order_book = client.get_order_book(symbol=symbol, limit=ORDER_BOOK_DEPTH_LIMIT)
+        order_book = safe_get_order_book(symbol, ORDER_BOOK_DEPTH_LIMIT)
         bids = pd.DataFrame(order_book['bids'], columns=['price', 'qty'], dtype=float)
         asks = pd.DataFrame(order_book['asks'], columns=['price', 'qty'], dtype=float)
 
@@ -1247,7 +1397,7 @@ def calculate_position_size(symbol: str, entry_price: float, stop_loss_price: fl
     if not client: return None
     try:
         with risk_per_trade_lock: current_risk_percent = RISK_PER_TRADE_PERCENT
-        balance_response = client.get_asset_balance(asset='USDT')
+        balance_response = safe_get_asset_balance('USDT')
         available_balance = Decimal(balance_response['free'])
         risk_amount_usdt = available_balance * (Decimal(str(current_risk_percent)) / Decimal('100'))
         risk_per_coin = Decimal(str(entry_price)) - Decimal(str(stop_loss_price))
@@ -1271,7 +1421,7 @@ def place_order(symbol: str, side: str, quantity: Decimal, order_type: str = Cli
     if not client: return None
     logger.info(f"➡️ [{symbol}] محاولة تنفيذ أمر {side} حقيقي لكمية {quantity}.")
     try:
-        order = client.create_order(symbol=symbol, side=side, type=order_type, quantity=str(quantity))
+        order = safe_create_order(symbol=symbol, side=side, type=order_type, quantity=str(quantity))
         log_and_notify('info', f"صفقة حقيقية: تم وضع أمر {side} لـ {quantity} {symbol}.", "REAL_TRADE")
         return order
     except Exception as e:
@@ -1284,7 +1434,7 @@ def verify_order_filled(symbol: str, order_id: str, timeout_seconds: int = 30) -
     start_time = time.time()
     while time.time() - start_time < timeout_seconds:
         try:
-            order_status = client.get_order(symbol=symbol, orderId=order_id)
+            order_status = safe_get_order(symbol=symbol, orderId=order_id)
             if order_status['status'] == 'FILLED': return True
             elif order_status['status'] in ['CANCELED', 'EXPIRED', 'REJECTED']: return False
             time.sleep(2)
@@ -1311,7 +1461,7 @@ def close_signal(signal_id: int, closing_price: float, reason: str) -> bool:
         if signal_to_close.get('is_real_trade'):
             try:
                 base_asset = symbol_to_close.replace('USDT', '')
-                balance_response = client.get_asset_balance(asset=base_asset)
+                balance_response = safe_get_asset_balance(base_asset)
                 actual_free_balance = Decimal(balance_response['free'])
                 
                 logger.info(f"  -> [{symbol_to_close}] التحقق من الرصيد للإغلاق الكامل. الرصيد الفعلي: {actual_free_balance} {base_asset}")
@@ -1477,7 +1627,18 @@ def require_dashboard_auth():
     if auth and auth.username == DASHBOARD_USERNAME and auth.password == DASHBOARD_PASSWORD:
         return None
     logger.warning(f"🔒 [أمن] محاولة وصول غير مصرح بها إلى {request.path} من: {request.remote_addr}")
-    return Response("401 Unauthorized - لوحة التحكم محمية، يتطلب تسجيل الدخول", 401,
+    # [تحسين V9.9] صفحة رفض بثيم الطرفية الهاكرية
+    denied_html = """<!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8">
+<title>ACCESS DENIED // CryptoBot</title><style>
+body{background:#020403;color:#00ff41;font-family:'Courier New',monospace;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+.box{border:1px solid #114d23;padding:2.5rem 3rem;text-align:center;box-shadow:0 0 30px rgba(0,255,65,.25)}
+h1{font-size:2rem;margin:0 0 .6rem;text-shadow:0 0 12px rgba(0,255,65,.8);direction:ltr;letter-spacing:2px}
+p{color:#5d8f6d;margin:.3rem 0;font-size:.9rem}
+.t{color:#ff2b4e}</style></head>
+<body><div class="box"><h1>&gt;&gt; ACCESS DENIED &lt;&lt;</h1>
+<p>لوحة التحكم محمية — يتطلب تسجيل الدخول</p>
+<p dir="ltr">[<span class="t">401 Unauthorized</span>] realm: CryptoBot Dashboard</p></div></body></html>"""
+    return Response(denied_html, 401,
                     {"WWW-Authenticate": 'Basic realm="CryptoBot Dashboard"'})
 
 def get_dashboard_html():
@@ -1486,33 +1647,72 @@ def get_dashboard_html():
 <html lang="ar" dir="rtl">
 <head>
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>لوحة تحكم التداول V9.8.0 - Enhanced</title>
+    <title>CryptoBot V9.9.0 // NEON TERMINAL</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;800&display=swap" rel="stylesheet">
+    <script>
+        // [تحسين V9.9] ألوان الثيم الهاكر: أخضر مصفوفة + سماوي سيبراني على أسود
+        tailwind.config = { theme: { extend: {
+            colors: {
+                'accent-green': '#00ff41', 'accent-red': '#ff2b4e', 'accent-yellow': '#f5ff00', 'accent-blue': '#00e5ff',
+                'text-primary': '#c9ffd6', 'text-secondary': '#5d8f6d', 'border-color': '#114d23',
+                'blue': {600:'#00e5ff',700:'#00b7d4'}, 'red': {600:'#ff2b4e',700:'#d9203f'},
+                'gray': {500:'#4a7a5a',600:'#0d2a17',700:'#082010'}
+            },
+            fontFamily: { mono: ['"Share Tech Mono"','Consolas','monospace'] }
+        } } }
+    </script>
+    <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Noto+Kufi+Arabic:wght@400;500;700;800&display=swap" rel="stylesheet">
     <style>
-        :root { --bg-main: #0D1117; --bg-card: #161B22; --border-color: #30363D; --text-primary: #E6EDF3; --text-secondary: #848D97; --accent-blue: #58A6FF; --accent-green: #3FB950; --accent-red: #F85149; --accent-yellow: #D29922; --accent-purple: #A371F7;}
-        body { font-family: 'Tajawal', sans-serif; background-color: var(--bg-main); color: var(--text-primary); }
-        .card { background-color: var(--bg-card); border: 1px solid var(--border-color); border-radius: 0.5rem; }
-        .trend-light { width: 1rem; height: 1rem; border-radius: 9999px; border: 2px solid #30363D; transition: all 0.5s ease; }
-        .light-on-green { background-color: var(--accent-green); box-shadow: 0 0 10px 2px var(--accent-green); }
-        .light-on-red { background-color: var(--accent-red); box-shadow: 0 0 10px 2px var(--accent-red); }
-        .light-on-yellow { background-color: var(--accent-yellow); box-shadow: 0 0 10px 2px var(--accent-yellow); }
-        .tab-btn.active { border-bottom-color: var(--accent-blue); }
-        input:checked + .toggle-bg { background-color: var(--accent-green); }
-        #modal-overlay { transition: opacity 0.3s ease; }
-        .input-field { background-color: #0D1117; border: 1px solid var(--border-color); border-radius: 0.375rem; padding: 0.5rem 0.75rem; color: var(--text-primary); }
-        .save-btn { background-color: var(--accent-blue); color: white; padding: 0.5rem 1rem; border-radius: 0.375rem; font-weight: bold; transition: background-color 0.2s; }
-        .save-btn:hover { background-color: #4a91e2; }
-        .strategy-toggle { border-left: 4px solid var(--accent-blue); }
-        .strategy-toggle-new { border-left: 4px solid var(--accent-yellow); }
-        .strategy-toggle-momentum { border-left: 4px solid var(--accent-purple); }
-        .tp-slider { -webkit-appearance: none; width: 100%; height: 8px; background: #30363D; border-radius: 5px; outline: none; opacity: 0.7; transition: opacity .2s; }
+        :root { --neon:#00ff41; --neon-dim:#114d23; --cyan:#00e5ff; --red:#ff2b4e; --yellow:#f5ff00; --bg:#020403; }
+        * { scrollbar-width: thin; scrollbar-color: #114d23 #020403; }
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: #020403; }
+        ::-webkit-scrollbar-thumb { background: #114d23; border-radius: 4px; }
+        body { font-family: 'Noto Kufi Arabic', 'Share Tech Mono', monospace; background-color: #020403; color: #c9ffd6; }
+        /* [V9.9] خلفية المطر الرقمي (Matrix Rain) + طبقة CRT */
+        #matrix-rain { position: fixed; inset: 0; z-index: 0; opacity: .15; pointer-events: none; }
+        .crt-overlay { position: fixed; inset: 0; z-index: 50; pointer-events: none; background: repeating-linear-gradient(0deg, rgba(0,0,0,.18) 0px, rgba(0,0,0,.18) 1px, transparent 1px, transparent 3px); }
+        .crt-vignette { position: fixed; inset: 0; z-index: 50; pointer-events: none; background: radial-gradient(ellipse at center, transparent 55%, rgba(0,0,0,.5) 100%); }
+        .wrap { position: relative; z-index: 2; }
+        .card { background: rgba(4,16,8,.82); border: 1px solid var(--neon-dim); border-radius: .3rem; box-shadow: 0 0 14px rgba(0,255,65,.08), inset 0 0 30px rgba(0,255,65,.03); position: relative; backdrop-filter: blur(2px); }
+        .card::before, .card::after { content: ''; position: absolute; width: 12px; height: 12px; opacity: .8; }
+        .card::before { top: -1px; right: -1px; border-top: 2px solid var(--neon); border-right: 2px solid var(--neon); }
+        .card::after { bottom: -1px; left: -1px; border-bottom: 2px solid var(--neon); border-left: 2px solid var(--neon); }
+        h1, h3, h4 { text-shadow: 0 0 10px rgba(0,255,65,.4); }
+        .neon-text { text-shadow: 0 0 6px rgba(0,255,65,.9), 0 0 18px rgba(0,255,65,.5); }
+        @keyframes blinkC { 0%,49% {opacity:1} 50%,100% {opacity:0} }
+        .cursor::after { content: '▊'; animation: blinkC 1s steps(1) infinite; color: var(--neon); }
+        @keyframes flickerA { 0%,100% {opacity:1} 91% {opacity:1} 92% {opacity:.55} 93% {opacity:1} 96% {opacity:.75} 97% {opacity:1} }
+        .flicker { animation: flickerA 7s infinite; }
+        .trend-light { width: .9rem; height: .9rem; border-radius: 9999px; border: 1px solid #114d23; transition: all 0.5s ease; }
+        .light-on-green { background-color: var(--neon); box-shadow: 0 0 10px 2px var(--neon); animation: pulseG 2s infinite; }
+        .light-on-red { background-color: var(--red); box-shadow: 0 0 10px 2px var(--red); }
+        .light-on-yellow { background-color: var(--yellow); box-shadow: 0 0 10px 2px var(--yellow); }
+        @keyframes pulseG { 0%,100% {box-shadow:0 0 6px 1px var(--neon)} 50% {box-shadow:0 0 14px 4px var(--neon)} }
+        .tab-btn.active { border-bottom: 2px solid var(--neon); color: var(--neon); text-shadow: 0 0 8px rgba(0,255,65,.6); }
+        input:checked + .toggle-bg { background-color: var(--neon); box-shadow: 0 0 12px rgba(0,255,65,.55); }
+        #modal-overlay { transition: opacity 0.3s ease; background: rgba(0,0,0,.8) !important; }
+        .input-field { background-color: #031008 !important; border: 1px solid var(--neon-dim); border-radius: .25rem; padding: 0.5rem 0.75rem; color: #c9ffd6; font-family: 'Share Tech Mono', monospace; transition: all .2s; }
+        .input-field:focus { outline: none; border-color: var(--neon); box-shadow: 0 0 10px rgba(0,255,65,.35); }
+        .save-btn { background: linear-gradient(180deg,#00ff41,#00c431); color: #01130a; padding: 0.5rem 1.4rem; border-radius: .25rem; font-weight: 800; letter-spacing: .5px; transition: all .2s; border: 1px solid #00ff41; box-shadow: 0 0 14px rgba(0,255,65,.4); }
+        .save-btn:hover { box-shadow: 0 0 22px rgba(0,255,65,.8); transform: translateY(-1px); }
+        .strategy-toggle { border-left: 4px solid var(--cyan); }
+        .strategy-toggle-new { border-left: 4px solid var(--yellow); }
+        .strategy-toggle-momentum { border-left: 4px solid var(--red); }
+        .tp-slider { -webkit-appearance: none; width: 100%; height: 6px; background: linear-gradient(90deg,#114d23,#0a2f14); border-radius: 5px; outline: none; opacity: .85; transition: opacity .2s; }
         .tp-slider:hover { opacity: 1; }
-        .tp-slider::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 18px; height: 18px; background: var(--accent-blue); cursor: pointer; border-radius: 50%; }
-        .tp-slider::-moz-range-thumb { width: 18px; height: 18px; background: var(--accent-blue); cursor: pointer; border-radius: 50%; }
+        .tp-slider::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 16px; height: 16px; background: var(--neon); cursor: pointer; border-radius: 50%; box-shadow: 0 0 10px 2px rgba(0,255,65,.7); }
+        .tp-slider::-moz-range-thumb { width: 16px; height: 16px; background: var(--neon); cursor: pointer; border-radius: 50%; border: none; box-shadow: 0 0 10px 2px rgba(0,255,65,.7); }
+        table thead tr { background: rgba(0,255,65,.05); }
+        tbody tr:hover { background: rgba(0,255,65,.05) !important; }
+        .sys-bar { height: 6px; background: #082010; border: 1px solid var(--neon-dim); border-radius: 4px; overflow: hidden; min-width: 120px; width: 140px; }
+        .sys-bar > div { height: 100%; background: linear-gradient(90deg,#00ff41,#f5ff00); transition: width .6s ease; box-shadow: 0 0 8px rgba(0,255,65,.6); }
     </style>
 </head>
 <body class="p-4 md:p-6">
+    <canvas id="matrix-rain"></canvas>
+    <div class="crt-overlay"></div>
+    <div class="crt-vignette"></div>
     <div id="modal-overlay" class="fixed inset-0 bg-black bg-opacity-70 hidden items-center justify-center z-50">
         <div id="modal-content" class="card p-6 rounded-lg shadow-xl max-w-sm w-full">
             <h3 id="modal-title" class="text-xl font-bold mb-4"></h3>
@@ -1524,16 +1724,36 @@ def get_dashboard_html():
         </div>
     </div>
 
-    <div class="container mx-auto max-w-screen-2xl">
+    <div class="container mx-auto max-w-screen-2xl wrap">
         <header class="mb-6 flex flex-wrap justify-between items-center gap-4">
-            <h1 class="text-2xl md:text-3xl font-extrabold"><span class="text-accent-blue">لوحة تحكم</span><span class="text-text-secondary font-medium"> V9.8.0 (Enhanced)</span></h1>
-            <div id="trend-lights-container" class="flex items-center gap-x-6 bg-black/20 px-4 py-2 rounded-lg border border-border-color"></div>
+            <div>
+                <div dir="ltr" class="font-mono text-xs md:text-sm text-text-secondary mb-1">&gt;&gt; root@crypto-bot:~$ ./trading_engine --live --region=eu-frankfurt<span class="cursor"></span></div>
+                <h1 class="text-2xl md:text-3xl font-extrabold flicker"><span class="text-accent-green neon-text">لوحة تحكم</span> <span class="font-mono text-text-secondary text-lg md:text-xl" dir="ltr">V9.9.0//NEON</span></h1>
+            </div>
+            <div id="trend-lights-container" class="flex items-center gap-x-6 bg-black/40 px-4 py-2 rounded-lg border border-border-color"></div>
         </header>
         <section class="mb-6 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-5">
             <div class="card p-4"><h3 class="font-bold mb-3 text-lg text-text-secondary">حالة السوق</h3><div id="overall-regime" class="text-2xl font-bold text-center">...</div></div>
             <div class="card p-4"><h3 class="font-bold mb-3 text-lg text-text-secondary">الجلسات النشطة</h3><div id="active-sessions-list" class="flex flex-wrap gap-2 items-center justify-center pt-2">...</div></div>
             <div class="card p-4"><h3 class="font-bold mb-3 text-lg text-text-secondary">الصفقات المفتوحة</h3><div id="open-trades-count" class="text-2xl font-bold text-center">...</div></div>
             <div class="card p-4 flex flex-col justify-center items-center"><h3 class="font-bold text-lg text-text-secondary mb-2">التداول الحقيقي</h3><div class="flex items-center space-x-3 space-x-reverse"><span id="trading-status-text" class="font-bold text-lg"></span><label class="flex items-center cursor-pointer"><div class="relative"><input type="checkbox" id="trading-toggle" class="sr-only" onchange="toggleTrading()"><div class="toggle-bg block bg-gray-600 w-12 h-7 rounded-full"></div></div></label></div><div class="mt-2 text-xs text-text-secondary">رصيد USDT: <span id="usdt-balance" class="font-mono">...</span></div></div>
+        </section>
+        <!-- [تحسين V9.9] شريط مراقبة النظام الحي: وزن API، الاتصال، قاطع الحماية -->
+        <section class="card p-3 md:p-4 mb-6">
+            <div class="flex flex-wrap items-center gap-x-6 gap-y-3 text-sm">
+                <span class="font-mono text-accent-green" dir="ltr">[SYS.MONITOR]</span>
+                <div class="flex items-center gap-2">
+                    <span class="text-text-secondary">وزن API/دقيقة:</span>
+                    <span id="sys-weight" class="font-mono text-accent-yellow">--</span>
+                    <div class="sys-bar"><div id="sys-weight-bar" style="width:0%"></div></div>
+                </div>
+                <div class="flex items-center gap-2"><span class="text-text-secondary">الاتصال:</span><span id="sys-conn" class="font-mono">--</span></div>
+                <div class="flex items-center gap-2"><span class="text-text-secondary">PnL اليوم:</span><span id="sys-pnl" class="font-mono">--</span></div>
+                <div class="flex items-center gap-2"><span class="text-text-secondary">قاطع الحماية:</span><span id="sys-lossguard" class="font-mono">--</span></div>
+                <div class="flex items-center gap-2"><span class="text-text-secondary">التخزين:</span><span id="sys-storage" class="font-mono text-accent-blue">--</span></div>
+                <div class="flex items-center gap-2"><span class="text-text-secondary">العملات:</span><span id="sys-symbols" class="font-mono">--</span></div>
+                <div class="flex items-center gap-2"><span class="text-text-secondary">مدة التشغيل:</span><span id="sys-uptime" class="font-mono" dir="ltr">--</span></div>
+            </div>
         </section>
         <div class="mb-4 border-b border-border-color"><nav class="flex space-x-6 space-x-reverse -mb-px">
             <button onclick="showTab('signals', this)" class="tab-btn active text-white py-3 px-1 font-semibold">الصفقات</button>
@@ -1612,6 +1832,26 @@ def get_dashboard_html():
         </main>
     </div>
 <script>
+// [تحسين V9.9] خلفية المطر الرقمي — خفيفة على المعالج وتحترم تفضيل تقليل الحركة
+(function(){
+    const c = document.getElementById('matrix-rain'); if(!c) return;
+    if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) { c.style.display='none'; return; }
+    const ctx = c.getContext('2d');
+    const glyphs = '01アイウエオカキクケコサシスセソ$#*+=<>010';
+    let w, h, cols, drops;
+    function resize(){ w = c.width = window.innerWidth; h = c.height = window.innerHeight; cols = Math.floor(w/16); drops = Array(cols).fill(0).map(() => Math.floor(Math.random()*h/16)); }
+    resize(); window.addEventListener('resize', resize);
+    setInterval(() => {
+        ctx.fillStyle = 'rgba(2,4,3,0.14)'; ctx.fillRect(0,0,w,h);
+        ctx.fillStyle = '#00ff41'; ctx.font = '14px "Share Tech Mono", monospace';
+        for (let i=0;i<cols;i++){
+            ctx.fillText(glyphs[Math.floor(Math.random()*glyphs.length)], i*16, drops[i]*16);
+            if (drops[i]*16 > h && Math.random() > 0.972) drops[i] = 0;
+            drops[i]++;
+        }
+    }, 70);
+})();
+
 let confirmCallback = null;
 const modal = {
     overlay: document.getElementById('modal-overlay'),
@@ -1774,6 +2014,32 @@ function manualClose(signalId, symbol) {
 }
 function toggleTrading() { fetch('/api/trading/toggle', { method: 'POST' }).then(() => updateMarketStatus()); }
 
+// [تحسين V9.9] مراقب حالة النظام الحي: وزن الطلبات، الحظر، قاطع الحماية
+function fmtUptime(sec){ const d=Math.floor(sec/86400), h=Math.floor((sec%86400)/3600), m=Math.floor((sec%3600)/60), s=sec%60; return `${d}d ${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`; }
+function updateSystemStatus() {
+    fetchData('/api/system_status').then(data => {
+        if (!data || data.error) return;
+        const rg = data.rate_guard || {};
+        document.getElementById('sys-weight').textContent = `${rg.used_weight_last_min ?? 0} / ${rg.budget_per_min ?? '-'}`;
+        const pct = rg.budget_per_min ? Math.min(100, (rg.used_weight_last_min / rg.budget_per_min) * 100) : 0;
+        document.getElementById('sys-weight-bar').style.width = pct.toFixed(1) + '%';
+        const conn = document.getElementById('sys-conn');
+        if (rg.banned_until) { conn.textContent = 'محظور مؤقتًا'; conn.className = 'font-mono text-accent-red'; }
+        else if (data.client_ready) { conn.textContent = 'متصل'; conn.className = 'font-mono text-accent-green'; }
+        else { conn.textContent = 'غير مهيأ'; conn.className = 'font-mono text-accent-yellow'; }
+        const pnl = document.getElementById('sys-pnl');
+        pnl.textContent = `${data.daily_pnl_usdt} / -${data.daily_max_loss_usdt}$`;
+        pnl.className = 'font-mono ' + (data.daily_pnl_usdt >= 0 ? 'text-accent-green' : 'text-accent-red');
+        const lg = document.getElementById('sys-lossguard');
+        if (data.daily_loss_limit_hit) { lg.textContent = 'مفعّل!'; lg.className = 'font-mono text-accent-red'; }
+        else { lg.textContent = 'سليم'; lg.className = 'font-mono text-accent-green'; }
+        const st = document.getElementById('sys-storage');
+        st.textContent = data.redis_mode === 'redis' ? 'Redis' : (data.redis_mode === 'memory' ? 'ذاكرة داخلية' : 'غير متصل');
+        document.getElementById('sys-symbols').textContent = data.symbols_count;
+        document.getElementById('sys-uptime').textContent = fmtUptime(data.uptime_sec);
+    });
+}
+
 function saveSettings() {
     const settings = {
         risk_percent: parseFloat(document.getElementById('risk-percent').value),
@@ -1814,9 +2080,9 @@ function saveSettings() {
 }
 
 document.addEventListener('DOMContentLoaded', () => {
-    ['MarketStatus', 'Signals', 'Stats', 'Notifications', 'Rejections'].forEach(f => window[`update${f}`]());
+    ['MarketStatus', 'Signals', 'Stats', 'Notifications', 'Rejections', 'SystemStatus'].forEach(f => window[`update${f}`]());
     setInterval(updateMarketStatus, 5000); setInterval(updateSignals, 7000); setInterval(updateStats, 60000);
-    setInterval(updateNotifications, 15000); setInterval(updateRejections, 15000);
+    setInterval(updateNotifications, 15000); setInterval(updateRejections, 15000); setInterval(updateSystemStatus, 5000);
 });
 </script>
 </body></html>
@@ -1828,7 +2094,39 @@ def home(): return render_template_string(get_dashboard_html())
 @app.route('/health')
 def health_check():
     """[تحسين V9.8] نقطة فحص صحة خفيفة لمراقبة الخدمة على Render وأدوات Uptime."""
-    return jsonify({"status": "ok", "version": "V9.8.0", "time": datetime.now(timezone.utc).isoformat()})
+    return jsonify({"status": "ok", "version": "V9.9.0", "time": datetime.now(timezone.utc).isoformat()})
+
+# --- [تحسين V9.9] نقطة حالة النظام: وزن الطلبات، الحظر، قاطع الحماية، التخزين ---
+@app.route('/api/system_status')
+def api_system_status():
+    try:
+        snap = rate_guard.snapshot()
+        try: daily_hit = is_daily_loss_limit_hit()
+        except Exception: daily_hit = False
+        with daily_pnl_lock:
+            pnl = round(daily_realized_pnl_usdt, 2)
+        with signal_cache_lock:
+            open_count = len(open_signals_cache)
+        is_real_redis = False
+        try:
+            is_real_redis = redis_client is not None and not isinstance(redis_client, InMemoryRedis)
+        except Exception:
+            pass
+        return jsonify({
+            'version': 'V9.9.0',
+            'client_ready': bool(client),
+            'rate_guard': snap,
+            'daily_pnl_usdt': pnl,
+            'daily_max_loss_usdt': DAILY_MAX_LOSS_USDT,
+            'daily_loss_limit_hit': daily_hit,
+            'lookback_days': SIGNAL_GENERATION_LOOKBACK_DAYS,
+            'symbols_count': len(validated_symbols_to_scan),
+            'open_trades': open_count,
+            'redis_mode': 'redis' if is_real_redis else ('memory' if redis_client is not None else 'none'),
+            'uptime_sec': int(time.time() - BOOT_TIME),
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/market_status')
 def get_market_status():
@@ -1837,7 +2135,7 @@ def get_market_status():
     active_sessions, _, _ = get_session_state()
     usdt_balance = None
     if client:
-        try: usdt_balance = float(client.get_asset_balance(asset='USDT')['free'])
+        try: usdt_balance = float(safe_get_asset_balance('USDT')['free'])
         except: usdt_balance = 'N/A'
 
     with risk_per_trade_lock: risk = RISK_PER_TRADE_PERCENT
@@ -1976,7 +2274,7 @@ def manual_close_trade_endpoint(signal_id):
     try:
         current_price = float(redis_client.hget(REDIS_PRICES_HASH_NAME, signal_to_close['symbol']))
     except (TypeError, ValueError):
-        try: current_price = float(client.get_symbol_ticker(symbol=signal_to_close['symbol'])['price'])
+        try: current_price = float(safe_get_symbol_ticker(symbol=signal_to_close['symbol'])['price'])
         except Exception as e: return jsonify({"success": False, "message": f"Could not fetch price: {e}"}), 500
 
     if close_signal(signal_id, current_price, 'manual'):
@@ -2163,7 +2461,7 @@ def trade_management_loop():
                                     desired_exit_quantity = original_quantity * Decimal(str(partial_exit_percent))
 
                                     base_asset = symbol.replace('USDT', '')
-                                    balance_response = client.get_asset_balance(asset=base_asset)
+                                    balance_response = safe_get_asset_balance(base_asset)
                                     actual_free_balance = Decimal(balance_response['free'])
 
                                     logger.info(f"  -> [{symbol}] التحقق من الرصيد للخروج الجزئي. المطلوب: {desired_exit_quantity:.8f}, المسجل: {current_db_quantity:.8f}, الفعلي: {actual_free_balance:.8f}")
@@ -2285,6 +2583,13 @@ def main_loop_enhanced():
         try:
             logger.info("🔄 [الحلقة الرئيسية] بدء دورة مسح جديدة...")
 
+            # [تحسين V9.9] انتظار انتهاء الحظر المؤقت من Binance قبل بدء الدورة
+            ban_remain = rate_guard.banned_until - time.time()
+            if ban_remain > 0:
+                logger.warning(f"🚫 [الحلقة الرئيسية] حظر API ساري — الانتظار {int(ban_remain)} ثانية...")
+                time.sleep(min(ban_remain, 60.0))
+                continue
+
             # [تحسين V9.8] قاطع الحماية اليومي: إيقاف فتح صفقات جديدة عند تجاوز حد الخسارة
             if is_daily_loss_limit_hit():
                 logger.warning("🛑 [الحلقة الرئيسية] قاطع الحماية مفعّل — انتظار 5 دقائق قبل الفحص التالي...")
@@ -2350,7 +2655,7 @@ def main_loop_enhanced():
 
                         logger.info(f"  -> [{symbol}] إشارة ناجحة من {strategy_used}. جاري التحقق النهائي...")
                         
-                        try: entry_price = float(client.get_symbol_ticker(symbol=symbol)['price'])
+                        try: entry_price = float(safe_get_symbol_ticker(symbol=symbol)['price'])
                         except Exception as e: logger.error(f"❌ [{symbol}] فشل جلب سعر الدخول: {e}."); continue
 
                         # --- [تحسين V9.8] فلاتر تأكيد مستوى الإشارة ---
@@ -2417,35 +2722,65 @@ def price_update_loop():
     if not redis_client: return
     while True:
         try:
+            # [تحسين V9.9] احترام فترة الحظر المؤقت بدل تكرار الطلبات المرفوضة
+            ban_remain = rate_guard.banned_until - time.time()
+            if ban_remain > 0:
+                time.sleep(min(ban_remain, 10.0)); continue
             if validated_symbols_to_scan and client:
-                tickers = client.get_symbol_ticker()
+                tickers = safe_get_symbol_ticker()
                 prices_to_set = {t['symbol']: t['price'] for t in tickers if t['symbol'] in validated_symbols_to_scan}
                 if prices_to_set: redis_client.hset(REDIS_PRICES_HASH_NAME, mapping=prices_to_set)
-            time.sleep(2)
+            time.sleep(max(2, PRICE_UPDATE_INTERVAL_SEC))
         except Exception as e: logger.error(f"خطأ في حلقة تحديث الأسعار: {e}"); time.sleep(10)
 
 def initialize_bot_services():
     global client, validated_symbols_to_scan
     logger.info("🤖 [خدمات البوت] بدء التهيئة...")
     try:
-        client = Client(API_KEY, API_SECRET)
         init_db()
         init_redis()
-        get_exchange_info_map()
-        load_open_signals_to_cache()
-        load_notifications_to_cache()
-        validated_symbols_to_scan = get_validated_symbols()
-        Thread(target=main_loop_enhanced, daemon=True).start()
-        Thread(target=price_update_loop, daemon=True).start()
-        Thread(target=trade_management_loop, daemon=True).start()
-        logger.info("✅ [خدمات البوت] تم بدء جميع الخدمات الخلفية بنجاح.")
-        send_telegram_message("✅ *البوت قيد التشغيل الآن (نسخة V9.8.0 - Enhanced)*")
     except Exception as e:
         log_and_notify("critical", f"حدث خطأ حرج أثناء التهيئة: {e}", "SYSTEM"); exit(1)
 
+    # [تحسين V9.9] حلقة إعادة محاولة غير نهائية لاتصال Binance:
+    # عند الحظر المؤقت (-1003) ننتظر حتى انتهاء مدته بدل exit(1) الذي يسبب
+    # حلقة إعادة تشغيل سريعة من Render تضرب API أثناء الحظر وتطيل مدته
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            client = Client(API_KEY, API_SECRET)
+            get_exchange_info_map()
+            load_open_signals_to_cache()
+            load_notifications_to_cache()
+            validated_symbols_to_scan = get_validated_symbols()
+            break
+        except Exception as e:
+            msg = str(e)
+            is_ban = _is_rate_error(e)
+            if is_ban:
+                m = BAN_UNTIL_RE.search(msg)
+                if m: rate_guard.register_ban(int(m.group(1)))
+                else: rate_guard.register_ban(fallback_sec=90.0)
+                rate_guard.last_error = msg[:160]
+                wait_sec = max(5.0, min(rate_guard.banned_until - time.time(), 120.0))
+            else:
+                wait_sec = min(30.0 * attempt, 300.0)
+            logger.critical(f"⚠️ [تهيئة] فشلت محاولة رقم {attempt} للاتصال بـ Binance: {msg[:200]}")
+            logger.info(f"⏳ [تهيئة] إعادة المحاولة تلقائيًا بعد {int(wait_sec)} ثانية (اللوحة تبقى تعمل)...")
+            if attempt == 1:
+                send_telegram_message(f"⚠️ *تعذر الاتصال بـ Binance عند التهيئة*\n{msg[:200]}\nسيتم إعادة المحاولة تلقائيًا دون إيقاف الخدمة.")
+            time.sleep(wait_sec)
+
+    Thread(target=main_loop_enhanced, daemon=True).start()
+    Thread(target=price_update_loop, daemon=True).start()
+    Thread(target=trade_management_loop, daemon=True).start()
+    logger.info("✅ [خدمات البوت] تم بدء جميع الخدمات الخلفية بنجاح.")
+    send_telegram_message("✅ *البوت قيد التشغيل الآن (نسخة V9.9.0 - Neon Security)*")
+
 # ---------------------- نقطة الدخول ----------------------
 if __name__ == "__main__":
-    logger.info("🚀 إطلاق بوت التداول ولوحة التحكم (V9.8.0) 🚀")
+    logger.info("🚀 إطلاق بوت التداول ولوحة التحكم (V9.9.0 - Neon Security) 🚀")
     Thread(target=initialize_bot_services, daemon=True).start()
     port = int(os.environ.get('PORT', 10000))
     host = "0.0.0.0"

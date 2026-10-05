@@ -44,3 +44,10 @@ services:
         value: "5"
       - key: USE_HTF_CONFIRMATION
         value: "True"
+      # --- [V9.9] حماية من حظر Binance (-1003): إدارة وزن الطلبات ---
+      - key: RATE_LIMIT_BUDGET_PER_MIN
+        value: "2400"
+      - key: API_MIN_SPACING_SEC
+        value: "0.08"
+      - key: PRICE_UPDATE_INTERVAL_SEC
+        value: "3"
