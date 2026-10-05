@@ -41,7 +41,7 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-logger = logging.getLogger('CryptoBotV9.9.1')
+logger = logging.getLogger('CryptoBotV9.10.0')
 
 # زمن إقلاع العملية لحساب مدة التشغيل في لوحة التحكم
 BOOT_TIME = time.time()
@@ -145,6 +145,19 @@ BAN_RESUME_RAMP_SEC: int = config('BAN_RESUME_RAMP_SEC', default=120, cast=int)
 # فاصل تحديث أسعار Redis بالثواني (كل طلب أسعار شامل وزنه 4)
 PRICE_UPDATE_INTERVAL_SEC: int = config('PRICE_UPDATE_INTERVAL_SEC', default=3, cast=int)
 
+# --- [تحسين V9.10] الكشف الديناميكي عن العملات الأكثر حيوية (سيولة + تقلب + انفجارات) ---
+# بدل قائمة ثابتة: طلب واحد (وزن 80) يجيب إحصائيات 24 ساعة لكل العملات، ثم ترشيح وترتيب:
+# 45% السيولة (quoteVolume) + 35% التقلب (المدى اليومي high-low) + 20% الانفجار (|التغير%|)
+USE_DYNAMIC_UNIVERSE: bool = config('USE_DYNAMIC_UNIVERSE', default=True, cast=bool)
+# عدد العملات المستهدفة كل دورة (طلب المستخدم: 20 عملة مختلفة للبحث عن فرص أكثر)
+DYNAMIC_UNIVERSE_SIZE: int = config('DYNAMIC_UNIVERSE_SIZE', default=20, cast=int)
+# فترة تحديث القائمة بالدقائق (لا داعي لكل دورة — الترتيب يتغير ببطء نسبيًا)
+DYNAMIC_UNIVERSE_REFRESH_MIN: int = config('DYNAMIC_UNIVERSE_REFRESH_MIN', default=30, cast=int)
+# حد أدنى للسيولة: حجم تداول 24 ساعة بالمليون USDT (يستبعد العملات الراكدة)
+DYNAMIC_UNIVERSE_MIN_QUOTE_VOLUME: float = config('DYNAMIC_UNIVERSE_MIN_QUOTE_VOLUME', default=10000000.0, cast=float)
+# حد أدنى للتقلب: المدى اليومي % (يقصّ العملات الميتة ويستهدف الانفجارات السعرية)
+DYNAMIC_UNIVERSE_MIN_RANGE_PCT: float = config('DYNAMIC_UNIVERSE_MIN_RANGE_PCT', default=1.5, cast=float)
+
 
 BASE_ML_MODEL_NAME: str = 'LightGBM_Scalping_V9_With_Microstructure'
 MODEL_FOLDER: str = 'V9'
@@ -194,6 +207,12 @@ redis_client: Optional[redis.Redis] = None
 ml_models_cache: Dict[str, Any] = {}
 exchange_info_map: Dict[str, Any] = {}
 validated_symbols_to_scan: List[str] = []
+# [تحسين V9.10] حالة القائمة الديناميكية (العملات الأكثر حيوية)
+universe_lock = Lock()
+universe_last_refresh: float = 0.0
+universe_source: str = 'static'  # dynamic / static_fallback / static
+universe_meta: Dict[str, Any] = {}
+_static_fallback_symbols: List[str] = []
 open_signals_cache: Dict[str, Dict] = {}
 signal_cache_lock = Lock()
 notifications_cache = deque(maxlen=50)
@@ -421,6 +440,11 @@ def safe_get_symbol_ticker(symbol: Optional[str] = None):
     if symbol:
         return safe_api_call(lambda: client.get_symbol_ticker(symbol=symbol), weight=2)
     return safe_api_call(lambda: client.get_symbol_ticker(), weight=4)
+
+def safe_get_24h_stats():
+    """[تحسين V9.10] إحصائيات 24 ساعة لكل الرموز في طلب واحد (وزن 80)
+    — أرخص طريقة لقياس حيوية السوق كله: سيولة + مدى + تغير + عدد الصفقات."""
+    return safe_api_call(lambda: client.get_ticker(), weight=80)
 
 def safe_get_exchange_info():
     return safe_api_call(client.get_exchange_info, weight=20)
@@ -653,6 +677,114 @@ def get_validated_symbols(filename: str = 'crypto_list.txt') -> List[str]:
     except Exception as e:
         logger.error(f"❌ [التحقق من الرموز] خطأ: {e}", exc_info=True)
         return []
+
+
+# ============================================================
+# [تحسين V9.10] الكشف الديناميكي عن العملات الأكثر حيوية (Dynamic Universe)
+# طلب واحد كل 30 دقيقة (وزن 80) يعطي إحصائيات 24 ساعة لكل العملات ثم:
+#   ترشيح: USDT فقط + حالة TRADING + استبعاد المستقرة والرافعة + سيولة ≥ 10M + مدى ≥ 1.5%
+#   ترتيب: 45% السيولة + 35% التقلب (المدى اليومي = صيد الانفجارات) + 20% الانفجار (|تغير 24س|)
+# مع بديل آمن: القائمة الثابتة من crypto_list.txt عند أي فشل
+# ============================================================
+_LEVERAGED_PATTERNS = ('UP', 'DOWN', 'BULL', 'BEAR')
+_STABLE_BASES = {'USDC', 'FDUSD', 'TUSD', 'DAI', 'USDP', 'BUSD', 'EUR', 'AEUR',
+                 'PYUSD', 'USD1', 'USDE', 'XUSD', 'USDT'}
+
+def compute_dynamic_universe(size: Optional[int] = None) -> Tuple[List[str], Dict[str, Any]]:
+    """يرشّح كل أزواج USDT ويرتّبها بنقاط الحيوية (سيولة + تقلب + انفجار) ويختار الأعلى."""
+    size = max(5, int(size or DYNAMIC_UNIVERSE_SIZE))
+    if not client:
+        return [], {'reason': 'client غير مهيأ'}
+    if not exchange_info_map:
+        get_exchange_info_map()
+    trading_usdt = {s for s, info in exchange_info_map.items()
+                    if info.get('quoteAsset') == 'USDT' and info.get('status') == 'TRADING'}
+    rows: List[Dict[str, Any]] = []
+    for t in safe_get_24h_stats():
+        sym = str(t.get('symbol', '') or '')
+        if sym not in trading_usdt:
+            continue
+        base = sym[:-4]
+        if base in _STABLE_BASES:
+            continue
+        if any(base.endswith(p) for p in _LEVERAGED_PATTERNS):
+            continue
+        try:
+            last = float(t.get('lastPrice') or 0)
+            high = float(t.get('highPrice') or 0)
+            low = float(t.get('lowPrice') or 0)
+            qvol = float(t.get('quoteVolume') or 0)
+            chg = abs(float(t.get('priceChangePercent') or 0))
+        except (TypeError, ValueError):
+            continue
+        if last <= 0 or high <= 0 or low <= 0 or high < low:
+            continue
+        if qvol < DYNAMIC_UNIVERSE_MIN_QUOTE_VOLUME:
+            continue
+        range_pct = (high - low) / low * 100.0
+        if range_pct < DYNAMIC_UNIVERSE_MIN_RANGE_PCT:
+            continue
+        rows.append({'symbol': sym, 'qvol': qvol, 'range_pct': range_pct, 'chg': chg})
+    if not rows:
+        return [], {'reason': 'لا مرشحين بعد الفلترة (سيولة/تقلب)'}
+    def _ranks(key: str) -> Dict[int, float]:
+        order = sorted(rows, key=lambda r: r[key], reverse=True)
+        n = max(1, len(order) - 1)
+        return {id(r): (n - i) / n for i, r in enumerate(order)}
+    vol_r, rng_r, chg_r = _ranks('qvol'), _ranks('range_pct'), _ranks('chg')
+    for r in rows:
+        r['score'] = round(100 * (0.45 * vol_r[id(r)] + 0.35 * rng_r[id(r)] + 0.20 * chg_r[id(r)]), 2)
+    rows.sort(key=lambda r: r['score'], reverse=True)
+    top = rows[:size]
+    picked = [r['symbol'] for r in top]
+    meta = {
+        'candidates': len(rows),
+        'top_preview': [{'symbol': r['symbol'], 'score': r['score'],
+                         'qvol_musd': round(r['qvol'] / 1e6, 1),
+                         'range_pct': round(r['range_pct'], 2),
+                         'chg24h': round(r['chg'], 2)} for r in top[:8]],
+    }
+    logger.info(f"⚡ [القائمة الديناميكية] رُشِّح {len(rows)} عملة حيوية — اختيار أفضل {len(picked)}: {picked}")
+    try:
+        logger.info("⚡ [الأعلى حيوية] " + " | ".join(
+            f"{p['symbol']} (نقاط {p['score']}, سيولة {p['qvol_musd']}M, مدى {p['range_pct']}%, تغير {p['chg24h']}%)"
+            for p in meta['top_preview'][:5]))
+    except Exception:
+        pass
+    return picked, meta
+
+def refresh_universe_if_needed(force: bool = False) -> None:
+    """يحدّث قائمة المسح للعملات الأكثر حيوية كل DYNAMIC_UNIVERSE_REFRESH_MIN دقيقة.
+    عند أي فشل: تبقى القائمة الحالية كما هي، وإن لم توجد أصلًا يُستخدم البديل الثابت."""
+    global validated_symbols_to_scan, universe_last_refresh, universe_source, universe_meta
+    if not USE_DYNAMIC_UNIVERSE:
+        return
+    with universe_lock:
+        if not force and time.time() - universe_last_refresh < DYNAMIC_UNIVERSE_REFRESH_MIN * 60:
+            return
+    reason = ''
+    try:
+        picked, meta = compute_dynamic_universe()
+        if picked:
+            with universe_lock:
+                validated_symbols_to_scan = picked
+                universe_last_refresh = time.time()
+                universe_source = 'dynamic'
+                universe_meta = meta
+            return
+        reason = meta.get('reason', 'غير معروف')
+    except Exception as e:
+        reason = str(e)[:120]
+        logger.warning(f"⚠️ [القائمة الديناميكية] فشل الجلب: {reason}")
+    # بديل آمن: القائمة الثابتة — ولا نلمس القائمة الحالية إن كانت تعمل
+    with universe_lock:
+        if not validated_symbols_to_scan and _static_fallback_symbols:
+            validated_symbols_to_scan = _static_fallback_symbols[:]
+        if validated_symbols_to_scan:
+            if universe_source != 'dynamic' or universe_last_refresh == 0.0:
+                universe_source = 'static_fallback'
+            universe_last_refresh = time.time()
+            universe_meta = {'reason': f'fallback: {reason}'}
 
 
 # --- دوال جلب البيانات وحساب المؤشرات ---
@@ -1740,7 +1872,7 @@ def get_dashboard_html():
 <html lang="ar" dir="rtl">
 <head>
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CryptoBot V9.9.1 // NEON TERMINAL</title>
+    <title>CryptoBot V9.10.0 // NEON TERMINAL</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
         // [تحسين V9.9] ألوان الثيم الهاكر: أخضر مصفوفة + سماوي سيبراني على أسود
@@ -1821,7 +1953,7 @@ def get_dashboard_html():
         <header class="mb-6 flex flex-wrap justify-between items-center gap-4">
             <div>
                 <div dir="ltr" class="font-mono text-xs md:text-sm text-text-secondary mb-1">&gt;&gt; root@crypto-bot:~$ ./trading_engine --live --region=eu-frankfurt<span class="cursor"></span></div>
-                <h1 class="text-2xl md:text-3xl font-extrabold flicker"><span class="text-accent-green neon-text">لوحة تحكم</span> <span class="font-mono text-text-secondary text-lg md:text-xl" dir="ltr">V9.9.1//NEON</span></h1>
+                <h1 class="text-2xl md:text-3xl font-extrabold flicker"><span class="text-accent-green neon-text">لوحة تحكم</span> <span class="font-mono text-text-secondary text-lg md:text-xl" dir="ltr">V9.10.0//NEON</span></h1>
             </div>
             <div id="trend-lights-container" class="flex items-center gap-x-6 bg-black/40 px-4 py-2 rounded-lg border border-border-color"></div>
         </header>
@@ -2128,7 +2260,7 @@ function updateSystemStatus() {
         else { lg.textContent = 'سليم'; lg.className = 'font-mono text-accent-green'; }
         const st = document.getElementById('sys-storage');
         st.textContent = data.redis_mode === 'redis' ? 'Redis' : (data.redis_mode === 'memory' ? 'ذاكرة داخلية' : 'غير متصل');
-        document.getElementById('sys-symbols').textContent = data.symbols_count;
+        document.getElementById('sys-symbols').textContent = data.symbols_count + (data.universe_mode === 'dynamic' ? ' ⚡ديناميكية' : ' 📋ثابتة');
         document.getElementById('sys-uptime').textContent = fmtUptime(data.uptime_sec);
     });
 }
@@ -2187,7 +2319,7 @@ def home(): return render_template_string(get_dashboard_html())
 @app.route('/health')
 def health_check():
     """[تحسين V9.8] نقطة فحص صحة خفيفة لمراقبة الخدمة على Render وأدوات Uptime."""
-    return jsonify({"status": "ok", "version": "V9.9.1", "time": datetime.now(timezone.utc).isoformat()})
+    return jsonify({"status": "ok", "version": "V9.10.0", "time": datetime.now(timezone.utc).isoformat()})
 
 # --- [تحسين V9.9] نقطة حالة النظام: وزن الطلبات، الحظر، قاطع الحماية، التخزين ---
 @app.route('/api/system_status')
@@ -2206,7 +2338,7 @@ def api_system_status():
         except Exception:
             pass
         return jsonify({
-            'version': 'V9.9.1',
+            'version': 'V9.10.0',
             'client_ready': bool(client),
             'rate_guard': snap,
             'daily_pnl_usdt': pnl,
@@ -2217,6 +2349,11 @@ def api_system_status():
             'open_trades': open_count,
             'redis_mode': 'redis' if is_real_redis else ('memory' if redis_client is not None else 'none'),
             'uptime_sec': int(time.time() - BOOT_TIME),
+            # [تحسين V9.10] حالة القائمة الديناميكية
+            'universe_mode': universe_source,
+            'universe_refresh_min': DYNAMIC_UNIVERSE_REFRESH_MIN if USE_DYNAMIC_UNIVERSE else 0,
+            'universe_updated_sec_ago': int(time.time() - universe_last_refresh) if universe_last_refresh else None,
+            'universe_top_preview': universe_meta.get('top_preview', []) if isinstance(universe_meta, dict) else [],
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -2690,6 +2827,10 @@ def main_loop_enhanced():
                 time.sleep(300)
                 continue
 
+            # [تحسين V9.10] تحديث قائمة العملات الديناميكية عند موعدها (كل 30 دقيقة افتراضيًا)
+            # يختار كل مرة العملات الأكثر حيوية: سيولة + تقلب + انفجارات سعرية
+            refresh_universe_if_needed()
+
             determine_market_state_enhanced()
             btc_data = get_btc_data_for_bot()
             symbols_to_process = random.sample(validated_symbols_to_scan, len(validated_symbols_to_scan))
@@ -2848,6 +2989,10 @@ def initialize_bot_services():
             load_open_signals_to_cache()
             load_notifications_to_cache()
             validated_symbols_to_scan = get_validated_symbols()
+            # [تحسين V9.10] حفظ القائمة الثابتة كبديل احتياطي ثم كشف فوري للعملات الأكثر حيوية
+            _static_fallback_symbols[:] = validated_symbols_to_scan
+            if USE_DYNAMIC_UNIVERSE:
+                refresh_universe_if_needed(force=True)
             break
         except Exception as e:
             msg = str(e)
@@ -2870,11 +3015,11 @@ def initialize_bot_services():
     Thread(target=price_update_loop, daemon=True).start()
     Thread(target=trade_management_loop, daemon=True).start()
     logger.info("✅ [خدمات البوت] تم بدء جميع الخدمات الخلفية بنجاح.")
-    send_telegram_message("✅ *البوت قيد التشغيل الآن (نسخة V9.9.1 - Neon Security)*")
+    send_telegram_message("✅ *البوت قيد التشغيل الآن (نسخة V9.10.0 - Neon Security)*")
 
 # ---------------------- نقطة الدخول ----------------------
 if __name__ == "__main__":
-    logger.info("🚀 إطلاق بوت التداول ولوحة التحكم (V9.9.1 - Neon Security) 🚀")
+    logger.info("🚀 إطلاق بوت التداول ولوحة التحكم (V9.10.0 - Neon Security) 🚀")
     Thread(target=initialize_bot_services, daemon=True).start()
     port = int(os.environ.get('PORT', 10000))
     host = "0.0.0.0"

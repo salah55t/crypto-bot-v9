@@ -55,3 +55,14 @@ services:
         value: "120"
       - key: PRICE_UPDATE_INTERVAL_SEC
         value: "3"
+      # --- [V9.10] القائمة الديناميكية: العملات الأكثر حيوية (سيولة + تقلب + انفجارات) ---
+      - key: USE_DYNAMIC_UNIVERSE
+        value: "True"
+      - key: DYNAMIC_UNIVERSE_SIZE
+        value: "20"
+      - key: DYNAMIC_UNIVERSE_REFRESH_MIN
+        value: "30"
+      - key: DYNAMIC_UNIVERSE_MIN_QUOTE_VOLUME
+        value: "10000000"
+      - key: DYNAMIC_UNIVERSE_MIN_RANGE_PCT
+        value: "1.5"
