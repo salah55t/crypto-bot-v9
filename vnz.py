@@ -42,7 +42,7 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-logger = logging.getLogger('CryptoBotV9.10.1')
+logger = logging.getLogger('CryptoBotV9.11.0')
 
 # زمن إقلاع العملية لحساب مدة التشغيل في لوحة التحكم
 BOOT_TIME = time.time()
@@ -146,7 +146,7 @@ BAN_RESUME_RAMP_SEC: int = config('BAN_RESUME_RAMP_SEC', default=120, cast=int)
 # فاصل تحديث أسعار Redis بالثواني (كل طلب أسعار شامل وزنه 4)
 PRICE_UPDATE_INTERVAL_SEC: int = config('PRICE_UPDATE_INTERVAL_SEC', default=3, cast=int)
 
-# --- [تحسين V9.10.1] منع اختناق خيوط الويب (waitress queue depth) ---
+# --- [تحسين V9.11.0] منع اختناق خيوط الويب (waitress queue depth) ---
 # السبب الجذري: /api/market_status كان يستدعي Binance مباشرة (وزن 5) في كل استطلاع
 # من المتصفح كل 5 ثوانٍ — وأثناء انشغال الحارس أو الحظر يبقى خيط waitress محجوزًا
 # في acquire() لثوانٍ إلى دقائق، فتتراكم الطابور (Task queue depth 1..15+).
@@ -312,7 +312,7 @@ class BinanceRateGuard:
     def acquire(self, weight: int = 1) -> None:
         """يُستدعى قبل كل طلب REST: يحجز الوزن مسبقًا وينتظر عند الحاجة.
         [V9.9.1] بعد الحظر: تبريد استئناف ثم فاصل متدرج ×4 يمنع انفجار الخيوط.
-        [V9.10.1] إصلاح اختناق اللوحة: النوم يتم خارج القفل — كان النوم داخل
+        [V9.11.0] إصلاح اختناق اللوحة: النوم يتم خارج القفل — كان النوم داخل
         القفل يُسلسل كل الخيوط (بوت + لوحة) خلف بعضها ويستنزف خيوط waitress."""
         weight = max(1, int(weight))
         while True:
@@ -331,7 +331,7 @@ class BinanceRateGuard:
                 if used + weight <= self.budget:
                     gap = now - self._last_call
                     if gap >= spacing:
-                        # حجز فوري بدون أي نوم داخل القفل (V9.10.1)
+                        # حجز فوري بدون أي نوم داخل القفل (V9.11.0)
                         self._window.append((now, weight))
                         self._last_call = now
                         self.total_requests += 1
@@ -376,7 +376,7 @@ class BinanceRateGuard:
 
 rate_guard = BinanceRateGuard(RATE_LIMIT_BUDGET_PER_MIN, API_MIN_SPACING_SEC)
 
-# --- [تحسين V9.10.1] كاش رصيد USDT للوحة: قراءة فورية بلا نداء شبكي ---
+# --- [تحسين V9.11.0] كاش رصيد USDT للوحة: قراءة فورية بلا نداء شبكي ---
 _usdt_balance_cache: Dict[str, Any] = {'value': None, 'ts': 0.0}
 _usdt_balance_lock = Lock()
 
@@ -413,6 +413,128 @@ def balance_refresh_loop():
         except Exception as e:
             logger.debug(f"[كاش الرصيد] خطأ: {e}")
         time.sleep(max(10, DASHBOARD_BALANCE_REFRESH_SEC))
+
+# --- [تحسين V9.11] بوصلة اتجاه BTC: فريمات ثلاث عبر API مجاني بتكلفة وزن شبه معدومة ---
+# طلب واحد لكل فريم (limit=150 شمعة، وزن 2) كل دقيقة = 6 وزن/دقيقة فقط.
+# تعطي اللوحة اتجاهًا واضحًا (درجة -100..+100 + تسمية عربية) لكل فريم 15م/1س/4س.
+BTC_TREND_REFRESH_SEC: int = config('BTC_TREND_REFRESH_SEC', default=60, cast=int)
+BTC_TREND_TFS: List[str] = ['15m', '1h', '4h']
+_TF_WEIGHTS: Dict[str, float] = {'15m': 0.2, '1h': 0.3, '4h': 0.5}
+
+_btc_trend_cache: Dict[str, Any] = {'data': None, 'ts': 0.0}
+_btc_trend_lock = Lock()
+
+def _rsi_series(closes: pd.Series, period: int = 14) -> pd.Series:
+    """RSI بطريقة Wilder المُنعّمة — يعيد سلسلة بنفس الطول.
+    حالات حدّية: صعود خالص (خسارة=0) → 100، سكون تام → 50."""
+    delta = closes.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1.0 / period, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1.0 / period, adjust=False).mean()
+    rs = gain / loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    rsi = rsi.mask((loss == 0) & (gain > 0), 100.0)   # صعود خالص
+    rsi = rsi.mask((gain == 0) & (loss == 0), 50.0)   # سكون تام
+    return rsi.fillna(50.0)
+
+def compute_tf_trend(closes: List[float]) -> Dict[str, Any]:
+    """يحسب اتجاه فريم واحد من أسعار الإغلاق: درجة -100..+100 + تسمية عربية.
+    مكونات الدرجة: محاذاة EMA9/21/50 + السعر مقابل EMA50 + MACD هيستوغرام
+    + RSI (منطقة 50) + زخم 10 شموع — كلها مؤشرات قياسية مجانية بلا أي خدمة خارجية."""
+    s = pd.Series([float(c) for c in closes], dtype=float)
+    if len(s) < 60:
+        return {'score': 0, 'label': 'بيانات غير كافية', 'arrow': '⏳', 'color': 'yellow',
+                'rsi': 50.0, 'momentum_pct': 0.0, 'price': float(s.iloc[-1]) if len(s) else None}
+    ema9 = s.ewm(span=9, adjust=False).mean().iloc[-1]
+    ema21 = s.ewm(span=21, adjust=False).mean().iloc[-1]
+    ema50 = s.ewm(span=50, adjust=False).mean().iloc[-1]
+    rsi = float(_rsi_series(s).iloc[-1])
+    macd_line = s.ewm(span=12, adjust=False).mean() - s.ewm(span=26, adjust=False).mean()
+    macd_hist = float((macd_line - macd_line.ewm(span=9, adjust=False).mean()).iloc[-1])
+    momentum_pct = float((s.iloc[-1] / s.iloc[-11] - 1.0) * 100.0) if s.iloc[-11] else 0.0
+    last = float(s.iloc[-1])
+    # [V9.11] قياس الفصل بين المتوسطات نسبةً إلى ضجيج السعر الفعلي (متوسط حركة الشمعة)
+    # بدل المقارنة الثنائية — يمنع تصنيف السوق العرضي الضيق كـ"هابط قوي" أو "صاعد قوي"
+    noise = float(s.diff().abs().tail(20).mean())
+    if not noise or noise <= 0: noise = max(last * 1e-4, 1e-9)
+    # مكوّنات الدرجة (مجموعها الأقصى ≈ ±100)
+    score = 0.0
+    score += 18.0 * float(np.tanh((ema9 - ema21) / (2.0 * noise)))    # محاذاة سريعة
+    score += 18.0 * float(np.tanh((ema21 - ema50) / (2.0 * noise)))   # محاذاة هيكلية
+    score += 14.0 * float(np.tanh((last - ema50) / (3.0 * noise)))    # السعر مقابل الهيكل
+    score += 20.0 * float(np.tanh(macd_hist / (2.0 * noise)))         # قوة MACD
+    score += max(-20.0, min(20.0, (rsi - 50.0) * 0.5))                # انحياز RSI حول 50
+    score += 10.0 * float(np.tanh(momentum_pct / 2.0))                # زخم 10 شموع
+    score = max(-100.0, min(100.0, score))
+    if score >= 45: label, arrow, color = 'صاعد قوي', '▲▲', 'green'
+    elif score >= 18: label, arrow, color = 'صاعد', '▲', 'green'
+    elif score > -18: label, arrow, color = 'محايد', '▬', 'yellow'
+    elif score > -45: label, arrow, color = 'هابط', '▼', 'red'
+    else: label, arrow, color = 'هابط قوي', '▼▼', 'red'
+    return {'score': round(score, 1), 'label': label, 'arrow': arrow, 'color': color,
+            'rsi': round(rsi, 1), 'momentum_pct': round(momentum_pct, 2), 'price': last}
+
+def _trend_label_from_score(score: float) -> Tuple[str, str, str]:
+    if score >= 45: return 'صاعد قوي', '▲▲', 'green'
+    if score >= 18: return 'صاعد', '▲', 'green'
+    if score > -18: return 'محايد', '▬', 'yellow'
+    if score > -45: return 'هابط', '▼', 'red'
+    return 'هابط قوي', '▼▼', 'red'
+
+def fetch_btc_trend_matrix(force: bool = False) -> Optional[Dict[str, Any]]:
+    """يجلب شموع BTC للفريمات الثلاث (طلبات عامة مجانية وزن 2 لكل فريم) ويحسب البوصلة.
+    يعيد الكاش خلال نافذة التحديث ما لم force=True. عند الفشل تبقى آخر بيانات صالحة."""
+    now = time.time()
+    with _btc_trend_lock:
+        if not force and _btc_trend_cache['data'] and (now - _btc_trend_cache['ts']) < BTC_TREND_REFRESH_SEC:
+            return _btc_trend_cache['data']
+    if not client:
+        return _btc_trend_cache['data']
+    tfs_out: Dict[str, Any] = {}
+    try:
+        for tf in BTC_TREND_TFS:
+            klines = safe_api_call(client.get_klines, symbol=BTC_SYMBOL, interval=tf, limit=150, weight=2)
+            closes = [float(k[4]) for k in klines] if klines else []
+            tfs_out[tf] = compute_tf_trend(closes)
+        if not tfs_out:
+            return _btc_trend_cache['data']
+        overall_score = sum(float(tfs_out[tf]['score']) * w for tf, w in _TF_WEIGHTS.items() if tf in tfs_out)
+        o_label, o_arrow, o_color = _trend_label_from_score(overall_score)
+        bulls = sum(1 for t in tfs_out.values() if t['score'] >= 18)
+        bears = sum(1 for t in tfs_out.values() if t['score'] <= -18)
+        agreement = ('موحد صاعد ✓' if bulls == len(tfs_out)
+                     else 'موحد هابط ✓' if bears == len(tfs_out)
+                     else 'متضارب ⚠' if bulls and bears else 'انتظاري')
+        price = tfs_out.get('15m', {}).get('price')
+        data = {'tfs': tfs_out,
+                'overall': {'score': round(overall_score, 1), 'label': o_label,
+                            'arrow': o_arrow, 'color': o_color, 'agreement': agreement},
+                'updated': datetime.now(timezone.utc).isoformat(),
+                'stale': False}
+        with _btc_trend_lock:
+            _btc_trend_cache['data'] = data
+            _btc_trend_cache['ts'] = time.time()
+        return data
+    except Exception as e:
+        logger.warning(f"⚠️ [بوصلة BTC] تعذر التحديث: {e}")
+        data = _btc_trend_cache['data']
+        if data and (now - _btc_trend_cache['ts']) > 3 * BTC_TREND_REFRESH_SEC:
+            stale = dict(data); stale['stale'] = True
+            return stale
+        return data
+
+def btc_trend_loop():
+    """خيط خلفي: يحدّث بوصلة BTC دوريًا — يستثمر فترات الحظر ولا يزاحم المسح."""
+    time.sleep(5)  # مهلة تهيئة العميل
+    while True:
+        try:
+            ban_remain = rate_guard.banned_until - time.time()
+            if ban_remain > 0:
+                time.sleep(min(ban_remain, 10.0)); continue
+            if client:
+                fetch_btc_trend_matrix(force=True)
+        except Exception as e:
+            logger.debug(f"[بوصلة BTC] خطأ: {e}")
+        time.sleep(max(20, BTC_TREND_REFRESH_SEC))
 
 BAN_UNTIL_RE = re.compile(r'banned until (\d+)', re.IGNORECASE)
 
@@ -1923,7 +2045,7 @@ def get_dashboard_html():
 <html lang="ar" dir="rtl">
 <head>
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CryptoBot V9.10.1 // NEON TERMINAL</title>
+    <title>CryptoBot V9.11.0 // NEON TERMINAL</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
         // [تحسين V9.9] ألوان الثيم الهاكر: أخضر مصفوفة + سماوي سيبراني على أسود
@@ -2004,7 +2126,7 @@ def get_dashboard_html():
         <header class="mb-6 flex flex-wrap justify-between items-center gap-4">
             <div>
                 <div dir="ltr" class="font-mono text-xs md:text-sm text-text-secondary mb-1">&gt;&gt; root@crypto-bot:~$ ./trading_engine --live --region=eu-frankfurt<span class="cursor"></span></div>
-                <h1 class="text-2xl md:text-3xl font-extrabold flicker"><span class="text-accent-green neon-text">لوحة تحكم</span> <span class="font-mono text-text-secondary text-lg md:text-xl" dir="ltr">V9.10.1//NEON</span></h1>
+                <h1 class="text-2xl md:text-3xl font-extrabold flicker"><span class="text-accent-green neon-text">لوحة تحكم</span> <span class="font-mono text-text-secondary text-lg md:text-xl" dir="ltr">V9.11.0//NEON</span></h1>
             </div>
             <div id="trend-lights-container" class="flex items-center gap-x-6 bg-black/40 px-4 py-2 rounded-lg border border-border-color"></div>
         </header>
@@ -2013,6 +2135,28 @@ def get_dashboard_html():
             <div class="card p-4"><h3 class="font-bold mb-3 text-lg text-text-secondary">الجلسات النشطة</h3><div id="active-sessions-list" class="flex flex-wrap gap-2 items-center justify-center pt-2">...</div></div>
             <div class="card p-4"><h3 class="font-bold mb-3 text-lg text-text-secondary">الصفقات المفتوحة</h3><div id="open-trades-count" class="text-2xl font-bold text-center">...</div></div>
             <div class="card p-4 flex flex-col justify-center items-center"><h3 class="font-bold text-lg text-text-secondary mb-2">التداول الحقيقي</h3><div class="flex items-center space-x-3 space-x-reverse"><span id="trading-status-text" class="font-bold text-lg"></span><label class="flex items-center cursor-pointer"><div class="relative"><input type="checkbox" id="trading-toggle" class="sr-only" onchange="toggleTrading()"><div class="toggle-bg block bg-gray-600 w-12 h-7 rounded-full"></div></div></label></div><div class="mt-2 text-xs text-text-secondary">رصيد USDT: <span id="usdt-balance" class="font-mono">...</span></div></div>
+        </section>
+        <!-- [تحسين V9.11] بوصلة اتجاه BTC على الفريمات الثلاث (API مجاني) -->
+        <section class="card p-4 mb-6">
+            <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
+                <h3 class="font-bold text-lg text-text-secondary">🧭 بوصلة اتجاه BTC</h3>
+                <div class="text-xs text-text-secondary font-mono" id="btc-trend-updated" dir="ltr">--</div>
+            </div>
+            <div class="grid grid-cols-1 lg:grid-cols-4 gap-4 items-stretch">
+                <div class="lg:col-span-1 flex flex-col justify-center items-center bg-black/40 rounded-lg border border-border-color p-3">
+                    <div id="btc-overall-arrow" class="text-4xl leading-none">⏳</div>
+                    <div id="btc-overall-label" class="text-xl font-bold mt-2 text-text-secondary">جاري التحليل...</div>
+                    <div class="w-full mt-2 h-2 bg-gray-800 rounded-full relative overflow-hidden" dir="ltr">
+                        <div class="absolute left-1/2 top-0 w-px h-full bg-gray-600"></div>
+                        <div id="btc-overall-bar" class="absolute top-0 h-full rounded-full transition-all duration-700" style="left:50%;width:0"></div>
+                    </div>
+                    <div id="btc-overall-agreement" class="text-xs text-text-secondary mt-2">--</div>
+                    <div id="btc-price" class="font-mono text-sm mt-1 text-accent-green" dir="ltr">--</div>
+                </div>
+                <div class="lg:col-span-3 grid grid-cols-1 md:grid-cols-3 gap-3" id="btc-tf-grid">
+                    <div class="text-text-secondary text-sm text-center py-6">جاري أول تحليل للفريمات (15م / 1س / 4س)...</div>
+                </div>
+            </div>
         </section>
         <!-- [تحسين V9.9] شريط مراقبة النظام الحي: وزن API، الاتصال، قاطع الحماية -->
         <section class="card p-3 md:p-4 mb-6">
@@ -2154,6 +2298,59 @@ function showTab(tabId, el) {
 }
 async function fetchData(url) { try { const r = await fetch(url); return r.ok ? await r.json() : null; } catch (e) { console.error('Fetch Error:', e); return null; } }
 
+function updateBtcTrend() {
+    fetchData('/api/btc_trend').then(data => {
+        if (!data) return;
+        if (data.status === 'init') return; // تبقى رسالة "جاري أول تحليل"
+        const cMap = {green: 'text-accent-green', red: 'text-accent-red', yellow: 'text-accent-yellow'};
+        const barMap = {green: '#00ff41', red: '#ff3b3b', yellow: '#ffd60a'};
+        // البطاقة العامة
+        const ov = data.overall || {};
+        const arrowEl = document.getElementById('btc-overall-arrow');
+        arrowEl.textContent = ov.arrow || '▬';
+        arrowEl.className = `text-4xl leading-none ${cMap[ov.color] || 'text-text-secondary'}`;
+        const labelEl = document.getElementById('btc-overall-label');
+        labelEl.textContent = ov.label || '--';
+        labelEl.className = `text-xl font-bold mt-2 ${cMap[ov.color] || 'text-text-secondary'}`;
+        const pct = Math.min(100, Math.abs(ov.score || 0)) / 2; // نصف العرض لكل اتجاه
+        const bar = document.getElementById('btc-overall-bar');
+        if ((ov.score || 0) >= 0) { bar.style.left = '50%'; bar.style.right = 'auto'; }
+        else { bar.style.left = (50 - pct) + '%'; bar.style.right = 'auto'; }
+        bar.style.width = pct + '%';
+        bar.style.background = barMap[ov.color] || '#888';
+        document.getElementById('btc-overall-agreement').textContent =
+            (data.stale ? '⏳ بيانات قديمة | ' : '') + (ov.agreement || '--');
+        document.getElementById('btc-price').textContent =
+            data.tfs?.['15m']?.price ? 'BTC ' + parseFloat(data.tfs['15m'].price).toLocaleString('en-US', {maximumFractionDigits: 1}) + '$' : '--';
+        const upd = document.getElementById('btc-trend-updated');
+        if (data.updated) { const d = new Date(data.updated); upd.textContent = 'تحديث: ' + d.toLocaleTimeString('ar-EG', {hour: '2-digit', minute: '2-digit'}); }
+        // بطاقات الفريمات الثلاث
+        const grid = document.getElementById('btc-tf-grid');
+        const tfNames = {'15m': '15 دقيقة', '1h': 'ساعة', '4h': '4 ساعات'};
+        grid.innerHTML = ['15m', '1h', '4h'].map(tf => {
+            const t = data.tfs?.[tf];
+            if (!t) return '';
+            const tp = Math.min(100, Math.abs(t.score)) / 2;
+            const pos = t.score >= 0 ? `left:50%;width:${tp}%` : `left:${50 - tp}%;width:${tp}%`;
+            const mom = t.momentum_pct != null ? (t.momentum_pct >= 0 ? '+' : '') + t.momentum_pct + '%' : '--';
+            const momClass = (t.momentum_pct || 0) >= 0 ? 'text-accent-green' : 'text-accent-red';
+            return `
+            <div class="bg-black/40 rounded-lg border border-border-color p-3 flex flex-col items-center justify-center gap-1">
+                <div class="text-xs font-mono text-text-secondary" dir="ltr">${tf} · ${tfNames[tf]}</div>
+                <div class="text-3xl leading-none ${cMap[t.color] || ''}">${t.arrow || '▬'}</div>
+                <div class="font-bold ${cMap[t.color] || 'text-text-secondary'}">${t.label || '--'}</div>
+                <div class="w-full h-1.5 bg-gray-800 rounded-full relative overflow-hidden mt-1" dir="ltr">
+                    <div class="absolute left-1/2 top-0 w-px h-full bg-gray-600"></div>
+                    <div class="absolute top-0 h-full rounded-full transition-all duration-700" style="${pos};background:${barMap[t.color] || '#888'}"></div>
+                </div>
+                <div class="flex justify-between w-full text-xs font-mono mt-1" dir="ltr">
+                    <span class="text-text-secondary">RSI ${t.rsi != null ? t.rsi : '--'}</span>
+                    <span class="${momClass}">${mom}</span>
+                </div>
+            </div>`;
+        }).join('');
+    });
+}
 function updateMarketStatus() {
     fetchData('/api/market_status').then(data => {
         if (!data) return;
@@ -2174,7 +2371,7 @@ function updateMarketStatus() {
         tradeToggle.checked = data.is_trading_enabled;
         tradeText.textContent = data.is_trading_enabled ? 'مُفعَّل' : 'غير مُفعَّل';
         tradeText.className = `font-bold text-lg ${data.is_trading_enabled ? 'text-accent-green' : 'text-accent-red'}`;
-        document.getElementById('usdt-balance').textContent = data.usdt_balance ? parseFloat(data.usdt_balance).toFixed(2) : 'N/A';
+        document.getElementById('usdt-balance').textContent = (data.usdt_balance != null && !isNaN(parseFloat(data.usdt_balance))) ? parseFloat(data.usdt_balance).toFixed(2) : 'N/A';
 
         if(data.settings) {
             document.getElementById('risk-percent').value = data.settings.risk_percent;
@@ -2356,12 +2553,13 @@ function saveSettings() {
 }
 
 document.addEventListener('DOMContentLoaded', () => {
-    ['MarketStatus', 'Signals', 'Stats', 'Notifications', 'Rejections', 'SystemStatus'].forEach(f => window[`update${f}`]());
-    // [تحسين V9.10.1] إيقاف الاستطلاع عند إخفاء التبويب — يمنع تراكم الطلبات
+    ['MarketStatus', 'Signals', 'Stats', 'Notifications', 'Rejections', 'SystemStatus', 'BtcTrend'].forEach(f => window[`update${f}`]());
+    // [تحسين V9.11.0] إيقاف الاستطلاع عند إخفاء التبويب — يمنع تراكم الطلبات
     // من التبويبات الخلفية ويخفف الضغط على خيوط الخادم (waitress queue)
     const whenVisible = (fn, ms) => setInterval(() => { if (!document.hidden) fn(); }, ms);
     whenVisible(updateMarketStatus, 5000); whenVisible(updateSignals, 7000); whenVisible(updateStats, 60000);
     whenVisible(updateNotifications, 15000); whenVisible(updateRejections, 15000); whenVisible(updateSystemStatus, 5000);
+    whenVisible(updateBtcTrend, 30000);  // [تحسين V9.11] البوصلة تُحدّث كل 30 ثانية
 });
 </script>
 </body></html>
@@ -2373,7 +2571,7 @@ def home(): return render_template_string(get_dashboard_html())
 @app.route('/health')
 def health_check():
     """[تحسين V9.8] نقطة فحص صحة خفيفة لمراقبة الخدمة على Render وأدوات Uptime."""
-    return jsonify({"status": "ok", "version": "V9.10.1", "time": datetime.now(timezone.utc).isoformat()})
+    return jsonify({"status": "ok", "version": "V9.11.0", "time": datetime.now(timezone.utc).isoformat()})
 
 # --- [تحسين V9.9] نقطة حالة النظام: وزن الطلبات، الحظر، قاطع الحماية، التخزين ---
 @app.route('/api/system_status')
@@ -2392,7 +2590,7 @@ def api_system_status():
         except Exception:
             pass
         return jsonify({
-            'version': 'V9.10.1',
+            'version': 'V9.11.0',
             'client_ready': bool(client),
             'rate_guard': snap,
             'daily_pnl_usdt': pnl,
@@ -2417,7 +2615,7 @@ def get_market_status():
     with market_state_lock: state_copy = dict(current_market_state)
     with trading_status_lock: is_enabled = is_trading_enabled
     active_sessions, _, _ = get_session_state()
-    # [تحسين V9.10.1] قراءة الرصيد من الكاش فقط — لا نداء Binance من خيوط الويب أبدًا
+    # [تحسين V9.11.0] قراءة الرصيد من الكاش فقط — لا نداء Binance من خيوط الويب أبدًا
     # (كان يستهلك خيط waitress أثناء انشغال الحارس/الحظر ويسبب تراكم Task queue)
     usdt_balance = get_cached_usdt_balance()
     if usdt_balance is None: usdt_balance = 'N/A'
@@ -2450,6 +2648,14 @@ def get_market_status():
             "use_sr_breakout_strategy": use_sr_breakout,
         }
     })
+
+@app.route('/api/btc_trend')
+def api_btc_trend():
+    """[تحسين V9.11] بوصلة اتجاه BTC — تقرأ الكاش فقط بلا أي نداء شبكي من خيوط الويب."""
+    data = _btc_trend_cache['data']
+    if not data:
+        return jsonify({'status': 'init', 'message': 'جاري أول تحليل للفريمات...'})
+    return jsonify(data)
 
 @app.route('/api/stats')
 def get_stats():
@@ -3068,27 +3274,28 @@ def initialize_bot_services():
     Thread(target=main_loop_enhanced, daemon=True).start()
     Thread(target=price_update_loop, daemon=True).start()
     Thread(target=trade_management_loop, daemon=True).start()
-    Thread(target=balance_refresh_loop, daemon=True).start()  # [تحسين V9.10.1] كاش رصيد اللوحة
+    Thread(target=balance_refresh_loop, daemon=True).start()  # [تحسين V9.11.0] كاش رصيد اللوحة
+    Thread(target=btc_trend_loop, daemon=True).start()        # [تحسين V9.11] بوصلة اتجاه BTC
     logger.info("✅ [خدمات البوت] تم بدء جميع الخدمات الخلفية بنجاح.")
-    send_telegram_message("✅ *البوت قيد التشغيل الآن (نسخة V9.10.1 - Neon Security)*")
+    send_telegram_message("✅ *البوت قيد التشغيل الآن (نسخة V9.11.0 - Neon Security)*")
 
 # ---------------------- نقطة الدخول ----------------------
 if __name__ == "__main__":
-    # [تحسين V9.10.1] تخفيف تجوّع CPU على خطة Render المجانية (0.1 CPU):
+    # [تحسين V9.11.0] تخفيف تجوّع CPU على خطة Render المجانية (0.1 CPU):
     # حسابات pandas لـ 20 عملة تحتجز الـ GIL — تقصير مفتاح التبديل يمنح خيوط
     # الويب فرصة تنفيذ أسرع ويمنع تراكم طابور waitress أثناء دورات المسح
     try:
         sys.setswitchinterval(0.002)
     except Exception:
         pass
-    logger.info("🚀 إطلاق بوت التداول ولوحة التحكم (V9.10.1 - Neon Security) 🚀")
+    logger.info("🚀 إطلاق بوت التداول ولوحة التحكم (V9.11.0 - Neon Security) 🚀")
     Thread(target=initialize_bot_services, daemon=True).start()
     port = int(os.environ.get('PORT', 10000))
     host = "0.0.0.0"
     logger.info(f"✅ بدء لوحة التحكم على {host}:{port}")
     try:
         from waitress import serve
-        # [تحسين V9.10.1] رفع الخيوط 8→12: الاستطلاع من اللوحة (6 نقاط نهاية)
+        # [تحسين V9.11.0] رفع الخيوط 8→12: الاستطلاع من اللوحة (6 نقاط نهاية)
         # + فحوصات صحة Render تمر حتى أثناء دورات المسح الثقيلة
         serve(app, host=host, port=port, threads=12)
     except ImportError:

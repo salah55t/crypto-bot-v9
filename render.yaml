@@ -69,3 +69,6 @@ services:
       # --- [V9.10.1] منع اختناق خيوط الويب: كاش رصيد اللوحة بدل النداء المباشر ---
       - key: DASHBOARD_BALANCE_REFRESH_SEC
         value: "45"
+      # --- [V9.11] بوصلة اتجاه BTC على الفريمات الثلاث (API مجاني، وزن 6/دقيقة) ---
+      - key: BTC_TREND_REFRESH_SEC
+        value: "60"
