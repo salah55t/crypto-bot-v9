@@ -1,6 +1,7 @@
 
 import time
 import os
+import sys
 import json
 import logging
 import requests
@@ -41,7 +42,7 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-logger = logging.getLogger('CryptoBotV9.10.0')
+logger = logging.getLogger('CryptoBotV9.10.1')
 
 # زمن إقلاع العملية لحساب مدة التشغيل في لوحة التحكم
 BOOT_TIME = time.time()
@@ -144,6 +145,13 @@ BAN_RESUME_COOLDOWN_SEC: int = config('BAN_RESUME_COOLDOWN_SEC', default=90, cas
 BAN_RESUME_RAMP_SEC: int = config('BAN_RESUME_RAMP_SEC', default=120, cast=int)
 # فاصل تحديث أسعار Redis بالثواني (كل طلب أسعار شامل وزنه 4)
 PRICE_UPDATE_INTERVAL_SEC: int = config('PRICE_UPDATE_INTERVAL_SEC', default=3, cast=int)
+
+# --- [تحسين V9.10.1] منع اختناق خيوط الويب (waitress queue depth) ---
+# السبب الجذري: /api/market_status كان يستدعي Binance مباشرة (وزن 5) في كل استطلاع
+# من المتصفح كل 5 ثوانٍ — وأثناء انشغال الحارس أو الحظر يبقى خيط waitress محجوزًا
+# في acquire() لثوانٍ إلى دقائق، فتتراكم الطابور (Task queue depth 1..15+).
+# الحل: خيط خلفي يحدّث رصيد USDT في كاش، واللوحة تقرأ الكاش فورًا بلا أي نداء شبكي.
+DASHBOARD_BALANCE_REFRESH_SEC: int = config('DASHBOARD_BALANCE_REFRESH_SEC', default=45, cast=int)
 
 # --- [تحسين V9.10] الكشف الديناميكي عن العملات الأكثر حيوية (سيولة + تقلب + انفجارات) ---
 # بدل قائمة ثابتة: طلب واحد (وزن 80) يجيب إحصائيات 24 ساعة لكل العملات، ثم ترشيح وترتيب:
@@ -303,7 +311,9 @@ class BinanceRateGuard:
 
     def acquire(self, weight: int = 1) -> None:
         """يُستدعى قبل كل طلب REST: يحجز الوزن مسبقًا وينتظر عند الحاجة.
-        [V9.9.1] بعد الحظر: تبريد استئناف ثم فاصل متدرج ×4 يمنع انفجار الخيوط."""
+        [V9.9.1] بعد الحظر: تبريد استئناف ثم فاصل متدرج ×4 يمنع انفجار الخيوط.
+        [V9.10.1] إصلاح اختناق اللوحة: النوم يتم خارج القفل — كان النوم داخل
+        القفل يُسلسل كل الخيوط (بوت + لوحة) خلف بعضها ويستنزف خيوط waitress."""
         weight = max(1, int(weight))
         while True:
             now = time.time()
@@ -312,6 +322,7 @@ class BinanceRateGuard:
                 time.sleep(min(resume_wait, 5.0))
                 continue
             self._maybe_recover(now)
+            need = 0.0
             with self._lock:
                 now = time.time()
                 self._prune(now)
@@ -319,15 +330,17 @@ class BinanceRateGuard:
                 spacing = self.min_spacing * (self.resume_spacing_factor if now < self._ramp_until else 1.0)
                 if used + weight <= self.budget:
                     gap = now - self._last_call
-                    if gap < spacing:
-                        time.sleep(spacing - gap)
-                    self._window.append((time.time(), weight))
-                    self._last_call = time.time()
-                    self.total_requests += 1
-                    return
-                wait = (61.0 - (now - self._window[0][0])) if self._window else 1.0
-                self.total_throttled_sec += min(wait, 5.0)
-            time.sleep(min(max(wait, 0.1), 5.0))
+                    if gap >= spacing:
+                        # حجز فوري بدون أي نوم داخل القفل (V9.10.1)
+                        self._window.append((now, weight))
+                        self._last_call = now
+                        self.total_requests += 1
+                        return
+                    need = spacing - gap  # ننام خارج القفل ثم نعيد المحاولة
+                else:
+                    need = (61.0 - (now - self._window[0][0])) if self._window else 1.0
+                    self.total_throttled_sec += min(need, 5.0)
+            time.sleep(min(max(need, 0.05), 5.0))
 
     def register_ban(self, until_ms: Optional[int] = None, fallback_sec: float = 120.0) -> None:
         with self._lock:
@@ -362,6 +375,44 @@ class BinanceRateGuard:
             }
 
 rate_guard = BinanceRateGuard(RATE_LIMIT_BUDGET_PER_MIN, API_MIN_SPACING_SEC)
+
+# --- [تحسين V9.10.1] كاش رصيد USDT للوحة: قراءة فورية بلا نداء شبكي ---
+_usdt_balance_cache: Dict[str, Any] = {'value': None, 'ts': 0.0}
+_usdt_balance_lock = Lock()
+
+def get_cached_usdt_balance(max_age_sec: float = 180.0) -> Optional[float]:
+    """يعيد رصيد USDT من الكاش فقط — لا شبكة أبدًا. None إن كان غائبًا/قديمًا جدًا."""
+    with _usdt_balance_lock:
+        val, ts = _usdt_balance_cache['value'], _usdt_balance_cache['ts']
+    if val is not None and (time.time() - ts) <= max_age_sec:
+        return float(val)
+    return None
+
+def update_usdt_balance_cache() -> bool:
+    """نداء شبكي واحد (وزن 5) لتحديث كاش الرصيد — يُستدعى من خيط خلفي فقط."""
+    try:
+        b = safe_get_asset_balance('USDT')
+        val = float(b['free']) if b and 'free' in b else None
+        with _usdt_balance_lock:
+            _usdt_balance_cache['value'] = val
+            _usdt_balance_cache['ts'] = time.time()
+        return val is not None
+    except Exception as e:
+        logger.debug(f"[كاش الرصيد] تعذر التحديث: {e}")
+        return False
+
+def balance_refresh_loop():
+    """خيط خلفي: يحدّث كاش رصيد USDT دوريًا — يستثمر فترات الحظر ولا يزاحم المسح."""
+    while True:
+        try:
+            ban_remain = rate_guard.banned_until - time.time()
+            if ban_remain > 0:
+                time.sleep(min(ban_remain, 10.0)); continue
+            if client:
+                update_usdt_balance_cache()
+        except Exception as e:
+            logger.debug(f"[كاش الرصيد] خطأ: {e}")
+        time.sleep(max(10, DASHBOARD_BALANCE_REFRESH_SEC))
 
 BAN_UNTIL_RE = re.compile(r'banned until (\d+)', re.IGNORECASE)
 
@@ -1872,7 +1923,7 @@ def get_dashboard_html():
 <html lang="ar" dir="rtl">
 <head>
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CryptoBot V9.10.0 // NEON TERMINAL</title>
+    <title>CryptoBot V9.10.1 // NEON TERMINAL</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
         // [تحسين V9.9] ألوان الثيم الهاكر: أخضر مصفوفة + سماوي سيبراني على أسود
@@ -1953,7 +2004,7 @@ def get_dashboard_html():
         <header class="mb-6 flex flex-wrap justify-between items-center gap-4">
             <div>
                 <div dir="ltr" class="font-mono text-xs md:text-sm text-text-secondary mb-1">&gt;&gt; root@crypto-bot:~$ ./trading_engine --live --region=eu-frankfurt<span class="cursor"></span></div>
-                <h1 class="text-2xl md:text-3xl font-extrabold flicker"><span class="text-accent-green neon-text">لوحة تحكم</span> <span class="font-mono text-text-secondary text-lg md:text-xl" dir="ltr">V9.10.0//NEON</span></h1>
+                <h1 class="text-2xl md:text-3xl font-extrabold flicker"><span class="text-accent-green neon-text">لوحة تحكم</span> <span class="font-mono text-text-secondary text-lg md:text-xl" dir="ltr">V9.10.1//NEON</span></h1>
             </div>
             <div id="trend-lights-container" class="flex items-center gap-x-6 bg-black/40 px-4 py-2 rounded-lg border border-border-color"></div>
         </header>
@@ -2306,8 +2357,11 @@ function saveSettings() {
 
 document.addEventListener('DOMContentLoaded', () => {
     ['MarketStatus', 'Signals', 'Stats', 'Notifications', 'Rejections', 'SystemStatus'].forEach(f => window[`update${f}`]());
-    setInterval(updateMarketStatus, 5000); setInterval(updateSignals, 7000); setInterval(updateStats, 60000);
-    setInterval(updateNotifications, 15000); setInterval(updateRejections, 15000); setInterval(updateSystemStatus, 5000);
+    // [تحسين V9.10.1] إيقاف الاستطلاع عند إخفاء التبويب — يمنع تراكم الطلبات
+    // من التبويبات الخلفية ويخفف الضغط على خيوط الخادم (waitress queue)
+    const whenVisible = (fn, ms) => setInterval(() => { if (!document.hidden) fn(); }, ms);
+    whenVisible(updateMarketStatus, 5000); whenVisible(updateSignals, 7000); whenVisible(updateStats, 60000);
+    whenVisible(updateNotifications, 15000); whenVisible(updateRejections, 15000); whenVisible(updateSystemStatus, 5000);
 });
 </script>
 </body></html>
@@ -2319,7 +2373,7 @@ def home(): return render_template_string(get_dashboard_html())
 @app.route('/health')
 def health_check():
     """[تحسين V9.8] نقطة فحص صحة خفيفة لمراقبة الخدمة على Render وأدوات Uptime."""
-    return jsonify({"status": "ok", "version": "V9.10.0", "time": datetime.now(timezone.utc).isoformat()})
+    return jsonify({"status": "ok", "version": "V9.10.1", "time": datetime.now(timezone.utc).isoformat()})
 
 # --- [تحسين V9.9] نقطة حالة النظام: وزن الطلبات، الحظر، قاطع الحماية، التخزين ---
 @app.route('/api/system_status')
@@ -2338,7 +2392,7 @@ def api_system_status():
         except Exception:
             pass
         return jsonify({
-            'version': 'V9.10.0',
+            'version': 'V9.10.1',
             'client_ready': bool(client),
             'rate_guard': snap,
             'daily_pnl_usdt': pnl,
@@ -2363,10 +2417,10 @@ def get_market_status():
     with market_state_lock: state_copy = dict(current_market_state)
     with trading_status_lock: is_enabled = is_trading_enabled
     active_sessions, _, _ = get_session_state()
-    usdt_balance = None
-    if client:
-        try: usdt_balance = float(safe_get_asset_balance('USDT')['free'])
-        except: usdt_balance = 'N/A'
+    # [تحسين V9.10.1] قراءة الرصيد من الكاش فقط — لا نداء Binance من خيوط الويب أبدًا
+    # (كان يستهلك خيط waitress أثناء انشغال الحارس/الحظر ويسبب تراكم Task queue)
+    usdt_balance = get_cached_usdt_balance()
+    if usdt_balance is None: usdt_balance = 'N/A'
 
     with risk_per_trade_lock: risk = RISK_PER_TRADE_PERCENT
     with order_book_ratio_lock: ob_ratio = ORDER_BOOK_MIN_BID_ASK_RATIO
@@ -3014,19 +3068,29 @@ def initialize_bot_services():
     Thread(target=main_loop_enhanced, daemon=True).start()
     Thread(target=price_update_loop, daemon=True).start()
     Thread(target=trade_management_loop, daemon=True).start()
+    Thread(target=balance_refresh_loop, daemon=True).start()  # [تحسين V9.10.1] كاش رصيد اللوحة
     logger.info("✅ [خدمات البوت] تم بدء جميع الخدمات الخلفية بنجاح.")
-    send_telegram_message("✅ *البوت قيد التشغيل الآن (نسخة V9.10.0 - Neon Security)*")
+    send_telegram_message("✅ *البوت قيد التشغيل الآن (نسخة V9.10.1 - Neon Security)*")
 
 # ---------------------- نقطة الدخول ----------------------
 if __name__ == "__main__":
-    logger.info("🚀 إطلاق بوت التداول ولوحة التحكم (V9.10.0 - Neon Security) 🚀")
+    # [تحسين V9.10.1] تخفيف تجوّع CPU على خطة Render المجانية (0.1 CPU):
+    # حسابات pandas لـ 20 عملة تحتجز الـ GIL — تقصير مفتاح التبديل يمنح خيوط
+    # الويب فرصة تنفيذ أسرع ويمنع تراكم طابور waitress أثناء دورات المسح
+    try:
+        sys.setswitchinterval(0.002)
+    except Exception:
+        pass
+    logger.info("🚀 إطلاق بوت التداول ولوحة التحكم (V9.10.1 - Neon Security) 🚀")
     Thread(target=initialize_bot_services, daemon=True).start()
     port = int(os.environ.get('PORT', 10000))
     host = "0.0.0.0"
     logger.info(f"✅ بدء لوحة التحكم على {host}:{port}")
     try:
         from waitress import serve
-        serve(app, host=host, port=port, threads=8)
+        # [تحسين V9.10.1] رفع الخيوط 8→12: الاستطلاع من اللوحة (6 نقاط نهاية)
+        # + فحوصات صحة Render تمر حتى أثناء دورات المسح الثقيلة
+        serve(app, host=host, port=port, threads=12)
     except ImportError:
         app.run(host=host, port=port)
     logger.info("👋 [إيقاف] تم إيقاف تشغيل التطبيق.")

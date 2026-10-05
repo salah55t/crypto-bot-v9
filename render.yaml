@@ -66,3 +66,6 @@ services:
         value: "10000000"
       - key: DYNAMIC_UNIVERSE_MIN_RANGE_PCT
         value: "1.5"
+      # --- [V9.10.1] منع اختناق خيوط الويب: كاش رصيد اللوحة بدل النداء المباشر ---
+      - key: DASHBOARD_BALANCE_REFRESH_SEC
+        value: "45"
