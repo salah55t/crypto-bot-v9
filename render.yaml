@@ -1,0 +1,46 @@
+# Blueprint نشر تلقائي على Render — الخطة المجانية، منطقة فرانكفورت
+# يُستخدم تلقائيًا عند: New + → Blueprint ← اختيار هذا المستودع
+services:
+  - type: web
+    name: crypto-bot-v9
+    runtime: python
+    plan: free
+    region: frankfurt
+    branch: main
+    buildCommand: "pip install --upgrade pip && pip install -r requirements.txt"
+    startCommand: "python vnz.py"
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      # --- مفاتيح التداول (تُضبط يدويًا بعد أول نشر) ---
+      - key: BINANCE_API_KEY
+        sync: false
+      - key: BINANCE_API_SECRET
+        sync: false
+      # --- قاعدة بيانات PostgreSQL (Neon أو Supabase المجانية) ---
+      - key: DATABASE_URL
+        sync: false
+      # --- اختياري: Redis خارجي (Upstash). اتركه فارغًا لاستخدام البديل في الذاكرة ---
+      - key: REDIS_URL
+        sync: false
+      # --- اختياري: إشعارات تليجرام ---
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      # --- حماية لوحة التحكم (يوصى بشدة بضبطها) ---
+      - key: DASHBOARD_USERNAME
+        sync: false
+      - key: DASHBOARD_PASSWORD
+        sync: false
+      # --- إعدادات المخاطرة والفلاتر ---
+      - key: DAILY_MAX_LOSS_USDT
+        value: "20"
+      - key: SIGNAL_GENERATION_LOOKBACK_DAYS
+        value: "30"
+      - key: MAX_OPEN_TRADES
+        value: "5"
+      - key: USE_HTF_CONFIRMATION
+        value: "True"

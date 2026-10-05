@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# نماذج التعلم الآلي المحلية (لا ترفعها للمستودع)
+V9/
+*.pkl
+
+# سجلات وملفات محلية
+*.log
+logs/
+
+# أسرار — لا ترفع أبدًا
+.env
+settings.ini
+*.secret
+
+# أنظمة التشغيل والمحررات
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
