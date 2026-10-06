@@ -42,7 +42,7 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-logger = logging.getLogger('CryptoBotV9.15.0')
+logger = logging.getLogger('CryptoBotV9.15.1')
 
 # زمن إقلاع العملية لحساب مدة التشغيل في لوحة التحكم
 BOOT_TIME = time.time()
@@ -174,8 +174,14 @@ API_MIN_SPACING_SEC: float = config('API_MIN_SPACING_SEC', default=0.15, cast=fl
 BAN_RESUME_COOLDOWN_SEC: int = config('BAN_RESUME_COOLDOWN_SEC', default=90, cast=int)
 # بعد الاستئناف: الفاصل الأدنى يتضاعف ×4 لمدة (ثوانٍ) ثم يعود تدريجيًا للطبيعي
 BAN_RESUME_RAMP_SEC: int = config('BAN_RESUME_RAMP_SEC', default=120, cast=int)
-# فاصل تحديث أسعار Redis بالثواني (كل طلب أسعار شامل وزنه 4)
-PRICE_UPDATE_INTERVAL_SEC: int = config('PRICE_UPDATE_INTERVAL_SEC', default=3, cast=int)
+# [V9.15.1] عتبة "الحظر الطويل" بالثواني: حظر أطول منها = تصعيد (إما تراكم وزن من
+# جلسة سابقة أو — الأشهر — جيران Render المجاني على نفس IP الخروج المشترك).
+# الاستجابة: الميزانية تهبط للأرضية مباشرة + تبريد استئناف ممتد + إشعار تليجرام
+# بموعد النهاية الفعلي بدل الضرب المتكرر أثناء الحظر
+BAN_LONG_THRESHOLD_SEC: int = config('BAN_LONG_THRESHOLD_SEC', default=600, cast=int)
+# فاصل تحديث أسعار Redis بالثواني (كل طلب أسعار شامل وزنه 4) — [V9.15.1] 3→5ث
+# (80→48 وزن/دقيقة): تقليل بصمتنا على IP مشترك بلا أثر عملي على حيوية اللوحة
+PRICE_UPDATE_INTERVAL_SEC: int = config('PRICE_UPDATE_INTERVAL_SEC', default=5, cast=int)
 
 # --- [تحسين V9.11.0] منع اختناق خيوط الويب (waitress queue depth) ---
 # السبب الجذري: /api/market_status كان يستدعي Binance مباشرة (وزن 5) في كل استطلاع
@@ -333,6 +339,7 @@ class BinanceRateGuard:
         self.budget_floor = max(300, int(self.configured_budget * 0.25))
         self.min_spacing = max(0.0, float(min_spacing))
         self.resume_cooldown = max(0, int(BAN_RESUME_COOLDOWN_SEC))
+        self._active_cooldown = self.resume_cooldown  # [V9.15.1] التبريد الفعلي المطبق للحظر الحالي
         self.resume_ramp_sec = max(0, int(BAN_RESUME_RAMP_SEC))
         self.resume_spacing_factor = 4.0
         self._lock = Lock()
@@ -363,7 +370,7 @@ class BinanceRateGuard:
         with self._lock:
             if self.banned_until <= 0:
                 return 0.0
-            wait = self.banned_until - now + float(self.resume_cooldown)
+            wait = self.banned_until - now + float(self._active_cooldown)
             if wait <= 0 and not self._resumed:
                 # لحظة الاستئناف بعد الحظر: بدء فترة التدرج مرة واحدة فقط
                 self._resumed = True
@@ -415,19 +422,57 @@ class BinanceRateGuard:
             time.sleep(min(max(need, 0.05), 5.0))
 
     def register_ban(self, until_ms: Optional[int] = None, fallback_sec: float = 120.0) -> None:
+        """[V9.15.1] تسجيل الحظر مع إلغاء الازدواج (Dedup):
+        قبل الإصلاح: التهيئة + safe_api_call (حتى 4 محاولات) + الحلقات الخلفية كانت
+        تلتقط نفس الحظر الواحد وتسجّله 6 مرات (شُوهد حيًا: ban_count=6 لحظر واحد)
+        → الميزانية تنخفض 40% ست مرات متتالية والعدّاد يتضخم زورًا.
+        الآن:
+        - نفس الحظر (موعد انتهاء قريب من المسجل أو أقدم) → تمديد فقط بلا عدّاد ولا خفض
+        - حظر جديد أطول فعليًا (+60ث فوق المسجل) → عدّاد + خفض ميزانية 40%
+        - حظر طويل > BAN_LONG_THRESHOLD_SEC → الميزانية للأرضية مباشرة +
+          تبريد استئناف ممتد (حتى 300ث) + إشعار تليجرام واحد بموعد النهاية الفعلي."""
+        now = time.time()
+        is_new = False
+        long_ban = False
         with self._lock:
-            until = (until_ms / 1000.0) if until_ms else (time.time() + fallback_sec)
+            until = (until_ms / 1000.0) if until_ms else (now + float(fallback_sec))
             until += 5.0  # هامش أمان فوق موعد Binance (توقيتات الخادم قد تختلف ثوانٍ)
-            self.banned_until = max(self.banned_until, until)
-            self.ban_count += 1
-            self._last_ban_ts = time.time()
-            self._ramp_until = 0.0
-            self._resumed = False  # سيُفعّل التدرج عند لحظة الاستئناف
-            old_budget = self.budget
-            self.budget = max(self.budget_floor, int(self.budget * 0.6))
-        logger.warning(f"🚫 [حارس الطلبات] حظر مؤقت من Binance — الانتظار حتى: "
-                       f"{datetime.fromtimestamp(self.banned_until, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')} "
-                       f"(+تبريد {self.resume_cooldown}ث) | الميزانية التكيفية: {old_budget} → {self.budget} وزن/دقيقة")
+            prev = self.banned_until
+            is_new = (prev <= 0.0) or (until > prev + 60.0)
+            self.banned_until = max(prev, until)
+            long_ban = (self.banned_until - now) > max(60, int(BAN_LONG_THRESHOLD_SEC))
+            if is_new:
+                self.ban_count += 1
+                self._last_ban_ts = now
+                self._ramp_until = 0.0
+                self._resumed = False  # سيُفعّل التدرج عند لحظة الاستئناف
+                old_budget = self.budget
+                if long_ban:
+                    self.budget = self.budget_floor
+                    self._active_cooldown = min(300, int(self.resume_cooldown * 2))
+                else:
+                    self.budget = max(self.budget_floor, int(self.budget * 0.6))
+                    self._active_cooldown = self.resume_cooldown
+            else:
+                old_budget = self.budget
+        end_utc = datetime.fromtimestamp(self.banned_until, tz=timezone.utc)
+        end_alg = datetime.fromtimestamp(self.banned_until, tz=timezone(timedelta(hours=1)))
+        if is_new:
+            logger.warning(f"🚫 [حارس الطلبات] {'حظر طويل (تصعيد)' if long_ban else 'حظر مؤقت'} من Binance — الانتظار حتى: "
+                           f"{end_utc.strftime('%H:%M:%S')} UTC ({end_alg.strftime('%H:%M:%S')} الجزائر) "
+                           f"| الميزانية التكيفية: {old_budget} → {self.budget} وزن/دقيقة | تبريد الاستئناف: {self._active_cooldown}ث")
+            if long_ban:
+                try:
+                    send_telegram_message(
+                        f"🚫 *حظر API طويل من Binance*\n"
+                        f"الانتظار حتى `{end_alg.strftime('%H:%M:%S')}` بتوقيت الجزائر — البوت في وضع سكون آمن "
+                        f"(صفر طلبات) وسيستأنف تلقائيًا.\n"
+                        f"السبب المرجح: IP مشترك على Render المجاني. الميزانية خُفّضت إلى {self.budget} وزن/دقيقة.")
+                except Exception:
+                    pass
+        else:
+            logger.info(f"🔁 [حارس الطلبات] تأكيد لنفس الحظر الساري — الامتداد حتى "
+                        f"{end_utc.strftime('%H:%M:%S')} UTC (بلا خفض إضافي للميزانية أو العدّاد)")
 
     def snapshot(self) -> Dict[str, Any]:
         now = time.time()
@@ -439,7 +484,8 @@ class BinanceRateGuard:
                 'budget_per_min': self.budget,
                 'configured_budget': self.configured_budget,
                 'banned_until': banned,
-                'ban_remaining_sec': round(self.banned_until - now + self.resume_cooldown, 0) if banned else 0,
+                'ban_remaining_sec': round(self.banned_until - now + self._active_cooldown, 0) if banned else 0,
+                'resume_cooldown_sec': int(self._active_cooldown),
                 'ban_count': self.ban_count,
                 'last_error': self.last_error,
                 'total_requests': self.total_requests,
@@ -2308,7 +2354,7 @@ def get_dashboard_html():
 <html lang="ar" dir="rtl">
 <head>
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CryptoBot V9.15.0 // NEON TERMINAL</title>
+    <title>CryptoBot V9.15.1 // NEON TERMINAL</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
         // [تحسين V9.9] ألوان الثيم الهاكر: أخضر مصفوفة + سماوي سيبراني على أسود
@@ -2389,7 +2435,7 @@ def get_dashboard_html():
         <header class="mb-6 flex flex-wrap justify-between items-center gap-4">
             <div>
                 <div dir="ltr" class="font-mono text-xs md:text-sm text-text-secondary mb-1">&gt;&gt; root@crypto-bot:~$ ./trading_engine --live --region=eu-frankfurt<span class="cursor"></span></div>
-                <h1 class="text-2xl md:text-3xl font-extrabold flicker"><span class="text-accent-green neon-text">لوحة تحكم</span> <span class="font-mono text-text-secondary text-lg md:text-xl" dir="ltr">V9.15.0//NEON</span></h1>
+                <h1 class="text-2xl md:text-3xl font-extrabold flicker"><span class="text-accent-green neon-text">لوحة تحكم</span> <span class="font-mono text-text-secondary text-lg md:text-xl" dir="ltr">V9.15.1//NEON</span></h1>
             </div>
             <div id="trend-lights-container" class="flex items-center gap-x-6 bg-black/40 px-4 py-2 rounded-lg border border-border-color"></div>
         </header>
@@ -2966,7 +3012,7 @@ def home(): return render_template_string(get_dashboard_html())
 @app.route('/health')
 def health_check():
     """[تحسين V9.8] نقطة فحص صحة خفيفة لمراقبة الخدمة على Render وأدوات Uptime."""
-    return jsonify({"status": "ok", "version": "V9.15.0", "time": datetime.now(timezone.utc).isoformat()})
+    return jsonify({"status": "ok", "version": "V9.15.1", "time": datetime.now(timezone.utc).isoformat()})
 
 # --- [تحسين V9.9] نقطة حالة النظام: وزن الطلبات، الحظر، قاطع الحماية، التخزين ---
 @app.route('/api/system_status')
@@ -2985,7 +3031,7 @@ def api_system_status():
         except Exception:
             pass
         return jsonify({
-            'version': 'V9.15.0',
+            'version': 'V9.15.1',
             'client_ready': bool(client),
             'rate_guard': snap,
             'daily_pnl_usdt': pnl,
@@ -3777,14 +3823,26 @@ def initialize_bot_services():
                 if m: rate_guard.register_ban(int(m.group(1)))
                 else: rate_guard.register_ban(fallback_sec=90.0)
                 rate_guard.last_error = msg[:160]
-                wait_sec = max(5.0, min(rate_guard.banned_until - time.time(), 120.0))
+                # [V9.15.1] سكون كامل حتى انتهاء الحظر الحقيقي بدل إعادة الضرب كل دقيقتين:
+                # الحظر الطويل كان يعني ~30 طلبًا مرفوضًا في الساعة وتسجيلات مضاعفة لنفس
+                # الحظر. الآن ننام حتى موعد النهاية + تبريد الاستئناف على دفعات ≤300ث
+                # تبقي اللوحة حية وتجعل الاحتكاك مع Binance أثناء الحظر = صفر.
+                wait_sec = max(5.0, rate_guard.banned_until + rate_guard._active_cooldown - time.time())
             else:
                 wait_sec = min(30.0 * attempt, 300.0)
             logger.critical(f"⚠️ [تهيئة] فشلت محاولة رقم {attempt} للاتصال بـ Binance: {msg[:200]}")
-            logger.info(f"⏳ [تهيئة] إعادة المحاولة تلقائيًا بعد {int(wait_sec)} ثانية (اللوحة تبقى تعمل)...")
+            if is_ban:
+                logger.info(f"⏳ [تهيئة] سكون كامل حتى انتهاء الحظر (~{int(wait_sec)} ثانية ≈ {int(wait_sec // 60)} دقيقة) "
+                            f"— صفر طلبات أثناء الحظر واللوحة تبقى تعمل...")
+            else:
+                logger.info(f"⏳ [تهيئة] إعادة المحاولة تلقائيًا بعد {int(wait_sec)} ثانية (اللوحة تبقى تعمل)...")
             if attempt == 1:
                 send_telegram_message(f"⚠️ *تعذر الاتصال بـ Binance عند التهيئة*\n{msg[:200]}\nسيتم إعادة المحاولة تلقائيًا دون إيقاف الخدمة.")
-            time.sleep(wait_sec)
+            waited = 0.0
+            while waited < wait_sec:  # [V9.15.1] نوم مجزّأ ≤300ث يسمح باستجابة الإيقاف
+                chunk = min(300.0, wait_sec - waited)
+                time.sleep(chunk)
+                waited += chunk
 
     Thread(target=main_loop_enhanced, daemon=True).start()
     Thread(target=price_update_loop, daemon=True).start()
@@ -3793,7 +3851,7 @@ def initialize_bot_services():
     Thread(target=btc_trend_loop, daemon=True).start()        # [تحسين V9.11] بوصلة اتجاه BTC
     Thread(target=leader_data_loop, daemon=True).start()      # [تحسين V9.13.0] بيانات قادة خريطة القيادة
     logger.info("✅ [خدمات البوت] تم بدء جميع الخدمات الخلفية بنجاح.")
-    send_telegram_message("✅ *البوت قيد التشغيل الآن (نسخة V9.13.0 - Neon Security)*")
+    send_telegram_message("✅ *البوت قيد التشغيل الآن (نسخة V9.15.1 - Neon Security)*")
 
 # ---------------------- نقطة الدخول ----------------------
 if __name__ == "__main__":
@@ -3804,7 +3862,7 @@ if __name__ == "__main__":
         sys.setswitchinterval(0.002)
     except Exception:
         pass
-    logger.info("🚀 إطلاق بوت التداول ولوحة التحكم (V9.12.1 - Neon Security) 🚀")
+    logger.info("🚀 إطلاق بوت التداول ولوحة التحكم (V9.15.1 - Neon Security) 🚀")
     Thread(target=initialize_bot_services, daemon=True).start()
     port = int(os.environ.get('PORT', 10000))
     host = "0.0.0.0"
