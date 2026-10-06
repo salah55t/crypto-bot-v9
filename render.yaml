@@ -72,3 +72,6 @@ services:
       # --- [V9.11] بوصلة اتجاه BTC على الفريمات الثلاث (API مجاني، وزن 6/دقيقة) ---
       - key: BTC_TREND_REFRESH_SEC
         value: "60"
+      # --- [V9.12] مهلة عميل Binance: تقطع النداءات المعلقة التي كانت تتجمد اللوحة ---
+      - key: BINANCE_CLIENT_TIMEOUT_SEC
+        value: "25"

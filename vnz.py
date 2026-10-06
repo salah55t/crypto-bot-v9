@@ -27,7 +27,7 @@ from datetime import datetime, timezone, timedelta
 from decouple import config
 from typing import List, Dict, Optional, Any, Set, Tuple
 from sklearn.preprocessing import StandardScaler
-from collections import deque, Counter
+from collections import deque, Counter, defaultdict
 import warnings
 
 # --- إعدادات التجاهل واللوجر ---
@@ -42,7 +42,7 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-logger = logging.getLogger('CryptoBotV9.11.0')
+logger = logging.getLogger('CryptoBotV9.12.0')
 
 # زمن إقلاع العملية لحساب مدة التشغيل في لوحة التحكم
 BOOT_TIME = time.time()
@@ -153,6 +153,12 @@ PRICE_UPDATE_INTERVAL_SEC: int = config('PRICE_UPDATE_INTERVAL_SEC', default=3, 
 # الحل: خيط خلفي يحدّث رصيد USDT في كاش، واللوحة تقرأ الكاش فورًا بلا أي نداء شبكي.
 DASHBOARD_BALANCE_REFRESH_SEC: int = config('DASHBOARD_BALANCE_REFRESH_SEC', default=45, cast=int)
 
+# --- [إصلاح V9.12.0] مهلة عميل Binance — قاتل التعليق الدائم ---
+# python-binance افتراضيًا يرسل طلبات HTTP بلا timeout إطلاقًا: أي اتصال نصف مفتوح
+# (شائع على Render) يجعل النداء يتدلى للأبد ويحبس الخيوط والأقفال خلفه.
+# مهلة 25 ثانية تقطع النداء المعلق وتسمح لمنطق إعادة المحاولة في safe_api_call بالعمل.
+BINANCE_CLIENT_TIMEOUT_SEC: int = config('BINANCE_CLIENT_TIMEOUT_SEC', default=25, cast=int)
+
 # --- [تحسين V9.10] الكشف الديناميكي عن العملات الأكثر حيوية (سيولة + تقلب + انفجارات) ---
 # بدل قائمة ثابتة: طلب واحد (وزن 80) يجيب إحصائيات 24 ساعة لكل العملات، ثم ترشيح وترتيب:
 # 45% السيولة (quoteVolume) + 35% التقلب (المدى اليومي high-low) + 20% الانفجار (|التغير%|)
@@ -223,10 +229,20 @@ universe_meta: Dict[str, Any] = {}
 _static_fallback_symbols: List[str] = []
 open_signals_cache: Dict[str, Dict] = {}
 signal_cache_lock = Lock()
+# [إصلاح V9.12.0] حارس منع الإغلاق المزدوج: بعد نقل العمل الشبكي خارج القفل،
+# قد يستدعي خيطان نفس الصفقة (حلقة الإدارة + إغلاق يدوي) فيبيع مرتين —
+# هذا المجموعة يضمن عملية إغلاق واحدة فقط لكل signal_id
+_closing_signal_ids: set = set()
 notifications_cache = deque(maxlen=50)
 notifications_lock = Lock()
 rejection_logs_cache = deque(maxlen=100)
 rejection_logs_lock = Lock()
+# [تحسين V9.12.0] عدادات تحليل أسباب الرفض التراكمية (منذ الإقلاع):
+# 1) كاش الرفض محدود بـ 100 عنصر يفيض خلال ثوانٍ في الدورة النشطة — العدادات تحفظ الصورة الكاملة
+# 2) خمس استراتيجيات من سبع كانت تفشل بصمت تام بلا تسجيل — الآن تُحصى كل الفحوصات والنجاحات
+_filter_reject_stats: Counter = Counter()          # رفضات الفلاتر العامة: تقلب / قوة اتجاه
+_strategy_scan_stats: Dict[str, Counter] = defaultdict(lambda: Counter({'checks': 0, 'passes': 0}))
+_scan_stats_lock = Lock()
 current_market_state: Dict[str, Any] = {"overall_regime": "INITIALIZING", "trend_details_by_tf": {}, "last_updated": None}
 market_state_lock = Lock()
 last_market_state_check = 0
@@ -1842,26 +1858,36 @@ def verify_order_filled(symbol: str, order_id: str, timeout_seconds: int = 30) -
     return False
 
 def close_signal(signal_id: int, closing_price: float, reason: str) -> bool:
+    # [إصلاح V9.12.0 — قاتل تجمد اللوحة] كان القفل ممسكًا طوال العملية كاملة:
+    # نداء رصيد Binance (ينام دقائق أثناء الحظر عبر rate_guard) + أمر البيع +
+    # UPDATE/commit على PostgreSQL + رسالة تليجرام. أي تعليق شبكي (والعميل سابقًا
+    # بلا timeout) يبقي signal_cache_lock محتجزًا للأبد فتموت نقاط اللوحة الثلاث
+    # (market_status / system_status / signals) ويتجمد المتصفح.
+    # الآن: القفل للبحث والنسخ والحارس فقط (ميكروثوانٍ) وكل العمل خارج القفل.
     with signal_cache_lock:
+        if signal_id in _closing_signal_ids:
+            logger.info(f"ℹ️ [إغلاق] الصفقة (ID: {signal_id}) قيد الإغلاق بالفعل من خيط آخر — تجاهل الطلب المزدوج.")
+            return False
         signal_to_close, symbol_to_close = None, None
         for symbol, signal_data in open_signals_cache.items():
             if signal_data['id'] == signal_id:
-                signal_to_close, symbol_to_close = signal_data, symbol
+                signal_to_close, symbol_to_close = dict(signal_data), symbol
                 break
         if not signal_to_close:
             logger.warning(f"⚠️ [إغلاق] محاولة إغلاق صفقة غير موجودة في الكاش (ID: {signal_id}). ربما أغلقت بالفعل.")
             return False
-
+        _closing_signal_ids.add(signal_id)
+    try:
         entry_price = float(signal_to_close['entry_price'])
         profit_percentage = ((closing_price - entry_price) / entry_price) * 100
 
-        # --- [إصلاح] منطق البيع عند الإغلاق ---
+        # --- [إصلاح] منطق البيع عند الإغلاق (خارج القفل تمامًا) ---
         if signal_to_close.get('is_real_trade'):
             try:
                 base_asset = symbol_to_close.replace('USDT', '')
                 balance_response = safe_get_asset_balance(base_asset)
                 actual_free_balance = Decimal(balance_response['free'])
-                
+
                 logger.info(f"  -> [{symbol_to_close}] التحقق من الرصيد للإغلاق الكامل. الرصيد الفعلي: {actual_free_balance} {base_asset}")
 
                 if actual_free_balance > 0:
@@ -1873,7 +1899,7 @@ def close_signal(signal_id: int, closing_price: float, reason: str) -> bool:
                     else:
                         amount_to_sell = min(actual_free_balance, original_qty)
                     quantity_to_sell = adjust_quantity_to_lot_size(symbol_to_close, float(amount_to_sell))
-                    
+
                     if quantity_to_sell and quantity_to_sell > 0:
                         # التحقق من فلتر MIN_NOTIONAL قبل البيع
                         notional_value = quantity_to_sell * Decimal(str(closing_price))
@@ -1886,7 +1912,7 @@ def close_signal(signal_id: int, closing_price: float, reason: str) -> bool:
                                 if notional_value < min_notional:
                                     min_notional_ok = False
                                     logger.warning(f"⚠️ [{symbol_to_close}] الرصيد الفعلي للبيع ({quantity_to_sell}) أقل من الحد الأدنى ({min_notional}). سيتم اعتباره غبارًا.")
-                        
+
                         if min_notional_ok:
                             sell_order = place_order(symbol_to_close, Client.SIDE_SELL, quantity_to_sell)
                             if not sell_order:
@@ -1896,7 +1922,7 @@ def close_signal(signal_id: int, closing_price: float, reason: str) -> bool:
             except Exception as e:
                 logger.error(f"❌ [{symbol_to_close}] خطأ أثناء محاولة بيع الرصيد عند الإغلاق: {e}", exc_info=True)
                 # نستمر في إغلاق الصفقة في قاعدة البيانات على أي حال
-        
+
         if not check_db_connection() or not conn: return False
 
         try:
@@ -1907,8 +1933,9 @@ def close_signal(signal_id: int, closing_price: float, reason: str) -> bool:
                 """, (closing_price, profit_percentage, reason, signal_id))
             conn.commit()
 
-            if symbol_to_close in open_signals_cache:
-                del open_signals_cache[symbol_to_close]
+            # حذف نهائي من الكاش — تحت القفل لحظة واحدة
+            with signal_cache_lock:
+                open_signals_cache.pop(symbol_to_close, None)
 
             log_and_notify('info', f"تم الإغلاق: {symbol_to_close} عند {closing_price:.4f}. السبب: {reason}. الربح/الخسارة: {profit_percentage:.2f}%", "TRADE_CLOSED")
             register_realized_pnl(signal_to_close, entry_price, closing_price)
@@ -1930,6 +1957,10 @@ def close_signal(signal_id: int, closing_price: float, reason: str) -> bool:
             return True
         except Exception as e:
             logger.error(f"❌ [قاعدة البيانات] فشل تحديث الصفقة المغلقة: {e}"); conn.rollback(); return False
+    finally:
+        # تحرير حارس الازدواجية في كل الحالات (نجاح/فشل/استثناء)
+        with signal_cache_lock:
+            _closing_signal_ids.discard(signal_id)
 
 def insert_signal_into_db(signal_data: Dict) -> Optional[Dict]:
     if not check_db_connection() or not conn: return None
@@ -2045,7 +2076,7 @@ def get_dashboard_html():
 <html lang="ar" dir="rtl">
 <head>
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CryptoBot V9.11.0 // NEON TERMINAL</title>
+    <title>CryptoBot V9.12.0 // NEON TERMINAL</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
         // [تحسين V9.9] ألوان الثيم الهاكر: أخضر مصفوفة + سماوي سيبراني على أسود
@@ -2126,7 +2157,7 @@ def get_dashboard_html():
         <header class="mb-6 flex flex-wrap justify-between items-center gap-4">
             <div>
                 <div dir="ltr" class="font-mono text-xs md:text-sm text-text-secondary mb-1">&gt;&gt; root@crypto-bot:~$ ./trading_engine --live --region=eu-frankfurt<span class="cursor"></span></div>
-                <h1 class="text-2xl md:text-3xl font-extrabold flicker"><span class="text-accent-green neon-text">لوحة تحكم</span> <span class="font-mono text-text-secondary text-lg md:text-xl" dir="ltr">V9.11.0//NEON</span></h1>
+                <h1 class="text-2xl md:text-3xl font-extrabold flicker"><span class="text-accent-green neon-text">لوحة تحكم</span> <span class="font-mono text-text-secondary text-lg md:text-xl" dir="ltr">V9.12.0//NEON</span></h1>
             </div>
             <div id="trend-lights-container" class="flex items-center gap-x-6 bg-black/40 px-4 py-2 rounded-lg border border-border-color"></div>
         </header>
@@ -2248,7 +2279,7 @@ def get_dashboard_html():
                 </div>
             </div>
             <div id="notifications-tab" class="tab-content hidden"><div id="notifications-list" class="card p-4 max-h-[60vh] overflow-y-auto space-y-2"></div></div>
-            <div id="rejections-tab" class="tab-content hidden"><div id="rejections-list" class="card p-4 max-h-[60vh] overflow-y-auto space-y-2"></div></div>
+            <div id="rejections-tab" class="tab-content hidden"><div id="rejections-summary" class="mb-3"></div><div id="rejections-list" class="card p-4 max-h-[55vh] overflow-y-auto space-y-2"></div></div>
         </main>
     </div>
 <script>
@@ -2296,7 +2327,15 @@ function showTab(tabId, el) {
     document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active', 'text-white'));
     el.classList.add('active', 'text-white');
 }
-async function fetchData(url) { try { const r = await fetch(url); return r.ok ? await r.json() : null; } catch (e) { console.error('Fetch Error:', e); return null; } }
+// [إصلاح V9.12.0] مهلة 15 ثانية لكل استطلاع — كان الطلب بلا timeout يبقى معلقًا
+// للأبد عند تعلق نقطة نهاية خلف قفل محتجز، فتتجمد اللوحة بلا أي مؤشر
+async function fetchData(url, timeoutMs = 15000) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    try { const r = await fetch(url, { signal: ctrl.signal }); return r.ok ? await r.json() : null; }
+    catch (e) { console.error('Fetch Error:', e); return null; }
+    finally { clearTimeout(timer); }
+}
 
 function updateBtcTrend() {
     fetchData('/api/btc_trend').then(data => {
@@ -2475,7 +2514,36 @@ function updateNotifications() {
 function updateRejections() {
     fetchData('/api/rejection_logs').then(data => {
         if (!data) return;
-        document.getElementById('rejections-list').innerHTML = data.map(r => `<div class="p-2 border-b border-border-color"><span class="font-mono text-xs text-text-secondary">${new Date(r.timestamp).toLocaleString('ar-EG')}</span>: <strong class="text-accent-yellow">${r.symbol}</strong> - ${r.reason} <span class="text-xs text-gray-500">${JSON.stringify(r.details)}</span></div>`).join('');
+        document.getElementById('rejections-list').innerHTML = data.length
+            ? data.map(r => `<div class="p-2 border-b border-border-color"><span class="font-mono text-xs text-text-secondary">${new Date(r.timestamp).toLocaleString('ar-EG')}</span>: <strong class="text-accent-yellow">${r.symbol}</strong> - ${r.reason} <span class="text-xs text-gray-500">${JSON.stringify(r.details)}</span></div>`).join('')
+            : '<div class="text-center text-text-secondary py-6">لا توجد رفضات مسجلة بعد (الكاش يحفظ آخر 100)</div>';
+    });
+    // [تحسين V9.12.0] بطاقة تحليل أسباب الرفض — الصورة الكاملة منذ الإقلاع
+    fetchData('/api/rejection_summary').then(s => {
+        if (!s || s.error) return;
+        const box = document.getElementById('rejections-summary');
+        if (!box) return;
+        const filtersHtml = (s.filters && s.filters.length)
+            ? s.filters.map(([name, count]) => {
+                const pct = s.total_filter_rejects ? Math.round(count / s.total_filter_rejects * 100) : 0;
+                return `<div class="flex items-center gap-2 mb-1"><span class="w-40 shrink-0 text-xs text-text-secondary truncate">${name}</span><div class="flex-1 h-2 bg-black/40 rounded overflow-hidden"><div class="h-full bg-accent-yellow" style="width:${pct}%"></div></div><span class="font-mono text-xs text-accent-yellow w-16 text-left">${count} (${pct}%)</span></div>`;
+            }).join('')
+            : '<div class="text-xs text-text-secondary mb-2">لا رفضات فلاتر بعد</div>';
+        const stratHtml = (s.strategies && s.strategies.length)
+            ? `<table class="w-full text-xs mt-1"><thead><tr class="text-text-secondary border-b border-border-color"><th class="text-right py-1">الاستراتيجية</th><th class="py-1">فحوصات</th><th class="py-1">نجاحات</th><th class="py-1">نسبة النجاح</th></tr></thead><tbody>${
+                s.strategies.map(r => `<tr class="border-b border-border-color/50"><td class="text-right py-1 font-mono">${r.strategy}</td><td class="text-center font-mono">${r.checks}</td><td class="text-center font-mono text-accent-green">${r.passes}</td><td class="text-center font-mono ${r.pass_rate_pct > 0 ? 'text-accent-green' : 'text-text-secondary'}">${r.pass_rate_pct}%</td></tr>`).join('')
+            }</tbody></table>`
+            : '<div class="text-xs text-text-secondary">لا فحوصات استراتيجيات بعد</div>';
+        const lastAt = s.last_rejection_at ? new Date(s.last_rejection_at).toLocaleTimeString('ar-EG') : '—';
+        box.innerHTML = `<div class="card p-4">
+            <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
+                <h4 class="text-sm font-bold text-neon">📊 تحليل أسباب الرفض (منذ الإقلاع)</h4>
+                <div class="font-mono text-xs text-text-secondary">رفضات فلاتر: <span class="text-accent-yellow">${s.total_filter_rejects}</span> | فحوصات استراتيجيات: <span class="text-white">${s.total_strategy_checks}</span> | نجاحات: <span class="text-accent-green">${s.total_strategy_passes}</span> | آخر رفض: <span class="text-white">${lastAt}</span></div>
+            </div>
+            <div class="mb-3">${filtersHtml}</div>
+            <div class="text-xs text-text-secondary mb-1">أقرب الاستراتيجيات للاشتعال (مرتبة بالنجاحات):</div>
+            ${stratHtml}
+        </div>`;
     });
 }
 function manualClose(signalId, symbol) {
@@ -2571,7 +2639,7 @@ def home(): return render_template_string(get_dashboard_html())
 @app.route('/health')
 def health_check():
     """[تحسين V9.8] نقطة فحص صحة خفيفة لمراقبة الخدمة على Render وأدوات Uptime."""
-    return jsonify({"status": "ok", "version": "V9.11.0", "time": datetime.now(timezone.utc).isoformat()})
+    return jsonify({"status": "ok", "version": "V9.12.0", "time": datetime.now(timezone.utc).isoformat()})
 
 # --- [تحسين V9.9] نقطة حالة النظام: وزن الطلبات، الحظر، قاطع الحماية، التخزين ---
 @app.route('/api/system_status')
@@ -2590,7 +2658,7 @@ def api_system_status():
         except Exception:
             pass
         return jsonify({
-            'version': 'V9.11.0',
+            'version': 'V9.12.0',
             'client_ready': bool(client),
             'rate_guard': snap,
             'daily_pnl_usdt': pnl,
@@ -2717,6 +2785,47 @@ def get_notifications():
 @app.route('/api/rejection_logs')
 def get_rejection_logs():
     with rejection_logs_lock: return jsonify(list(rejection_logs_cache))
+
+@app.route('/api/rejection_summary')
+def api_rejection_summary():
+    """[تحسين V9.12.0] تحليل أسباب الرفض — الصورة الكاملة منذ الإقلاع.
+    كاش الرفض (100 عنصر) يفيض خلال ثوانٍ في الدورة النشطة، والعديد من الاستراتيجيات
+    كانت تفشل بصمت — هذا الملخص يجمع: رفضات الفلاتر التراكمية + فحوصات/نجاحات كل
+    استراتيجية (يكشف أقرب استراتيجية للاشتعال) + آخر الرفضات المسجلة."""
+    try:
+        with _scan_stats_lock:
+            filters = dict(_filter_reject_stats)
+            strategies = {name: dict(c) for name, c in _strategy_scan_stats.items()}
+        with rejection_logs_lock:
+            recent = list(rejection_logs_cache)
+
+        total_filter_rejects = sum(filters.values())
+        total_checks = sum(s.get('checks', 0) for s in strategies.values())
+        total_passes = sum(s.get('passes', 0) for s in strategies.values())
+
+        strategy_rows = []
+        for name, s in strategies.items():
+            checks = s.get('checks', 0)
+            passes = s.get('passes', 0)
+            strategy_rows.append({
+                'strategy': name, 'checks': checks, 'passes': passes,
+                'pass_rate_pct': round(passes / checks * 100, 2) if checks else 0.0
+            })
+        strategy_rows.sort(key=lambda r: r['passes'], reverse=True)
+
+        return jsonify({
+            'since_boot': True,
+            'total_filter_rejects': total_filter_rejects,
+            'filters': sorted(filters.items(), key=lambda kv: kv[1], reverse=True),
+            'total_strategy_checks': total_checks,
+            'total_strategy_passes': total_passes,
+            'strategies': strategy_rows,
+            'recent_rejections_count': len(recent),
+            'last_rejection_at': recent[0].get('timestamp') if recent else None,
+        })
+    except Exception as e:
+        logger.error(f"❌ [API ملخص الرفض] خطأ: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/trading/toggle', methods=['POST'])
 def toggle_trading_status():
@@ -3117,9 +3226,12 @@ def main_loop_enhanced():
                             continue
                         
                         # --- تطبيق الفلاتر العامة أولاً ---
+                        # [تحسين V9.12.0] عدّاد تراكمي لرفضات الفلاتر — الكاش (100 عنصر) يفيض خلال ثوانٍ
                         if not check_market_volatility_filter(df_with_indicators):
+                            with _scan_stats_lock: _filter_reject_stats['فلتر تقلب السوق'] += 1
                             continue
                         if not check_trend_strength_filter(df_with_indicators):
+                            with _scan_stats_lock: _filter_reject_stats['فلتر قوة الاتجاه'] += 1
                             continue
 
                         signal_found, strategy_used = False, None
@@ -3140,8 +3252,11 @@ def main_loop_enhanced():
                         with sr_breakout_strategy_lock:
                             if USE_SR_BREAKOUT_STRATEGY: strategies_to_check.append(('SR_BREAKOUT', check_support_resistance_strategy_enhanced, "SR_Breakout_Enhanced"))
 
+                        # [تحسين V9.12.0] حصر فحوصات ونجاحات كل استراتيجية — 5 من 7 كانت صامتة تمامًا
                         for key, check_func, name in strategies_to_check:
+                            with _scan_stats_lock: _strategy_scan_stats[name]['checks'] += 1
                             if check_func(df_with_indicators):
+                                with _scan_stats_lock: _strategy_scan_stats[name]['passes'] += 1
                                 signal_found, strategy_used = True, name
                                 break
                         
@@ -3244,7 +3359,9 @@ def initialize_bot_services():
     while True:
         attempt += 1
         try:
-            client = Client(API_KEY, API_SECRET)
+            # [إصلاح V9.12.0] مهلة صريحة لكل طلبات العميل — بدونها يتدلى أي اتصال
+            # نصف مفتوح للأبد ويحبس الحلقات والأقفال (السبب الجذري لتجمد اللوحة)
+            client = Client(API_KEY, API_SECRET, requests_params={'timeout': BINANCE_CLIENT_TIMEOUT_SEC})
             get_exchange_info_map()
             load_open_signals_to_cache()
             load_notifications_to_cache()
@@ -3277,7 +3394,7 @@ def initialize_bot_services():
     Thread(target=balance_refresh_loop, daemon=True).start()  # [تحسين V9.11.0] كاش رصيد اللوحة
     Thread(target=btc_trend_loop, daemon=True).start()        # [تحسين V9.11] بوصلة اتجاه BTC
     logger.info("✅ [خدمات البوت] تم بدء جميع الخدمات الخلفية بنجاح.")
-    send_telegram_message("✅ *البوت قيد التشغيل الآن (نسخة V9.11.0 - Neon Security)*")
+    send_telegram_message("✅ *البوت قيد التشغيل الآن (نسخة V9.12.0 - Neon Security)*")
 
 # ---------------------- نقطة الدخول ----------------------
 if __name__ == "__main__":
@@ -3288,7 +3405,7 @@ if __name__ == "__main__":
         sys.setswitchinterval(0.002)
     except Exception:
         pass
-    logger.info("🚀 إطلاق بوت التداول ولوحة التحكم (V9.11.0 - Neon Security) 🚀")
+    logger.info("🚀 إطلاق بوت التداول ولوحة التحكم (V9.12.0 - Neon Security) 🚀")
     Thread(target=initialize_bot_services, daemon=True).start()
     port = int(os.environ.get('PORT', 10000))
     host = "0.0.0.0"
