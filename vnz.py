@@ -42,7 +42,7 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-logger = logging.getLogger('CryptoBotV9.13.0')
+logger = logging.getLogger('CryptoBotV9.14.0')
 
 # زمن إقلاع العملية لحساب مدة التشغيل في لوحة التحكم
 BOOT_TIME = time.time()
@@ -131,6 +131,31 @@ USE_HTF_CONFIRMATION: bool = config('USE_HTF_CONFIRMATION', default=True, cast=b
 USE_SHORT_TERM_MOMENTUM_FILTER: bool = config('USE_SHORT_TERM_MOMENTUM_FILTER', default=False, cast=bool)
 # مدة تخزين نتيجة تأكيد الترند لكل عملة (بالثواني) لتقليل استهلاك API
 HTF_CONFIRMATION_CACHE_TTL: int = config('HTF_CONFIRMATION_CACHE_TTL', default=900, cast=int)
+
+# --- [إعادة تصميم جوهرية V9.14.0] لكل استراتيجية فلترها المنطقي ---
+# المشكلة الموثقة ببيانات حقيقية (ملخص الرفض V9.13.0): فلترا "تقلب السوق"
+# (ATR% بين 0.5-5) و"قوة الاتجاه" (ADX>=18 و ROC>=0.5) كانا يُطبقان على الجميع
+# قبل أي استراتيجية، فقتلا استراتيجيات الاختراق بطبيعتها:
+#   BB_Squeeze_Breakout إعدادُه الانضغاط نفسه (تقلب منخفض) → رفض 163 مرة (0% نجاح)
+#   SR_Breakout_Enhanced يطلب نطاقًا عرضيًا قبل الاختراق (ADX منخفض) → رفض 152 مرة (0%)
+# والحل: إلغاء الفلاتر الشاملة واستبدالها بملف فلترة خاص بكل استراتيجية:
+#   اتجاهية (MACD_EMA/EMA_RSI/Pullback): تحتاج اتجاهًا حيًا → حد أدنى لـ ADX
+#   زخمية (Bullish_Momentum): تحتاج حركة فعلية → حدود للتقلب النسبي + زخم ROC
+#   ارتدادية (BB_Stoch): تعمل في النطاقات → سقف ADX (اتجاه قوي يقتل الارتداد)
+#   اختراقية (Squeeze/SR): الانضغاط هو الإعداد ذاته → بلا حد أدنى للتقلب أو ADX
+# None = بلا حد لهذا البعد. شروط الاستراتيجية الداخلية تبقى مسؤولة عن تفاصيلها.
+STRATEGY_FILTER_PROFILES: Dict[str, Dict[str, Optional[float]]] = {
+    'MACD_EMA_Crossover':         {'min_adx': 15.0, 'max_adx': None, 'min_atr_pct': 0.25, 'max_atr_pct': 6.0, 'min_roc': None},
+    'EMA_RSI_Cross':              {'min_adx': 15.0, 'max_adx': None, 'min_atr_pct': 0.25, 'max_atr_pct': 6.0, 'min_roc': None},
+    'Pullback_MACD':              {'min_adx': 18.0, 'max_adx': None, 'min_atr_pct': 0.25, 'max_atr_pct': 6.0, 'min_roc': None},
+    'Bullish_Momentum':           {'min_adx': None, 'max_adx': None, 'min_atr_pct': 0.40, 'max_atr_pct': 7.0, 'min_roc': 0.5},
+    'BB_Stoch_Reversal_Enhanced': {'min_adx': None, 'max_adx': 32.0, 'min_atr_pct': 0.20, 'max_atr_pct': 5.0, 'min_roc': None},
+    'BB_Squeeze_Breakout':        {'min_adx': None, 'max_adx': 28.0, 'min_atr_pct': None, 'max_atr_pct': 6.0, 'min_roc': None},
+    'SR_Breakout_Enhanced':       {'min_adx': None, 'max_adx': 28.0, 'min_atr_pct': None, 'max_atr_pct': 6.0, 'min_roc': None},
+}
+# احتياط لأي استراتيجية مستقبلية غير مدرجة: بوابة عقلانية واسعة فقط
+DEFAULT_STRATEGY_FILTER_PROFILE: Dict[str, Optional[float]] = {
+    'min_adx': None, 'max_adx': None, 'min_atr_pct': 0.20, 'max_atr_pct': 7.0, 'min_roc': None}
 
 # --- [تحسين V9.9.1] إعدادات حماية الحظر من Binance (خطأ -1003) ---
 # حد Binance الرسمي 6000 وزن/دقيقة لكل IP — وعلى Render المجاني الـ IP مشترك مع خدمات أخرى،
@@ -256,8 +281,10 @@ rejection_logs_lock = Lock()
 # [تحسين V9.12.0] عدادات تحليل أسباب الرفض التراكمية (منذ الإقلاع):
 # 1) كاش الرفض محدود بـ 100 عنصر يفيض خلال ثوانٍ في الدورة النشطة — العدادات تحفظ الصورة الكاملة
 # 2) خمس استراتيجيات من سبع كانت تفشل بصمت تام بلا تسجيل — الآن تُحصى كل الفحوصات والنجاحات
-_filter_reject_stats: Counter = Counter()          # رفضات الفلاتر العامة: تقلب / قوة اتجاه
+_filter_reject_stats: Counter = Counter()          # [V9.14.0] بوابة العقلانية العامة فقط
 _strategy_scan_stats: Dict[str, Counter] = defaultdict(lambda: Counter({'checks': 0, 'passes': 0}))
+# [V9.14.0] رفضات الفلتر الخاص بكل استراتيجية: {الاستراتيجية: {اسم الفلتر: عدد}}
+_strategy_filter_stats: Dict[str, Counter] = defaultdict(Counter)
 _scan_stats_lock = Lock()
 current_market_state: Dict[str, Any] = {"overall_regime": "INITIALIZING", "trend_details_by_tf": {}, "last_updated": None}
 market_state_lock = Lock()
@@ -825,6 +852,8 @@ REJECTION_REASONS_AR = {
     "Price Peak Avoidance": "تجنب الدخول عند قمة آخر 24 ساعة (استراتيجية ارتدادية)",
     "Daily Loss Limit": "قاطع الحماية: تم إيقاف فتح صفقات جديدة بسبب تجاوز حد الخسارة اليومي",
     "Leader Behavior Veto": "سلوك القائد معاكس: القائد هابط والعملة تابعة له",
+    "Market Sanity Filter Failed": "بوابة العقلانية: سوق ميت أو فوضوي بدرجة قصوى",
+    "Strategy Prefilter Failed": "الفلتر الخاص بالاستراتيجية رفض الدخول (ملف فلترة منطقي لكل استراتيجية)",
 }
 
 
@@ -1401,47 +1430,74 @@ def load_notifications_to_cache():
 
 # ---------------------- منطق التداول والفلاتر ----------------------
 
-# --- [إضافة] فلاتر التأكيد الجديدة ---
-def check_market_volatility_filter(df: pd.DataFrame) -> bool:
-    """فلتر لتجنب التداول في فترات التقلب الشديد أو المنخفض جدًا"""
+# --- [إعادة تصميم V9.14.0] بوابة عقلانية عامة + فلتر خاص لكل استراتيجية ---
+def _count_strategy_filter_reject(strategy_name: str, filter_label: str):
+    """محاسبة رفضات الفلتر الخاص بكل استراتيجية (لتحليل لوحة التحكم)."""
+    with _scan_stats_lock:
+        _strategy_filter_stats[strategy_name][filter_label] += 1
+
+def passes_market_sanity_filter(df: pd.DataFrame) -> bool:
+    """[V9.14.0] بوابة العقلانية العامة — واسعة جدًا وبلا أي حساسية اتجاهية.
+    تحل محل فلتري "تقلب السوق" و"قوة الاتجاه" الشاملين اللذين كانا يخنقان التوصيات.
+    تمنع فقط الحالات القصوى غير القابلة للتداول: السوق الميت (ATR% < 0.10)
+    والفوضى العارمة (ATR% > 8.0). كل أنماط السوق المشروعة (اتجاه/نطاق/انضغاط/
+    انفجار) تمر منها إلى استراتيجياتها، وكل فلترة أدق صارت ملكًا للاستراتيجية نفسها."""
     if len(df) < 50:
         return False
-    
     last = df.iloc[-1]
     # التأكد من وجود الأعمدة المطلوبة
     if 'atr' not in last or 'close' not in last or last['close'] == 0:
-        return False # لا يمكن الحساب، نفترض أنه غير صالح
-        
-    atr_percent = (last['atr'] / last['close']) * 100
-    
-    # تجنب التداول عندما يكون التقلب منخفض جدًا أو مرتفع جدًا
-    if atr_percent < 0.5 or atr_percent > 5.0:
-        log_rejection(df.name, "Market Volatility Filter Failed", {"atr_percent": f"{atr_percent:.2f}"})
+        return False  # لا يمكن الحساب، نفترض أنه غير صالح
+    atr_percent = (float(last['atr']) / float(last['close'])) * 100
+    if atr_percent < 0.10 or atr_percent > 8.0:
+        log_rejection(df.name, "Market Sanity Filter Failed", {"atr_percent": f"{atr_percent:.2f}"})
         return False
-    
     return True
 
-def check_trend_strength_filter(df: pd.DataFrame) -> bool:
-    """فلتر لتأكيد قوة الاتجاه الحالي"""
+def passes_strategy_prefilters(df: pd.DataFrame, strategy_name: str) -> bool:
+    """[V9.14.0] الفلتر الخاص بكل استراتيجية حسب ملفها المنطقي (STRATEGY_FILTER_PROFILES).
+    الفلسفة: الفلتر يخدم نمط الاستراتيجية ولا يحاربه:
+    - الاتجاهية تحتاج ADX حيًا (حد أدنى) — السوق الجانبي بلا فرص لها.
+    - الارتدادية تعمل في النطاقات فسقف ADX يحميها من الاتجاه القاتل لها.
+    - الاختراقية إعدادُها الانضغاطُ ما قبل الاختراق ذاته فلا حد أدنى للتقلب أو ADX.
+    None = بلا حد لهذا البعد. كل رفض يُحاسب في _strategy_filter_stats للتحليل."""
     if len(df) < 50:
         return False
-        
+    profile = STRATEGY_FILTER_PROFILES.get(strategy_name) or DEFAULT_STRATEGY_FILTER_PROFILE
     last = df.iloc[-1]
-    
-    # التأكد من وجود الأعمدة المطلوبة
-    if 'adx' not in last or f'roc_{MOMENTUM_PERIOD}' not in last:
-        return False # لا يمكن الحساب، نفترض أنه غير صالح
 
-    # تجنب التداول في الأسواق الجانبية
-    if last['adx'] < 18:
-        log_rejection(df.name, "Trend Strength Filter Failed", {"reason": "ADX too low", "adx": f"{last['adx']:.2f}"})
+    def _fail(label: str, details: Dict[str, Any]) -> bool:
+        _count_strategy_filter_reject(strategy_name, label)
+        log_rejection(df.name, "Strategy Prefilter Failed",
+                      {'strategy': strategy_name, 'filter': label, **details})
         return False
-        
-    # التأكد من وجود زخم كافٍ
-    if abs(last[f'roc_{MOMENTUM_PERIOD}']) < 0.5:
-        log_rejection(df.name, "Trend Strength Filter Failed", {"reason": "ROC too low", "roc_10": f"{last[f'roc_{MOMENTUM_PERIOD}']:.2f}"})
-        return False
-        
+
+    # 1) حدود ADX (قوة الاتجاه): حد أدنى للاتجاهية، سقف للارتدادية/الاختراقية
+    adx_val = float(last['adx']) if ('adx' in last and pd.notna(last['adx'])) else None
+    if adx_val is not None:
+        min_adx, max_adx = profile.get('min_adx'), profile.get('max_adx')
+        if min_adx is not None and adx_val < min_adx:
+            return _fail(f"ADX أدنى من {min_adx:g}", {'adx': f"{adx_val:.2f}"})
+        if max_adx is not None and adx_val > max_adx:
+            return _fail(f"ADX أعلى من {max_adx:g}", {'adx': f"{adx_val:.2f}"})
+
+    # 2) حدود التقلب النسبي ATR%: لكل نمط نطاقه المناسب (الاختراقية بلا حد أدنى)
+    if 'atr' in last and 'close' in last and last['close']:
+        atr_percent = (float(last['atr']) / float(last['close'])) * 100
+        min_atr, max_atr = profile.get('min_atr_pct'), profile.get('max_atr_pct')
+        if min_atr is not None and atr_percent < min_atr:
+            return _fail(f"تقلب أدنى من {min_atr:g}%", {'atr_percent': f"{atr_percent:.2f}"})
+        if max_atr is not None and atr_percent > max_atr:
+            return _fail(f"تقلب أعلى من {max_atr:g}%", {'atr_percent': f"{atr_percent:.2f}"})
+
+    # 3) حد أدنى للزخم المطلق ROC: فقط لمن يحتاجه في ملفه (الزخمية)
+    roc_key = f'roc_{MOMENTUM_PERIOD}'
+    min_roc = profile.get('min_roc')
+    if min_roc is not None and roc_key in last and pd.notna(last[roc_key]):
+        roc_abs = abs(float(last[roc_key]))
+        if roc_abs < min_roc:
+            return _fail(f"زخم ROC أدنى من {min_roc:g}%", {roc_key: f"{roc_abs:.2f}"})
+
     return True
 
 
@@ -2234,7 +2290,7 @@ def get_dashboard_html():
 <html lang="ar" dir="rtl">
 <head>
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CryptoBot V9.13.0 // NEON TERMINAL</title>
+    <title>CryptoBot V9.14.0 // NEON TERMINAL</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
         // [تحسين V9.9] ألوان الثيم الهاكر: أخضر مصفوفة + سماوي سيبراني على أسود
@@ -2315,7 +2371,7 @@ def get_dashboard_html():
         <header class="mb-6 flex flex-wrap justify-between items-center gap-4">
             <div>
                 <div dir="ltr" class="font-mono text-xs md:text-sm text-text-secondary mb-1">&gt;&gt; root@crypto-bot:~$ ./trading_engine --live --region=eu-frankfurt<span class="cursor"></span></div>
-                <h1 class="text-2xl md:text-3xl font-extrabold flicker"><span class="text-accent-green neon-text">لوحة تحكم</span> <span class="font-mono text-text-secondary text-lg md:text-xl" dir="ltr">V9.13.0//NEON</span></h1>
+                <h1 class="text-2xl md:text-3xl font-extrabold flicker"><span class="text-accent-green neon-text">لوحة تحكم</span> <span class="font-mono text-text-secondary text-lg md:text-xl" dir="ltr">V9.14.0//NEON</span></h1>
             </div>
             <div id="trend-lights-container" class="flex items-center gap-x-6 bg-black/40 px-4 py-2 rounded-lg border border-border-color"></div>
         </header>
@@ -2715,8 +2771,8 @@ function updateRejections() {
             }).join('')
             : '<div class="text-xs text-text-secondary mb-2">لا رفضات فلاتر بعد</div>';
         const stratHtml = (s.strategies && s.strategies.length)
-            ? `<table class="w-full text-xs mt-1"><thead><tr class="text-text-secondary border-b border-border-color"><th class="text-right py-1">الاستراتيجية</th><th class="py-1">فحوصات</th><th class="py-1">نجاحات</th><th class="py-1">نسبة النجاح</th></tr></thead><tbody>${
-                s.strategies.map(r => `<tr class="border-b border-border-color/50"><td class="text-right py-1 font-mono">${r.strategy}</td><td class="text-center font-mono">${r.checks}</td><td class="text-center font-mono text-accent-green">${r.passes}</td><td class="text-center font-mono ${r.pass_rate_pct > 0 ? 'text-accent-green' : 'text-text-secondary'}">${r.pass_rate_pct}%</td></tr>`).join('')
+            ? `<table class="w-full text-xs mt-1"><thead><tr class="text-text-secondary border-b border-border-color"><th class="text-right py-1">الاستراتيجية</th><th class="py-1">فحوصات</th><th class="py-1">نجاحات</th><th class="py-1">نسبة النجاح</th><th class="py-1" title="رفضات الفلتر الخاص بهذه الاستراتيجية (ملف فلترة منطقي لكل نمط)">رفض فلترها</th></tr></thead><tbody>${
+                s.strategies.map(r => `<tr class="border-b border-border-color/50"><td class="text-right py-1 font-mono" title="${r.filter_breakdown ? Object.entries(r.filter_breakdown).map(([k,v]) => k + ': ' + v).join(' | ') : ''}">${r.strategy}</td><td class="text-center font-mono">${r.checks}</td><td class="text-center font-mono text-accent-green">${r.passes}</td><td class="text-center font-mono ${r.pass_rate_pct > 0 ? 'text-accent-green' : 'text-text-secondary'}">${r.pass_rate_pct}%</td><td class="text-center font-mono ${r.prefilter_rejects ? 'text-accent-yellow' : 'text-text-secondary'}">${r.prefilter_rejects || 0}</td></tr>`).join('')
             }</tbody></table>`
             : '<div class="text-xs text-text-secondary">لا فحوصات استراتيجيات بعد</div>';
         const lastAt = s.last_rejection_at ? new Date(s.last_rejection_at).toLocaleTimeString('ar-EG') : '—';
@@ -2726,7 +2782,7 @@ function updateRejections() {
                 <div class="font-mono text-xs text-text-secondary">رفضات فلاتر: <span class="text-accent-yellow">${s.total_filter_rejects}</span> | فحوصات استراتيجيات: <span class="text-white">${s.total_strategy_checks}</span> | نجاحات: <span class="text-accent-green">${s.total_strategy_passes}</span> | آخر رفض: <span class="text-white">${lastAt}</span></div>
             </div>
             <div class="mb-3">${filtersHtml}</div>
-            <div class="text-xs text-text-secondary mb-1">أقرب الاستراتيجيات للاشتعال (مرتبة بالنجاحات):</div>
+            <div class="text-xs text-text-secondary mb-1">أقرب الاستراتيجيات للاشتعال (مرتبة بالنجاحات) — كل استراتيجية لها فلترها المنطقي الخاص (V9.14.0):</div>
             ${stratHtml}
         </div>`;
     });
@@ -2892,7 +2948,7 @@ def home(): return render_template_string(get_dashboard_html())
 @app.route('/health')
 def health_check():
     """[تحسين V9.8] نقطة فحص صحة خفيفة لمراقبة الخدمة على Render وأدوات Uptime."""
-    return jsonify({"status": "ok", "version": "V9.13.0", "time": datetime.now(timezone.utc).isoformat()})
+    return jsonify({"status": "ok", "version": "V9.14.0", "time": datetime.now(timezone.utc).isoformat()})
 
 # --- [تحسين V9.9] نقطة حالة النظام: وزن الطلبات، الحظر، قاطع الحماية، التخزين ---
 @app.route('/api/system_status')
@@ -2911,7 +2967,7 @@ def api_system_status():
         except Exception:
             pass
         return jsonify({
-            'version': 'V9.13.0',
+            'version': 'V9.14.0',
             'client_ready': bool(client),
             'rate_guard': snap,
             'daily_pnl_usdt': pnl,
@@ -3065,14 +3121,14 @@ def get_rejection_logs():
 
 @app.route('/api/rejection_summary')
 def api_rejection_summary():
-    """[تحسين V9.12.0] تحليل أسباب الرفض — الصورة الكاملة منذ الإقلاع.
-    كاش الرفض (100 عنصر) يفيض خلال ثوانٍ في الدورة النشطة، والعديد من الاستراتيجيات
-    كانت تفشل بصمت — هذا الملخص يجمع: رفضات الفلاتر التراكمية + فحوصات/نجاحات كل
-    استراتيجية (يكشف أقرب استراتيجية للاشتعال) + آخر الرفضات المسجلة."""
+    """[تحسين V9.12.0 + V9.14.0] تحليل أسباب الرفض — الصورة الكاملة منذ الإقلاع.
+    يضم: رفضات بوابة العقلانية + فحوصات/نجاحات كل استراتيجية + رفضات الفلتر
+    الخاص بكل استراتيجية (ملف فلترة منطقي لكل نمط) + آخر الرفضات المسجلة."""
     try:
         with _scan_stats_lock:
             filters = dict(_filter_reject_stats)
             strategies = {name: dict(c) for name, c in _strategy_scan_stats.items()}
+            strategy_filters = {name: dict(c) for name, c in _strategy_filter_stats.items()}
         with rejection_logs_lock:
             recent = list(rejection_logs_cache)
 
@@ -3084,9 +3140,12 @@ def api_rejection_summary():
         for name, s in strategies.items():
             checks = s.get('checks', 0)
             passes = s.get('passes', 0)
+            prefilter_rejects = sum(strategy_filters.get(name, {}).values())
             strategy_rows.append({
                 'strategy': name, 'checks': checks, 'passes': passes,
-                'pass_rate_pct': round(passes / checks * 100, 2) if checks else 0.0
+                'pass_rate_pct': round(passes / checks * 100, 2) if checks else 0.0,
+                'prefilter_rejects': prefilter_rejects,
+                'filter_breakdown': strategy_filters.get(name, {})
             })
         strategy_rows.sort(key=lambda r: r['passes'], reverse=True)
 
@@ -3097,6 +3156,7 @@ def api_rejection_summary():
             'total_strategy_checks': total_checks,
             'total_strategy_passes': total_passes,
             'strategies': strategy_rows,
+            'strategy_filters': strategy_filters,
             'recent_rejections_count': len(recent),
             'last_rejection_at': recent[0].get('timestamp') if recent else None,
         })
@@ -3530,13 +3590,11 @@ def main_loop_enhanced():
                         if df_with_indicators.empty:
                             continue
                         
-                        # --- تطبيق الفلاتر العامة أولاً ---
-                        # [تحسين V9.12.0] عدّاد تراكمي لرفضات الفلاتر — الكاش (100 عنصر) يفيض خلال ثوانٍ
-                        if not check_market_volatility_filter(df_with_indicators):
-                            with _scan_stats_lock: _filter_reject_stats['فلتر تقلب السوق'] += 1
-                            continue
-                        if not check_trend_strength_filter(df_with_indicators):
-                            with _scan_stats_lock: _filter_reject_stats['فلتر قوة الاتجاه'] += 1
+                        # --- [V9.14.0] بوابة العقلانية العامة فقط (واسعة جدًا) ---
+                        # لم تعد تمنع أي نمط سوق مشروع: فقط الميت القصوى (ATR%<0.1) والفوضى (>8)
+                        # كل الفلترة المنطقية صارت ملفًا خاصًا بكل استراتيجية داخل الحلقة أدناه
+                        if not passes_market_sanity_filter(df_with_indicators):
+                            with _scan_stats_lock: _filter_reject_stats['بوابة العقلانية العامة'] += 1
                             continue
 
                         signal_found, strategy_used = False, None
@@ -3557,9 +3615,13 @@ def main_loop_enhanced():
                         with sr_breakout_strategy_lock:
                             if USE_SR_BREAKOUT_STRATEGY: strategies_to_check.append(('SR_BREAKOUT', check_support_resistance_strategy_enhanced, "SR_Breakout_Enhanced"))
 
-                        # [تحسين V9.12.0] حصر فحوصات ونجاحات كل استراتيجية — 5 من 7 كانت صامتة تمامًا
+                        # [تحسين V9.12.0 + V9.14.0] حصر فحوصات ونجاحات كل استراتيجية
+                        # مع فلتر خاص بكل استراتيجية حسب ملفها المنطقي بدل الفلاتر الشاملة
                         for key, check_func, name in strategies_to_check:
                             with _scan_stats_lock: _strategy_scan_stats[name]['checks'] += 1
+                            # [V9.14.0] فلتر الاستراتيجية الخاص (ملف منطقي لكل نمط)
+                            if not passes_strategy_prefilters(df_with_indicators, name):
+                                continue
                             if check_func(df_with_indicators):
                                 with _scan_stats_lock: _strategy_scan_stats[name]['passes'] += 1
                                 signal_found, strategy_used = True, name
