@@ -42,7 +42,7 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-logger = logging.getLogger('CryptoBotV9.14.0')
+logger = logging.getLogger('CryptoBotV9.15.0')
 
 # زمن إقلاع العملية لحساب مدة التشغيل في لوحة التحكم
 BOOT_TIME = time.time()
@@ -132,30 +132,36 @@ USE_SHORT_TERM_MOMENTUM_FILTER: bool = config('USE_SHORT_TERM_MOMENTUM_FILTER', 
 # مدة تخزين نتيجة تأكيد الترند لكل عملة (بالثواني) لتقليل استهلاك API
 HTF_CONFIRMATION_CACHE_TTL: int = config('HTF_CONFIRMATION_CACHE_TTL', default=900, cast=int)
 
-# --- [إعادة تصميم جوهرية V9.14.0] لكل استراتيجية فلترها المنطقي ---
-# المشكلة الموثقة ببيانات حقيقية (ملخص الرفض V9.13.0): فلترا "تقلب السوق"
-# (ATR% بين 0.5-5) و"قوة الاتجاه" (ADX>=18 و ROC>=0.5) كانا يُطبقان على الجميع
-# قبل أي استراتيجية، فقتلا استراتيجيات الاختراق بطبيعتها:
-#   BB_Squeeze_Breakout إعدادُه الانضغاط نفسه (تقلب منخفض) → رفض 163 مرة (0% نجاح)
-#   SR_Breakout_Enhanced يطلب نطاقًا عرضيًا قبل الاختراق (ADX منخفض) → رفض 152 مرة (0%)
-# والحل: إلغاء الفلاتر الشاملة واستبدالها بملف فلترة خاص بكل استراتيجية:
-#   اتجاهية (MACD_EMA/EMA_RSI/Pullback): تحتاج اتجاهًا حيًا → حد أدنى لـ ADX
-#   زخمية (Bullish_Momentum): تحتاج حركة فعلية → حدود للتقلب النسبي + زخم ROC
-#   ارتدادية (BB_Stoch): تعمل في النطاقات → سقف ADX (اتجاه قوي يقتل الارتداد)
-#   اختراقية (Squeeze/SR): الانضغاط هو الإعداد ذاته → بلا حد أدنى للتقلب أو ADX
-# None = بلا حد لهذا البعد. شروط الاستراتيجية الداخلية تبقى مسؤولة عن تفاصيلها.
+# --- [معايرة احترافية V9.15.0] لكل استراتيجية فلترها المنطقي بقيم معيارية ---
+# مراجع المعايرة (الكلاسيكيات الموثقة التي يستخدمها المحترفون):
+#   Wilder  (مبتكر ADX): ADX<20 نطاق/بلا اتجاه، 20-25 اتجاه ناشئ، >25 اتجاه قوي
+#   Raschke (Holy Grail): الارتداد يُشترى في اتجاه مثبت فقط (ADX≥25)
+#   Connors (الانعكاس): اشترِ التراجعات فوق المتوسط البنيوي فقط — لا تصيد سكاكين
+#   Carter  (TTM Squeeze): الانضغاط+الاختراق+الحجم هو الفلتر ذاته — صالح في النطاق
+#                          وفي استمرار الاتجاه القوي على السواء (العلم/الراية)
+# والاتجاه العام محمي أصلًا ببوابة سلوك القائد (V9.13) وتأكيد فريم الساعة
+# الأبعاد: min/max_adx حدود قوة الاتجاه، min/max_atr_pct حدود التقلب النسبي
+# (أرضية 0.30% ≳ تكلفة الدوران 0.2% — معيار سيولة التنفيذ)، min_roc دفعة الزخم،
+# require_above_ema50: معيار Connors البنيوي لصفقات شراء التراجعات. None = بلا حد.
 STRATEGY_FILTER_PROFILES: Dict[str, Dict[str, Optional[float]]] = {
-    'MACD_EMA_Crossover':         {'min_adx': 15.0, 'max_adx': None, 'min_atr_pct': 0.25, 'max_atr_pct': 6.0, 'min_roc': None},
-    'EMA_RSI_Cross':              {'min_adx': 15.0, 'max_adx': None, 'min_atr_pct': 0.25, 'max_atr_pct': 6.0, 'min_roc': None},
-    'Pullback_MACD':              {'min_adx': 18.0, 'max_adx': None, 'min_atr_pct': 0.25, 'max_atr_pct': 6.0, 'min_roc': None},
-    'Bullish_Momentum':           {'min_adx': None, 'max_adx': None, 'min_atr_pct': 0.40, 'max_atr_pct': 7.0, 'min_roc': 0.5},
-    'BB_Stoch_Reversal_Enhanced': {'min_adx': None, 'max_adx': 32.0, 'min_atr_pct': 0.20, 'max_atr_pct': 5.0, 'min_roc': None},
-    'BB_Squeeze_Breakout':        {'min_adx': None, 'max_adx': 28.0, 'min_atr_pct': None, 'max_atr_pct': 6.0, 'min_roc': None},
-    'SR_Breakout_Enhanced':       {'min_adx': None, 'max_adx': 28.0, 'min_atr_pct': None, 'max_atr_pct': 6.0, 'min_roc': None},
+    # التقاطعات الاتجاهية — Wilder: بلا تداول تقاطعات في غياب الاتجاه (ADX≥20)
+    'MACD_EMA_Crossover':         {'min_adx': 20.0, 'max_adx': None, 'min_atr_pct': 0.30, 'max_atr_pct': 5.0, 'min_roc': None, 'require_above_ema50': False},
+    'EMA_RSI_Cross':              {'min_adx': 20.0, 'max_adx': None, 'min_atr_pct': 0.30, 'max_atr_pct': 5.0, 'min_roc': None, 'require_above_ema50': False},
+    # Pullback — Raschke: الارتداد يُشترى في اتجاه مثبت فقط (ADX≥25)
+    'Pullback_MACD':              {'min_adx': 25.0, 'max_adx': None, 'min_atr_pct': 0.30, 'max_atr_pct': 5.0, 'min_roc': None, 'require_above_ema50': False},
+    # الزخم — قمم/قيعان صاعدة تحتاج اتجاهًا قويًا + تقلبًا حيًا + دفعة فعلية (ROC≥1%)
+    'Bullish_Momentum':           {'min_adx': 25.0, 'max_adx': None, 'min_atr_pct': 0.50, 'max_atr_pct': 6.0, 'min_roc': 1.0, 'require_above_ema50': False},
+    # الارتدادية — Connors: شراء التراجعات فوق EMA50 فقط، وبلا سقف ADX:
+    # شراء الغرقى في اتجاه صاعد قوي أفضل صفقات الانعكاس على الإطلاق (وليست ممنوعة)
+    'BB_Stoch_Reversal_Enhanced': {'min_adx': None, 'max_adx': None, 'min_atr_pct': 0.25, 'max_atr_pct': 4.0, 'min_roc': None, 'require_above_ema50': True},
+    # الاختراقية — Carter: الانضغاط هو الفلتر ذاته، بلا قيود نظامية ADX إطلاقًا
+    # (سقف ADX كان يمنع نمط الاستمرار الاحترافي في الاتجاهات القوية — 72 رفضًا حيًا)
+    'BB_Squeeze_Breakout':        {'min_adx': None, 'max_adx': None, 'min_atr_pct': None, 'max_atr_pct': 5.0, 'min_roc': None, 'require_above_ema50': False},
+    'SR_Breakout_Enhanced':       {'min_adx': None, 'max_adx': None, 'min_atr_pct': None, 'max_atr_pct': 5.0, 'min_roc': None, 'require_above_ema50': False},
 }
 # احتياط لأي استراتيجية مستقبلية غير مدرجة: بوابة عقلانية واسعة فقط
 DEFAULT_STRATEGY_FILTER_PROFILE: Dict[str, Optional[float]] = {
-    'min_adx': None, 'max_adx': None, 'min_atr_pct': 0.20, 'max_atr_pct': 7.0, 'min_roc': None}
+    'min_adx': None, 'max_adx': None, 'min_atr_pct': 0.20, 'max_atr_pct': 7.0, 'min_roc': None, 'require_above_ema50': False}
 
 # --- [تحسين V9.9.1] إعدادات حماية الحظر من Binance (خطأ -1003) ---
 # حد Binance الرسمي 6000 وزن/دقيقة لكل IP — وعلى Render المجاني الـ IP مشترك مع خدمات أخرى،
@@ -1455,11 +1461,15 @@ def passes_market_sanity_filter(df: pd.DataFrame) -> bool:
     return True
 
 def passes_strategy_prefilters(df: pd.DataFrame, strategy_name: str) -> bool:
-    """[V9.14.0] الفلتر الخاص بكل استراتيجية حسب ملفها المنطقي (STRATEGY_FILTER_PROFILES).
-    الفلسفة: الفلتر يخدم نمط الاستراتيجية ولا يحاربه:
-    - الاتجاهية تحتاج ADX حيًا (حد أدنى) — السوق الجانبي بلا فرص لها.
-    - الارتدادية تعمل في النطاقات فسقف ADX يحميها من الاتجاه القاتل لها.
-    - الاختراقية إعدادُها الانضغاطُ ما قبل الاختراق ذاته فلا حد أدنى للتقلب أو ADX.
+    """[V9.15.0] الفلتر الخاص بكل استراتيجية حسب ملفها المعياري الاحترافي.
+    الفلسفة: الفلتر يخدم نمط الاستراتيجية ولا يحاربه — بقيم الكلاسيكيات:
+    - التقاطعات (Wilder): ADX≥20 — بلا تقاطعات في غياب الاتجاه.
+    - Pullback (Raschke): ADX≥25 — الارتداد في اتجاه مثبت فقط.
+    - الزخم: اتجاه قوي + تقلب حي + دفعة ROC≥1%.
+    - الارتدادية (Connors): شراء التراجعات فوق EMA50 فقط — بلا سقف ADX
+      (شراء الغرقى في الاتجاه الصاعد القوي أفضل صفقات الانعكاس).
+    - الاختراقية (Carter/TTM): الانضغاط+الاختراق+الحجم هو الفلتر ذاته —
+      صالح في النطاق وفي استمرار الاتجاه، فلا قيود ADX ولا أرضية تقلب.
     None = بلا حد لهذا البعد. كل رفض يُحاسب في _strategy_filter_stats للتحليل."""
     if len(df) < 50:
         return False
@@ -1497,6 +1507,14 @@ def passes_strategy_prefilters(df: pd.DataFrame, strategy_name: str) -> bool:
         roc_abs = abs(float(last[roc_key]))
         if roc_abs < min_roc:
             return _fail(f"زخم ROC أدنى من {min_roc:g}%", {roc_key: f"{roc_abs:.2f}"})
+
+    # 4) [V9.15.0] معيار Connors البنيوي لصفقات شراء التراجعات: السعر فوق EMA50
+    # (لا نشتري غرقى في عملة بنيوها هابط — أفضل انعكاسات هي تراجعات اتجاه صاعد)
+    if profile.get('require_above_ema50'):
+        if 'ema_50' in last and pd.notna(last['ema_50']) and last['close']:
+            if float(last['close']) <= float(last['ema_50']):
+                return _fail("السعر تحت EMA50 (معيار Connors)",
+                             {'close': f"{float(last['close']):.6g}", 'ema_50': f"{float(last['ema_50']):.6g}"})
 
     return True
 
@@ -2290,7 +2308,7 @@ def get_dashboard_html():
 <html lang="ar" dir="rtl">
 <head>
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CryptoBot V9.14.0 // NEON TERMINAL</title>
+    <title>CryptoBot V9.15.0 // NEON TERMINAL</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
         // [تحسين V9.9] ألوان الثيم الهاكر: أخضر مصفوفة + سماوي سيبراني على أسود
@@ -2371,7 +2389,7 @@ def get_dashboard_html():
         <header class="mb-6 flex flex-wrap justify-between items-center gap-4">
             <div>
                 <div dir="ltr" class="font-mono text-xs md:text-sm text-text-secondary mb-1">&gt;&gt; root@crypto-bot:~$ ./trading_engine --live --region=eu-frankfurt<span class="cursor"></span></div>
-                <h1 class="text-2xl md:text-3xl font-extrabold flicker"><span class="text-accent-green neon-text">لوحة تحكم</span> <span class="font-mono text-text-secondary text-lg md:text-xl" dir="ltr">V9.14.0//NEON</span></h1>
+                <h1 class="text-2xl md:text-3xl font-extrabold flicker"><span class="text-accent-green neon-text">لوحة تحكم</span> <span class="font-mono text-text-secondary text-lg md:text-xl" dir="ltr">V9.15.0//NEON</span></h1>
             </div>
             <div id="trend-lights-container" class="flex items-center gap-x-6 bg-black/40 px-4 py-2 rounded-lg border border-border-color"></div>
         </header>
@@ -2948,7 +2966,7 @@ def home(): return render_template_string(get_dashboard_html())
 @app.route('/health')
 def health_check():
     """[تحسين V9.8] نقطة فحص صحة خفيفة لمراقبة الخدمة على Render وأدوات Uptime."""
-    return jsonify({"status": "ok", "version": "V9.14.0", "time": datetime.now(timezone.utc).isoformat()})
+    return jsonify({"status": "ok", "version": "V9.15.0", "time": datetime.now(timezone.utc).isoformat()})
 
 # --- [تحسين V9.9] نقطة حالة النظام: وزن الطلبات، الحظر، قاطع الحماية، التخزين ---
 @app.route('/api/system_status')
@@ -2967,7 +2985,7 @@ def api_system_status():
         except Exception:
             pass
         return jsonify({
-            'version': 'V9.14.0',
+            'version': 'V9.15.0',
             'client_ready': bool(client),
             'rate_guard': snap,
             'daily_pnl_usdt': pnl,
