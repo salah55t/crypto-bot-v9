@@ -22,7 +22,7 @@ from binance.client import Client
 from binance.exceptions import BinanceAPIException
 from flask import Flask, jsonify, render_template_string, request, Response
 from flask_cors import CORS
-from threading import Thread, Lock
+from threading import Thread, Lock, current_thread, enumerate as threading_enumerate
 from datetime import datetime, timezone, timedelta
 from decouple import config
 from typing import List, Dict, Optional, Any, Set, Tuple
@@ -42,7 +42,7 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-logger = logging.getLogger('CryptoBotV9.12.0')
+logger = logging.getLogger('CryptoBotV9.12.1')
 
 # زمن إقلاع العملية لحساب مدة التشغيل في لوحة التحكم
 BOOT_TIME = time.time()
@@ -1218,18 +1218,26 @@ def get_btc_data_for_bot() -> Optional[pd.DataFrame]:
     if btc_data is not None: btc_data['btc_returns'] = btc_data['close'].pct_change()
     return btc_data
 
-def load_open_signals_to_cache():
-    if not check_db_connection() or not conn: return
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM signals WHERE status IN ('open', 'updated');")
-            open_signals = cur.fetchall()
-            with signal_cache_lock:
-                open_signals_cache.clear()
-                for signal in open_signals: open_signals_cache[signal['symbol']] = dict(signal)
-            logger.info(f"✅ [تحميل] تم تحميل {len(open_signals)} صفقة مفتوحة إلى الذاكرة المؤقتة.")
-    except Exception as e:
-        logger.error(f"❌ [تحميل] فشل تحميل الصفقات المفتوحة: {e}")
+def load_open_signals_to_cache(retries: int = 4, delay: int = 10):
+    # [إصلاح V9.12.1] كانت تعود صامتة إذا كانت قاعدة البيانات باردة عند الإقلاع
+    # (Neon/Supabase المجانية تستيقظ ببطء) فيبقى كاش الصفقات فارغًا حتى إعادة التشغيل —
+    # والآن تعيد المحاولة عدة مرات قبل الاستسلام.
+    for attempt in range(1, retries + 1):
+        if not check_db_connection() or not conn:
+            logger.warning(f"[تحميل] قاعدة البيانات غير جاهزة (محاولة {attempt}/{retries})...")
+            time.sleep(delay); continue
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM signals WHERE status IN ('open', 'updated');")
+                open_signals = cur.fetchall()
+                with signal_cache_lock:
+                    open_signals_cache.clear()
+                    for signal in open_signals: open_signals_cache[signal['symbol']] = dict(signal)
+                logger.info(f"✅ [تحميل] تم تحميل {len(open_signals)} صفقة مفتوحة إلى الذاكرة المؤقتة.")
+                return
+        except Exception as e:
+            logger.error(f"❌ [تحميل] فشل تحميل الصفقات المفتوحة (محاولة {attempt}/{retries}): {e}")
+            if attempt < retries: time.sleep(delay)
 
 def load_notifications_to_cache():
     if not check_db_connection() or not conn: return
@@ -2076,7 +2084,7 @@ def get_dashboard_html():
 <html lang="ar" dir="rtl">
 <head>
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CryptoBot V9.12.0 // NEON TERMINAL</title>
+    <title>CryptoBot V9.12.1 // NEON TERMINAL</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
         // [تحسين V9.9] ألوان الثيم الهاكر: أخضر مصفوفة + سماوي سيبراني على أسود
@@ -2157,7 +2165,7 @@ def get_dashboard_html():
         <header class="mb-6 flex flex-wrap justify-between items-center gap-4">
             <div>
                 <div dir="ltr" class="font-mono text-xs md:text-sm text-text-secondary mb-1">&gt;&gt; root@crypto-bot:~$ ./trading_engine --live --region=eu-frankfurt<span class="cursor"></span></div>
-                <h1 class="text-2xl md:text-3xl font-extrabold flicker"><span class="text-accent-green neon-text">لوحة تحكم</span> <span class="font-mono text-text-secondary text-lg md:text-xl" dir="ltr">V9.12.0//NEON</span></h1>
+                <h1 class="text-2xl md:text-3xl font-extrabold flicker"><span class="text-accent-green neon-text">لوحة تحكم</span> <span class="font-mono text-text-secondary text-lg md:text-xl" dir="ltr">V9.12.1//NEON</span></h1>
             </div>
             <div id="trend-lights-container" class="flex items-center gap-x-6 bg-black/40 px-4 py-2 rounded-lg border border-border-color"></div>
         </header>
@@ -2639,7 +2647,7 @@ def home(): return render_template_string(get_dashboard_html())
 @app.route('/health')
 def health_check():
     """[تحسين V9.8] نقطة فحص صحة خفيفة لمراقبة الخدمة على Render وأدوات Uptime."""
-    return jsonify({"status": "ok", "version": "V9.12.0", "time": datetime.now(timezone.utc).isoformat()})
+    return jsonify({"status": "ok", "version": "V9.12.1", "time": datetime.now(timezone.utc).isoformat()})
 
 # --- [تحسين V9.9] نقطة حالة النظام: وزن الطلبات، الحظر، قاطع الحماية، التخزين ---
 @app.route('/api/system_status')
@@ -2658,7 +2666,7 @@ def api_system_status():
         except Exception:
             pass
         return jsonify({
-            'version': 'V9.12.0',
+            'version': 'V9.12.1',
             'client_ready': bool(client),
             'rate_guard': snap,
             'daily_pnl_usdt': pnl,
@@ -2827,6 +2835,25 @@ def api_rejection_summary():
         logger.error(f"❌ [API ملخص الرفض] خطأ: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/debug_threads')
+def api_debug_threads():
+    """[تشخيص V9.12.1] مكدس كل خيط لحظيًا — يكشف بالضبط أين علق أي خيط
+    (مثلاً: نائم داخل قفل، منتظر شبكة، محسوبًا pandas). للفحص اليدوي فقط."""
+    import traceback as _tb
+    frames = sys._current_frames()
+    out = []
+    for t in threading_enumerate():
+        entry = {'name': t.name, 'daemon': t.daemon, 'alive': t.is_alive()}
+        f = frames.get(t.ident)
+        if f:
+            try:
+                stack = _tb.extract_stack(f)
+                entry['stack'] = [f"{fr.filename.split('/')[-1]}:{fr.lineno} in {fr.name}: {fr.line[:110] if fr.line else ''}" for fr in stack[-8:]]
+            except Exception as ee:
+                entry['stack'] = [f'unavailable: {ee}']
+        out.append(entry)
+    return jsonify({'thread_count': len(out), 'threads': out})
+
 @app.route('/api/trading/toggle', methods=['POST'])
 def toggle_trading_status():
     global is_trading_enabled
@@ -2894,9 +2921,11 @@ def update_target_price(signal_id):
 
     try:
         new_target_price = float(new_target_price)
+        # [إصلاح V9.12.1] كانت UPDATE على قاعدة البيانات + تليجرام تتم داخل القفل —
+        # نفس عائلة خطأ close_signal (احتكار signal_cache_lock أثناء الشبكة/DB)
         with signal_cache_lock:
             signal_to_update = next((s for s in open_signals_cache.values() if s['id'] == signal_id), None)
-            
+
             if not signal_to_update:
                 return jsonify({"success": False, "message": "Signal not found or already closed"}), 404
 
@@ -2908,16 +2937,17 @@ def update_target_price(signal_id):
                 return jsonify({"success": False, "message": "Target price cannot be below stop loss"}), 400
 
             signal_to_update['target_price'] = new_target_price
-            
-            with conn.cursor() as cur:
-                cur.execute("UPDATE signals SET target_price = %s WHERE id = %s", (new_target_price, signal_id))
-            conn.commit()
 
-            log_message = f"🖐️ [{symbol}] تم تحديث الهدف يدوياً من {old_target:.4f} إلى {new_target_price:.4f}"
-            log_and_notify('warning', log_message, "MANUAL_TP_UPDATE")
-            send_telegram_message(log_message)
+        # العمل الشبكي وقاعدة البيانات — خارج القفل تمامًا
+        with conn.cursor() as cur:
+            cur.execute("UPDATE signals SET target_price = %s WHERE id = %s", (new_target_price, signal_id))
+        conn.commit()
 
-            return jsonify({"success": True, "message": "Target price updated successfully"})
+        log_message = f"🖐️ [{symbol}] تم تحديث الهدف يدوياً من {old_target:.4f} إلى {new_target_price:.4f}"
+        log_and_notify('warning', log_message, "MANUAL_TP_UPDATE")
+        send_telegram_message(log_message)
+
+        return jsonify({"success": True, "message": "Target price updated successfully"})
 
     except (ValueError, TypeError):
         return jsonify({"success": False, "message": "Invalid target price format"}), 400
@@ -3016,14 +3046,16 @@ def trade_management_loop():
     logger.info("✅ [مدير الصفقات] بدء حلقة إدارة الصفقات...")
     while True:
         try:
+            # [إصلاح V9.12.1 — حامل القفل الدائم] كان النوم (5 ثوانٍ) يتم داخل القفل
+            # عندما يكون الكاش فارغًا: امسك ← نم 5ث ← حرر ميكروثانية ← امسك فورًا...
+            # = احتكار شبه دائم لـ signal_cache_lock يجوّع نقاط اللوحة الثلاث التي تنتظره
+            # (كان يبدأ فقط عندما يكون كاش الصفقات فارغًا — مثل فشل تحميله عند إقلاع DB باردة)
             with signal_cache_lock:
-                if not open_signals_cache:
-                    time.sleep(5)
-                    continue
-                signals_to_check = list(open_signals_cache.values())
+                has_signals = bool(open_signals_cache)
+                signals_to_check = list(open_signals_cache.values()) if has_signals else []
 
-            if not redis_client:
-                time.sleep(5)
+            if not has_signals or not redis_client:
+                time.sleep(5)  # النوم خارج القفل الآن
                 continue
 
             current_prices = redis_client.hgetall(REDIS_PRICES_HASH_NAME)
@@ -3394,7 +3426,7 @@ def initialize_bot_services():
     Thread(target=balance_refresh_loop, daemon=True).start()  # [تحسين V9.11.0] كاش رصيد اللوحة
     Thread(target=btc_trend_loop, daemon=True).start()        # [تحسين V9.11] بوصلة اتجاه BTC
     logger.info("✅ [خدمات البوت] تم بدء جميع الخدمات الخلفية بنجاح.")
-    send_telegram_message("✅ *البوت قيد التشغيل الآن (نسخة V9.12.0 - Neon Security)*")
+    send_telegram_message("✅ *البوت قيد التشغيل الآن (نسخة V9.12.1 - Neon Security)*")
 
 # ---------------------- نقطة الدخول ----------------------
 if __name__ == "__main__":
@@ -3405,7 +3437,7 @@ if __name__ == "__main__":
         sys.setswitchinterval(0.002)
     except Exception:
         pass
-    logger.info("🚀 إطلاق بوت التداول ولوحة التحكم (V9.12.0 - Neon Security) 🚀")
+    logger.info("🚀 إطلاق بوت التداول ولوحة التحكم (V9.12.1 - Neon Security) 🚀")
     Thread(target=initialize_bot_services, daemon=True).start()
     port = int(os.environ.get('PORT', 10000))
     host = "0.0.0.0"
