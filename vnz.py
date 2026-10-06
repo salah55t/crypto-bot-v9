@@ -28,6 +28,13 @@ from decouple import config
 from typing import List, Dict, Optional, Any, Set, Tuple
 from sklearn.preprocessing import StandardScaler
 from collections import deque, Counter, defaultdict
+# [V9.16.0] مركز بيانات WebSocket — لا يخضع لأوزان REST ويعمل أثناء الحظر
+try:
+    import websocket  # websocket-client
+    _WEBSOCKET_AVAILABLE: bool = True
+except Exception:
+    websocket = None
+    _WEBSOCKET_AVAILABLE = False
 import warnings
 
 # --- إعدادات التجاهل واللوجر ---
@@ -42,7 +49,8 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-logger = logging.getLogger('CryptoBotV9.15.1')
+APP_VERSION: str = 'V9.16.0'  # [V9.16.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
+logger = logging.getLogger('CryptoBotV9.16.0')
 
 # زمن إقلاع العملية لحساب مدة التشغيل في لوحة التحكم
 BOOT_TIME = time.time()
@@ -182,6 +190,20 @@ BAN_LONG_THRESHOLD_SEC: int = config('BAN_LONG_THRESHOLD_SEC', default=600, cast
 # فاصل تحديث أسعار Redis بالثواني (كل طلب أسعار شامل وزنه 4) — [V9.15.1] 3→5ث
 # (80→48 وزن/دقيقة): تقليل بصمتنا على IP مشترك بلا أثر عملي على حيوية اللوحة
 PRICE_UPDATE_INTERVAL_SEC: int = config('PRICE_UPDATE_INTERVAL_SEC', default=5, cast=int)
+
+# --- [V9.16.0] مركز بيانات WebSocket — الشفاء الجذري لحظر -1003 على IP مشترك ---
+# الشموع والأسعار عبر تدفقات Binance العامة (بلا مفاتيح وبلا أوزان REST وتعمل أثناء الحظر)،
+# ويبقى REST للتهيئة/الأوامر/تعبئة أولى لكل رمز — بصمة وزن شبه معدومة على IP الخروج المشترك.
+USE_STREAM_HUB: bool = config('USE_STREAM_HUB', default=True, cast=bool)
+STREAM_HUB_BASE_URL: str = config('STREAM_HUB_BASE_URL', default='wss://stream.binance.com:9443/stream')
+# عمق المخازن (شمعة مكتملة): 15م يغطي lookback المسح (920 ساعة = 3680 شمعة) + هامش
+STREAM_HUB_BUFFER_15M: int = config('STREAM_HUB_BUFFER_15M', default=4200, cast=int)
+STREAM_HUB_BUFFER_1H: int = config('STREAM_HUB_BUFFER_1H', default=1300, cast=int)
+STREAM_HUB_BUFFER_DEFAULT: int = config('STREAM_HUB_BUFFER_DEFAULT', default=500, cast=int)
+# فاصل التعبئة العميقة (رمز واحد كل مرة — يحترم الحارس) وعتبة الطلب الجامد
+STREAM_HUB_BACKFILL_DELAY_SEC: float = config('STREAM_HUB_BACKFILL_DELAY_SEC', default=3.0, cast=float)
+STREAM_HUB_STALE_SEC: int = config('STREAM_HUB_STALE_SEC', default=90, cast=int)
+STREAM_HUB_MAINTAIN_SEC: int = config('STREAM_HUB_MAINTAIN_SEC', default=60, cast=int)
 
 # --- [تحسين V9.11.0] منع اختناق خيوط الويب (waitress queue depth) ---
 # السبب الجذري: /api/market_status كان يستدعي Binance مباشرة (وزن 5) في كل استطلاع
@@ -610,8 +632,11 @@ def fetch_btc_trend_matrix(force: bool = False) -> Optional[Dict[str, Any]]:
     tfs_out: Dict[str, Any] = {}
     try:
         for tf in BTC_TREND_TFS:
-            klines = safe_api_call(client.get_klines, symbol=BTC_SYMBOL, interval=tf, limit=150, weight=2)
-            closes = [float(k[4]) for k in klines] if klines else []
+            # [V9.16.0] أغلاق BTC من مركز WebSocket أولًا — REST احتياطي فقط
+            closes = stream_hub.get_closes(BTC_SYMBOL, tf, 150) if stream_hub is not None else None
+            if not closes:
+                klines = safe_api_call(client.get_klines, symbol=BTC_SYMBOL, interval=tf, limit=150, weight=2)
+                closes = [float(k[4]) for k in klines] if klines else []
             tfs_out[tf] = compute_tf_trend(closes)
         if not tfs_out:
             return _btc_trend_cache['data']
@@ -660,7 +685,10 @@ def btc_trend_loop():
 # تكلفة الشبكة: 3 قادة × شموع 15م (وزن 2) كل 5 دقائق ≈ 1.2 وزن/دقيقة فقط.
 # ============================================================
 def _fetch_leader_closes(symbol: str) -> List[float]:
-    """شموع إغلاق 15م للقائد (300 شمعة = 75 ساعة، وزن 2 فقط)."""
+    """شموع إغلاق 15م للقائد — [V9.16.0] من مركز WebSocket أولًا (REST احتياطي، وزن 2)."""
+    closes = stream_hub.get_closes(symbol, '15m', 300) if stream_hub is not None else None
+    if closes:
+        return closes
     klines = safe_api_call(client.get_klines, symbol=symbol, interval='15m', limit=300, weight=2)
     if not klines:
         return []
@@ -875,6 +903,390 @@ def safe_create_order(**params):
     """الأوامر الحقيقية: نحجز الوزن فقط ولا نعيد المحاولة تلقائيًا لتجنب ازدواجية الأوامر."""
     rate_guard.acquire(weight=1)
     return client.create_order(**params)
+
+# ============================================================
+# [V9.16.0] مركز بيانات WebSocket — الشفاء الجذري لحظر IP (-1003)
+# ------------------------------------------------------------
+# المشكلة: IP الخروج المشترك على Render المجاني يُحظر من Binance REST
+# (وزن الطلبات يتراكم من جيران الخادم أيضًا) — وأي إعادة محاولة REST مهما
+# تحسنت تبقى أسيرة الحظر نفسه. رسالة Binance نفسها تحدد الحل:
+# "Please use WebSocket Streams for live updates to avoid bans".
+# الحل: تدفقات Binance العامة (wss://stream.binance.com:9443) لا تحتاج
+# مفاتيح ولا تخضع لأوزان REST إطلاقًا وتعمل أثناء الحظر — فتصبح الشموع
+# والأسعار تصل عبر WebSocket، ويبقى REST فقط للتهيئة/الأوامر/التعبئة
+# الأولى العميقة (بصمة وزن شبه معدومة).
+# الفلسفة كما هي: خيوط الويب تقرأ كاشًا فقط، والمركز كله خيوط خلفية.
+# تعطل المركز أو نقص مخزون → مسار REST القديم يعمل كما هو (تدهور رشيق).
+# ============================================================
+class MarketStreamHub:
+    _KLINE_COLUMNS = ['timestamp', 'open', 'high', 'low', 'close', 'volume', 'quote_volume', 'taker_buy_base']
+    # أعمدة صف REST kline [0..11] المستخدمة: 0=وقت الفتح 1..5=OHLCV 7=quote_volume 9=taker_buy_base
+    _REST_IDX = (0, 1, 2, 3, 4, 5, 7, 9)
+
+    def __init__(self):
+        self._lock = Lock()
+        self._closed: Dict[Tuple[str, str], Dict[int, tuple]] = {}
+        self._forming: Dict[Tuple[str, str], tuple] = {}
+        self._desired: Set[Tuple[str, str]] = set()
+        self._subscribed: Set[Tuple[str, str]] = set()
+        self._backfill_state: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        self._last_msg_ts: float = 0.0
+        self._connected: bool = False
+        self._reconnects: int = 0
+        self._served_frames: int = 0
+        self._subscribe_id: int = 1
+        self._ws = None
+        self._stop: bool = False
+        self._pinned: Set[str] = set([BTC_SYMBOL] + list(LEADER_SYMBOLS))
+        # أهداف الاكتمال — مطابقة تمامًا لما يطلبه مسار REST (شرط الخدمة من المخزون)
+        htf_days = 40  # is_htf_bullish_confirmation يستدعي days=40 ثابتًا
+        self._target_count: Dict[str, int] = {
+            '15m': (SIGNAL_GENERATION_LOOKBACK_DAYS * 24 + 200) * 4,
+            '1h': (htf_days * 24 + 200),
+            '4h': 200,
+        }
+        self._backfill_lookback: Dict[str, str] = {
+            '15m': f"{SIGNAL_GENERATION_LOOKBACK_DAYS * 24 + 200} hour",
+            '1h': f"{htf_days * 24 + 200} hour",
+            '4h': '800 hour',
+        }
+        self._maxlen: Dict[str, int] = {'15m': STREAM_HUB_BUFFER_15M, '1h': STREAM_HUB_BUFFER_1H}
+
+    # ---------------- الاشتراكات ----------------
+    def _pinned_streams(self) -> Set[Tuple[str, str]]:
+        # الرموز المثبتة لا تُلغى اشتراكاتها أبدًا: BTC + القادة + الصفقات المفتوحة
+        pins: Set[Tuple[str, str]] = set()
+        for s in self._pinned:
+            pins.add((s, '15m')); pins.add((s, '1h'))
+        pins.add((BTC_SYMBOL, '4h'))  # بوصلة BTC تحتاج فريم 4h
+        try:
+            with signal_cache_lock:
+                for s in list(open_signals_cache.keys()):
+                    su = str(s).upper()
+                    pins.add((su, '15m')); pins.add((su, '1h'))
+        except Exception:
+            pass
+        return pins
+
+    def set_universe(self, symbols: List[str]) -> None:
+        """تحديث قائمة الاشتراك المطلوبة مع إرسال الفرق فقط (SUBSCRIBE/UNSUBSCRIBE)."""
+        desired = set(self._pinned_streams())
+        for s in symbols or []:
+            su = str(s).upper()
+            desired.add((su, '15m')); desired.add((su, '1h'))
+        with self._lock:
+            new_keys = desired - self._desired
+            gone_keys = self._desired - desired
+            self._desired = desired
+            for k in new_keys:
+                st = self._backfill_state.get(k)
+                if st is None or st.get('status') == 'done' and not self._closed.get(k):
+                    self._backfill_state[k] = {'status': 'pending', 'attempts': 0, 'next_try': 0.0}
+            self._subscribe_id += 1
+            sid = self._subscribe_id
+            ws = self._ws
+            connected = self._connected
+            to_sub = sorted(new_keys)
+            to_unsub = sorted(k for k in gone_keys if k in self._subscribed)
+            self._subscribed |= set(to_sub)
+            self._subscribed -= set(to_unsub)
+        if connected and ws is not None and (to_sub or to_unsub):
+            try:
+                if to_sub:
+                    ws.send(json.dumps({'method': 'SUBSCRIBE', 'params': [f"{s.lower()}@kline_{iv}" for s, iv in to_sub], 'id': sid}))
+                if to_unsub:
+                    ws.send(json.dumps({'method': 'UNSUBSCRIBE', 'params': [f"{s.lower()}@kline_{iv}" for s, iv in to_unsub], 'id': sid}))
+                logger.info(f"🛰️ [مركز البيانات] تحديث الاشتراكات: +{len(to_sub)} / -{len(to_unsub)}")
+            except Exception as e:
+                logger.warning(f"🛰️ [مركز البيانات] فشل إرسال تحديث الاشتراك: {e}")
+
+    def _current_universe(self) -> List[str]:
+        try:
+            with universe_lock:
+                return list(validated_symbols_to_scan)
+        except Exception:
+            return []
+
+    def subscribed_count(self) -> int:
+        with self._lock:
+            return len(self._subscribed)
+
+    def is_connected(self) -> bool:
+        with self._lock:
+            return self._connected
+
+    # ---------------- حلقة الاتصال ----------------
+    def start(self) -> None:
+        Thread(self._run_loop, daemon=True).start()
+        Thread(self._backfill_loop, daemon=True).start()
+        Thread(self._maintain_loop, daemon=True).start()
+        logger.info("🛰️ [مركز البيانات] انطلق — WebSocket لقنوات الشموع الحية (يعمل حتى أثناء حظر REST)")
+
+    def _run_loop(self) -> None:
+        backoff = 5.0
+        while not self._stop:
+            try:
+                self._connect_once()
+                backoff = 5.0
+            except Exception as e:
+                logger.warning(f"🛰️ [مركز البيانات] انقطع الاتصال: {str(e)[:120]} — إعادة المحاولة بعد {int(backoff)}ث")
+            with self._lock:
+                self._connected = False
+                self._reconnects += 1
+            time.sleep(backoff)
+            backoff = min(60.0, backoff * 1.5)
+
+    def _connect_once(self) -> None:
+        with self._lock:
+            desired = sorted(self._desired)
+        streams_q = '/'.join(f"{s.lower()}@kline_{iv}" for s, iv in desired)
+        url = STREAM_HUB_BASE_URL + (f"?streams={streams_q}" if streams_q else '')
+        logger.info(f"🛰️ [مركز البيانات] الاتصال بـ Binance WebSocket — {len(desired)} تدفق شموع...")
+        ws = websocket.WebSocketApp(
+            url,
+            on_open=self._on_open, on_message=self._on_message,
+            on_error=self._on_error, on_close=self._on_close,
+        )
+        with self._lock:
+            self._ws = ws
+        ws.run_forever(ping_interval=180, ping_timeout=20)
+
+    def _on_open(self, ws) -> None:
+        with self._lock:
+            self._connected = True
+            desired = sorted(self._desired)
+            self._subscribe_id += 1
+            sid = self._subscribe_id
+        try:
+            if desired:
+                ws.send(json.dumps({'method': 'SUBSCRIBE', 'params': [f"{s.lower()}@kline_{iv}" for s, iv in desired], 'id': sid}))
+            with self._lock:
+                self._subscribed = set(desired)
+            logger.info(f"🛰️ [مركز البيانات] WebSocket متصل — {len(desired)} تدفق شموع حية (بلا أوزان REST)")
+        except Exception as e:
+            logger.warning(f"🛰️ [مركز البيانات] فشل الاشتراك الأولي: {e}")
+
+    def _on_message(self, ws, message) -> None:
+        try:
+            payload = json.loads(message)
+            d = payload.get('data') or {}
+            k = d.get('k')
+            if not k:
+                return
+            key = (str(d.get('s', '')).upper(), str(k.get('i', '')).lower())
+            tup = (int(k['t']), float(k['o']), float(k['h']), float(k['l']), float(k['c']),
+                   float(k['v']), float(k['q']), float(k['V']))
+            with self._lock:
+                self._last_msg_ts = time.time()
+                if key in self._subscribed:
+                    self._forming[key] = tup
+                    if k.get('x'):
+                        buf = self._closed.setdefault(key, {})
+                        buf[tup[0]] = tup
+                        mx = self._maxlen.get(key[1], STREAM_HUB_BUFFER_DEFAULT)
+                        if len(buf) > mx:
+                            for ot in sorted(buf)[:len(buf) - mx]:
+                                buf.pop(ot, None)
+        except Exception:
+            pass  # رسالة تالفة/غير متوقعة — لا تسمح لها بقتل الخيط
+
+    def _on_error(self, ws, error) -> None:
+        logger.debug(f"🛰️ [مركز البيانات] خطأ WebSocket: {str(error)[:120]}")
+
+    def _on_close(self, ws, code, reason) -> None:
+        logger.info(f"🛰️ [مركز البيانات] أُغلق الاتصال (code={code}) — سيعاد الاتصال تلقائيًا")
+
+    # ---------------- التعبئة العميقة (Backfill) ----------------
+    def _scan_backfill_needs(self) -> None:
+        now = time.time()
+        with self._lock:
+            for key in list(self._desired):
+                st = self._backfill_state.setdefault(key, {'status': 'pending', 'attempts': 0, 'next_try': 0.0})
+                if st.get('status') == 'done' and self._closed.get(key):
+                    iv_min = _INTERVAL_MINUTES.get(key[1], 15)
+                    # فحص الفجوة: مخزون كان مكتملًا وتوقّف تدفقه (انقطاع طويل) → إعادة تعبئة
+                    if now - (max(self._closed[key]) / 1000.0) > 3 * iv_min * 60:
+                        st['status'] = 'pending'; st['next_try'] = 0.0
+                elif st.get('status') == 'failed' and now >= st.get('next_try', 0.0):
+                    st['status'] = 'pending'
+
+    def _backfill_loop(self) -> None:
+        while not self._stop:
+            key = None
+            with self._lock:
+                now = time.time()
+                for k, st in self._backfill_state.items():
+                    if st.get('status') != 'pending' or now < st.get('next_try', 0.0):
+                        continue
+                    # اكتمل المخزون عبر WebSocket أصلًا؟ علّمه منجزًا دون REST
+                    have = len(self._closed.get(k) or {}) + (1 if self._forming.get(k) else 0)
+                    if have >= self._target_count.get(k[1], 10**9):
+                        st['status'] = 'done'; continue
+                    st['status'] = 'running'; key = k; break
+            if key is None:
+                time.sleep(max(1.0, STREAM_HUB_BACKFILL_DELAY_SEC)); continue
+            try:
+                self._do_backfill(key)
+                with self._lock:
+                    st = self._backfill_state.get(key)
+                    if st is not None:
+                        st['status'] = 'done'
+                        st['attempts'] = st.get('attempts', 0) + 1
+                with self._lock:
+                    cnt = len(self._closed.get(key) or {})
+                logger.info(f"🛰️ [مركز البيانات] اكتملت تعبئة {key[0]} {key[1]} ({cnt} شمعة مكتملة)")
+            except Exception as e:
+                with self._lock:
+                    st = self._backfill_state.get(key)
+                    if st is not None:
+                        st['attempts'] = st.get('attempts', 0) + 1
+                        if st['attempts'] >= 5:
+                            st['status'] = 'failed'; st['next_try'] = time.time() + 600
+                        else:
+                            st['status'] = 'pending'; st['next_try'] = time.time() + 60 * st['attempts']
+                logger.warning(f"🛰️ [مركز البيانات] فشلت تعبئة {key[0]} {key[1]}: {str(e)[:120]}")
+            time.sleep(max(0.5, STREAM_HUB_BACKFILL_DELAY_SEC))
+
+    def _do_backfill(self, key: Tuple[str, str]) -> None:
+        sym, iv = key
+        lookback = self._backfill_lookback.get(iv)
+        if not lookback:
+            raise ValueError(f"لا lookback معرّف للفريم {iv}")
+        # safe_get_klines يمر عبر الحارس (يحترم الحظر والميزانية) — نفس مسار المسح القديم
+        klines = safe_get_klines(sym, iv, lookback)
+        if not klines:
+            raise RuntimeError('REST أعاد بيانات فارغة')
+        merged: Dict[int, tuple] = {}
+        for k in klines:
+            try:
+                tup = (int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]),
+                       float(k[5]), float(k[7]), float(k[9]))
+                merged[tup[0]] = tup
+            except Exception:
+                continue
+        if not merged:
+            raise RuntimeError('REST أعاد صفوفًا غير قابلة للتحليل')
+        with self._lock:
+            buf = self._closed.setdefault(key, {})
+            buf.update(merged)
+            mx = self._maxlen.get(iv, STREAM_HUB_BUFFER_DEFAULT)
+            if len(buf) > mx:
+                for ot in sorted(buf)[:len(buf) - mx]:
+                    buf.pop(ot, None)
+
+    def _maintain_loop(self) -> None:
+        # صيانة دورية: مزامنة الاشتراكات مع (القائمة الديناميكية + المثبتة) وفحص فجوات التعبئة
+        while not self._stop:
+            try:
+                self.set_universe(self._current_universe())
+            except Exception:
+                pass
+            try:
+                self._scan_backfill_needs()
+            except Exception:
+                pass
+            time.sleep(max(20, STREAM_HUB_MAINTAIN_SEC))
+
+    # ---------------- واجهات القراءة (بلا شبكة) ----------------
+    def _snapshot_rows(self, key: Tuple[str, str]) -> Optional[List[tuple]]:
+        now = time.time()
+        with self._lock:
+            if self._last_msg_ts <= 0 or (now - self._last_msg_ts) > STREAM_HUB_STALE_SEC:
+                return None  # بيانات جامدة/لا رسائل — دع REST يتكفل
+            buf = self._closed.get(key)
+            forming = self._forming.get(key)
+            rows = sorted(buf.values()) if buf else []
+        if forming and (not rows or forming[0] > rows[-1][0]):
+            rows = rows + [forming]  # الشمعة الجارية آخر صف — مطابق لسلوك REST تمامًا
+        return rows or None
+
+    def build_dataframe(self, symbol: str, interval: str, days: int) -> Optional[pd.DataFrame]:
+        """يبني DataFrame مطابقًا بايتًا لمسار fetch_historical_data REST عند اكتمال المخزون، وإلا None."""
+        iv = str(interval).lower()
+        key = (str(symbol).upper(), iv)
+        iv_min = _INTERVAL_MINUTES.get(iv)
+        target = self._target_count.get(iv)
+        if iv_min is None or target is None:
+            return None
+        needed = max(target, ((int(days) * 24 + 200) * 60) // iv_min)
+        rows = self._snapshot_rows(key)
+        if not rows or len(rows) < needed:
+            return None
+        df = pd.DataFrame(rows, columns=self._KLINE_COLUMNS)
+        df = df.astype({'open': 'float', 'high': 'float', 'low': 'float', 'close': 'float',
+                        'volume': 'float', 'quote_volume': 'float', 'taker_buy_base': 'float'})
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
+        df.set_index('timestamp', inplace=True)
+        self._served_frames += 1
+        return df.dropna()
+
+    def get_closes(self, symbol: str, interval: str, n: int) -> Optional[List[float]]:
+        """آخر n سعر إغلاق (شامل الشمعة الجارية كما يفعل REST) — None إن لم تكتمل الكمية."""
+        rows = self._snapshot_rows((str(symbol).upper(), str(interval).lower()))
+        if not rows or len(rows) < int(n):
+            return None
+        return [r[4] for r in rows[-int(n):]]
+
+    def get_prices(self, symbols: List[str]) -> Dict[str, float]:
+        """أسعار حية من الشمعة الجارية (تحديث كل ~2ث بلا أي وزن REST)."""
+        out: Dict[str, float] = {}
+        now = time.time()
+        with self._lock:
+            if self._last_msg_ts <= 0 or (now - self._last_msg_ts) > STREAM_HUB_STALE_SEC:
+                return out
+            for s in symbols or []:
+                su = str(s).upper()
+                f = self._forming.get((su, '15m'))
+                if f:
+                    out[s] = f[4]
+                    continue
+                buf = self._closed.get((su, '15m'))
+                if buf:
+                    out[s] = buf[max(buf)][4]
+        return out
+
+    def mark_served(self, symbol: str, interval: str) -> None:
+        pass  # العدّاد يُحدَّث في build_dataframe مباشرة
+
+    def note_rest_fallback(self) -> None:
+        self._rest_fallbacks = getattr(self, '_rest_fallbacks', 0) + 1
+
+    def snapshot(self) -> Dict[str, Any]:
+        now = time.time()
+        with self._lock:
+            warm = 0; total = 0; prices_fresh = 0
+            for key in self._desired:
+                total += 1
+                buf = self._closed.get(key) or {}
+                forming = self._forming.get(key)
+                have = len(buf) + (1 if forming else 0)
+                if have >= self._target_count.get(key[1], 10**9):
+                    warm += 1
+            for key in list(self._forming.keys()):
+                prices_fresh += 1
+            pending = sum(1 for st in self._backfill_state.values() if st.get('status') == 'pending')
+            failed = sum(1 for st in self._backfill_state.values() if st.get('status') == 'failed')
+            return {'enabled': True, 'connected': self._connected,
+                    'subscribed': len(self._subscribed), 'desired': len(self._desired),
+                    'buffers_warm': warm, 'buffers_total': total,
+                    'last_msg_age_sec': round(now - self._last_msg_ts, 1) if self._last_msg_ts else None,
+                    'reconnects': self._reconnects, 'served_frames': self._served_frames,
+                    'rest_fallbacks': getattr(self, '_rest_fallbacks', 0),
+                    'backfill_pending': pending, 'backfill_failed': failed,
+                    'prices_fresh': prices_fresh}
+
+# --- [V9.16.0] التمثيل الواحد للمركز — يُعطَّل كليًا بـ USE_STREAM_HUB=False أو غياب websocket-client
+stream_hub: Optional[MarketStreamHub] = None
+if USE_STREAM_HUB:
+    if _WEBSOCKET_AVAILABLE:
+        try:
+            stream_hub = MarketStreamHub()
+            logger.info("🛰️ [مركز البيانات] MarketStreamHub جاهز (WebSocket — يعمل حتى أثناء حظر REST)")
+        except Exception as hub_init_err:
+            logger.warning(f"🛰️ [مركز البيانات] فشل التهيئة — سن عمل بـ REST فقط: {hub_init_err}")
+            stream_hub = None
+    else:
+        logger.warning("🛰️ [مركز البيانات] مكتبة websocket-client غير مثبتة — سن عمل بـ REST فقط (ثبّتها: pip install websocket-client)")
 
 # --- قاموس أسباب الرفض باللغة العربية ---
 REJECTION_REASONS_AR = {
@@ -1186,6 +1598,10 @@ def refresh_universe_if_needed(force: bool = False) -> None:
                 universe_last_refresh = time.time()
                 universe_source = 'dynamic'
                 universe_meta = meta
+            # [V9.16.0] مزامنة اشتراكات WebSocket مع القائمة الجديدة
+            if stream_hub is not None:
+                try: stream_hub.set_universe(picked)
+                except Exception: pass
             return
         reason = meta.get('reason', 'غير معروف')
     except Exception as e:
@@ -1200,11 +1616,28 @@ def refresh_universe_if_needed(force: bool = False) -> None:
                 universe_source = 'static_fallback'
             universe_last_refresh = time.time()
             universe_meta = {'reason': f'fallback: {reason}'}
+    # [V9.16.0] مزامنة اشتراكات WebSocket حتى في وضع البديل الثابت
+    if stream_hub is not None:
+        try:
+            with universe_lock:
+                stream_hub.set_universe(list(validated_symbols_to_scan))
+        except Exception:
+            pass
 
 
 # --- دوال جلب البيانات وحساب المؤشرات ---
 def fetch_historical_data(symbol: str, interval: str, days: int) -> Optional[pd.DataFrame]:
     if not client: return None
+    # [V9.16.0] المحاولة الأولى: مركز بيانات WebSocket — صفر وزن REST عند اكتمال المخزون.
+    # أي نقص/تعطل = None → مسار REST القديم يعمل كما هو (تدهور رشيق دائمًا).
+    if stream_hub is not None:
+        try:
+            df_hub = stream_hub.build_dataframe(symbol, interval, days)
+            if df_hub is not None:
+                return df_hub
+            stream_hub.note_rest_fallback()
+        except Exception as _hub_err:
+            logger.debug(f"[مركز البيانات] تجاوز إلى REST لـ {symbol} {interval}: {_hub_err}")
     try:
         lookback_str = f"{days + 50} day" if 'd' in interval.lower() else f"{days * 24 + 200} hour"
         
@@ -2354,7 +2787,7 @@ def get_dashboard_html():
 <html lang="ar" dir="rtl">
 <head>
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CryptoBot V9.15.1 // NEON TERMINAL</title>
+    <title>CryptoBot V9.16.0 // NEON TERMINAL</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
         // [تحسين V9.9] ألوان الثيم الهاكر: أخضر مصفوفة + سماوي سيبراني على أسود
@@ -2435,7 +2868,7 @@ def get_dashboard_html():
         <header class="mb-6 flex flex-wrap justify-between items-center gap-4">
             <div>
                 <div dir="ltr" class="font-mono text-xs md:text-sm text-text-secondary mb-1">&gt;&gt; root@crypto-bot:~$ ./trading_engine --live --region=eu-frankfurt<span class="cursor"></span></div>
-                <h1 class="text-2xl md:text-3xl font-extrabold flicker"><span class="text-accent-green neon-text">لوحة تحكم</span> <span class="font-mono text-text-secondary text-lg md:text-xl" dir="ltr">V9.15.1//NEON</span></h1>
+                <h1 class="text-2xl md:text-3xl font-extrabold flicker"><span class="text-accent-green neon-text">لوحة تحكم</span> <span class="font-mono text-text-secondary text-lg md:text-xl" dir="ltr">V9.16.0//NEON</span></h1>
             </div>
             <div id="trend-lights-container" class="flex items-center gap-x-6 bg-black/40 px-4 py-2 rounded-lg border border-border-color"></div>
         </header>
@@ -2507,6 +2940,7 @@ def get_dashboard_html():
                 <div class="flex items-center gap-2"><span class="text-text-secondary">PnL اليوم:</span><span id="sys-pnl" class="font-mono">--</span></div>
                 <div class="flex items-center gap-2"><span class="text-text-secondary">قاطع الحماية:</span><span id="sys-lossguard" class="font-mono">--</span></div>
                 <div class="flex items-center gap-2"><span class="text-text-secondary">التخزين:</span><span id="sys-storage" class="font-mono text-accent-blue">--</span></div>
+                <div class="flex items-center gap-2"><span class="text-text-secondary">البيانات الحية:</span><span id="sys-ws" class="font-mono">--</span></div>
                 <div class="flex items-center gap-2"><span class="text-text-secondary">العملات:</span><span id="sys-symbols" class="font-mono">--</span></div>
                 <div class="flex items-center gap-2"><span class="text-text-secondary">مدة التشغيل:</span><span id="sys-uptime" class="font-mono" dir="ltr">--</span></div>
             </div>
@@ -2883,6 +3317,12 @@ function updateSystemStatus() {
         st.textContent = data.redis_mode === 'redis' ? 'Redis' : (data.redis_mode === 'memory' ? 'ذاكرة داخلية' : 'غير متصل');
         document.getElementById('sys-symbols').textContent = data.symbols_count + (data.universe_mode === 'dynamic' ? ' ⚡ديناميكية' : ' 📋ثابتة');
         document.getElementById('sys-uptime').textContent = fmtUptime(data.uptime_sec);
+        // [V9.16.0] حالة مركز بيانات WebSocket
+        const wsEl = document.getElementById('sys-ws');
+        const sh = data.stream_hub || {};
+        if (sh.enabled && sh.connected) { wsEl.textContent = `🛰️ WS مباشر (${sh.subscribed ?? 0} تدفق / ${sh.buffers_warm ?? 0} مخزون دافئ)`; wsEl.className = 'font-mono text-accent-green'; }
+        else if (sh.enabled) { wsEl.textContent = 'إعادة اتصال... (REST احتياطيًا)'; wsEl.className = 'font-mono text-accent-yellow'; }
+        else { wsEl.textContent = 'REST'; wsEl.className = 'font-mono text-text-secondary'; }
     });
 }
 
@@ -3012,7 +3452,7 @@ def home(): return render_template_string(get_dashboard_html())
 @app.route('/health')
 def health_check():
     """[تحسين V9.8] نقطة فحص صحة خفيفة لمراقبة الخدمة على Render وأدوات Uptime."""
-    return jsonify({"status": "ok", "version": "V9.15.1", "time": datetime.now(timezone.utc).isoformat()})
+    return jsonify({"status": "ok", "version": APP_VERSION, "time": datetime.now(timezone.utc).isoformat()})
 
 # --- [تحسين V9.9] نقطة حالة النظام: وزن الطلبات، الحظر، قاطع الحماية، التخزين ---
 @app.route('/api/system_status')
@@ -3031,9 +3471,11 @@ def api_system_status():
         except Exception:
             pass
         return jsonify({
-            'version': 'V9.15.1',
+            'version': APP_VERSION,
             'client_ready': bool(client),
             'rate_guard': snap,
+            # [V9.16.0] حالة مركز بيانات WebSocket للوحة التحكم
+            'stream_hub': stream_hub.snapshot() if stream_hub is not None else {'enabled': False},
             'daily_pnl_usdt': pnl,
             'daily_max_loss_usdt': DAILY_MAX_LOSS_USDT,
             'daily_loss_limit_hit': daily_hit,
@@ -3781,8 +4223,16 @@ def price_update_loop():
             if ban_remain > 0:
                 time.sleep(min(ban_remain, 10.0)); continue
             if validated_symbols_to_scan and client:
-                tickers = safe_get_symbol_ticker()
-                prices_to_set = {t['symbol']: t['price'] for t in tickers if t['symbol'] in validated_symbols_to_scan}
+                # [V9.16.0] الأسعار من مركز WebSocket أولًا (تحديث ~2ث بلا وزن — وتعمل أثناء الحظر)
+                prices_to_set = {}
+                if stream_hub is not None:
+                    prices_to_set = stream_hub.get_prices(validated_symbols_to_scan)
+                missing = [s for s in validated_symbols_to_scan if s not in prices_to_set]
+                if missing and (rate_guard.banned_until - time.time()) <= 0:
+                    tickers = safe_get_symbol_ticker()
+                    for t in tickers:
+                        if t['symbol'] in missing:
+                            prices_to_set[t['symbol']] = t['price']
                 if prices_to_set: redis_client.hset(REDIS_PRICES_HASH_NAME, mapping=prices_to_set)
             time.sleep(max(2, PRICE_UPDATE_INTERVAL_SEC))
         except Exception as e: logger.error(f"خطأ في حلقة تحديث الأسعار: {e}"); time.sleep(10)
@@ -3790,6 +4240,13 @@ def price_update_loop():
 def initialize_bot_services():
     global client, validated_symbols_to_scan
     logger.info("🤖 [خدمات البوت] بدء التهيئة...")
+    # [V9.16.0] مركز WebSocket يبدأ قبل كل شيء: يتصل ويجمع الشموع الحية حتى أثناء
+    # حظر REST أو بيانات قاعدة باردة — التهيئة REST تكمل بالتوازي دون انتظار
+    if stream_hub is not None:
+        try:
+            stream_hub.start()
+        except Exception as hub_start_err:
+            logger.warning(f"🛰️ [مركز البيانات] تعذر الإطلاق — REST فقط: {hub_start_err}")
     try:
         init_db()
         init_redis()
@@ -3851,7 +4308,13 @@ def initialize_bot_services():
     Thread(target=btc_trend_loop, daemon=True).start()        # [تحسين V9.11] بوصلة اتجاه BTC
     Thread(target=leader_data_loop, daemon=True).start()      # [تحسين V9.13.0] بيانات قادة خريطة القيادة
     logger.info("✅ [خدمات البوت] تم بدء جميع الخدمات الخلفية بنجاح.")
-    send_telegram_message("✅ *البوت قيد التشغيل الآن (نسخة V9.15.1 - Neon Security)*")
+    hub_line = ''
+    if stream_hub is not None:
+        try:
+            hub_line = f"\n🛰️ مركز البيانات: WebSocket ({stream_hub.subscribed_count()} تدفق)" if stream_hub.is_connected() else "\n🛰️ مركز البيانات: جارٍ الاتصال..."
+        except Exception:
+            hub_line = "\n🛰️ مركز البيانات: مفعّل"
+    send_telegram_message("✅ *البوت قيد التشغيل الآن (نسخة " + APP_VERSION + " - Neon Security)*" + hub_line)
 
 # ---------------------- نقطة الدخول ----------------------
 if __name__ == "__main__":
@@ -3862,7 +4325,7 @@ if __name__ == "__main__":
         sys.setswitchinterval(0.002)
     except Exception:
         pass
-    logger.info("🚀 إطلاق بوت التداول ولوحة التحكم (V9.15.1 - Neon Security) 🚀")
+    logger.info(f"🚀 إطلاق بوت التداول ولوحة التحكم ({APP_VERSION} - Neon Security) 🚀")
     Thread(target=initialize_bot_services, daemon=True).start()
     port = int(os.environ.get('PORT', 10000))
     host = "0.0.0.0"
