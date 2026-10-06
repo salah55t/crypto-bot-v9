@@ -49,8 +49,8 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-APP_VERSION: str = 'V9.16.0'  # [V9.16.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
-logger = logging.getLogger('CryptoBotV9.16.0')
+APP_VERSION: str = 'V9.17.0'  # [V9.17.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
+logger = logging.getLogger(f'CryptoBot{APP_VERSION}')
 
 # زمن إقلاع العملية لحساب مدة التشغيل في لوحة التحكم
 BOOT_TIME = time.time()
@@ -153,23 +153,64 @@ HTF_CONFIRMATION_CACHE_TTL: int = config('HTF_CONFIRMATION_CACHE_TTL', default=9
 # require_above_ema50: معيار Connors البنيوي لصفقات شراء التراجعات. None = بلا حد.
 STRATEGY_FILTER_PROFILES: Dict[str, Dict[str, Optional[float]]] = {
     # التقاطعات الاتجاهية — Wilder: بلا تداول تقاطعات في غياب الاتجاه (ADX≥20)
-    'MACD_EMA_Crossover':         {'min_adx': 20.0, 'max_adx': None, 'min_atr_pct': 0.30, 'max_atr_pct': 5.0, 'min_roc': None, 'require_above_ema50': False},
-    'EMA_RSI_Cross':              {'min_adx': 20.0, 'max_adx': None, 'min_atr_pct': 0.30, 'max_atr_pct': 5.0, 'min_roc': None, 'require_above_ema50': False},
+    'MACD_EMA_Crossover':         {'min_adx': 20.0, 'max_adx': None, 'min_atr_pct': 0.30, 'max_atr_pct': 5.0, 'min_roc': None},
+    'EMA_RSI_Cross':              {'min_adx': 20.0, 'max_adx': None, 'min_atr_pct': 0.30, 'max_atr_pct': 5.0, 'min_roc': None},
     # Pullback — Raschke: الارتداد يُشترى في اتجاه مثبت فقط (ADX≥25)
-    'Pullback_MACD':              {'min_adx': 25.0, 'max_adx': None, 'min_atr_pct': 0.30, 'max_atr_pct': 5.0, 'min_roc': None, 'require_above_ema50': False},
-    # الزخم — قمم/قيعان صاعدة تحتاج اتجاهًا قويًا + تقلبًا حيًا + دفعة فعلية (ROC≥1%)
-    'Bullish_Momentum':           {'min_adx': 25.0, 'max_adx': None, 'min_atr_pct': 0.50, 'max_atr_pct': 6.0, 'min_roc': 1.0, 'require_above_ema50': False},
-    # الارتدادية — Connors: شراء التراجعات فوق EMA50 فقط، وبلا سقف ADX:
-    # شراء الغرقى في اتجاه صاعد قوي أفضل صفقات الانعكاس على الإطلاق (وليست ممنوعة)
-    'BB_Stoch_Reversal_Enhanced': {'min_adx': None, 'max_adx': None, 'min_atr_pct': 0.25, 'max_atr_pct': 4.0, 'min_roc': None, 'require_above_ema50': True},
+    'Pullback_MACD':              {'min_adx': 25.0, 'max_adx': None, 'min_atr_pct': 0.30, 'max_atr_pct': 5.0, 'min_roc': None},
+    # الزخم — [V9.17.0] ROC≥0.6%: مطابقة الأزواج تختار قادة الزخم أصلًا،
+    # فتكفي الأرضية بإيقاع أقل صرامة من 1% التي رفضت 155 محاولة حية
+    'Bullish_Momentum':           {'min_adx': 25.0, 'max_adx': None, 'min_atr_pct': 0.50, 'max_atr_pct': 6.0, 'min_roc': 0.6},
+    # الارتدادية — Connors المرن [V9.17.0]: شراء التراجعات قرب EMA50 أو فوقها (ضمن سماحية
+    # ATR واحدة). الصرامة المطلقة القديمة (close>EMA50) رفضت 431 محاولة (67%) بلا نجاح واحد،
+    # مع أن شراء الغرقى المقصود في الاستراتيجية يقع شرعًا تحت المتوسط بهامش ضئيل
+    'BB_Stoch_Reversal_Enhanced': {'min_adx': None, 'max_adx': None, 'min_atr_pct': 0.25, 'max_atr_pct': 4.0, 'min_roc': None, 'ema50_tol_atr': 1.0},
     # الاختراقية — Carter: الانضغاط هو الفلتر ذاته، بلا قيود نظامية ADX إطلاقًا
     # (سقف ADX كان يمنع نمط الاستمرار الاحترافي في الاتجاهات القوية — 72 رفضًا حيًا)
-    'BB_Squeeze_Breakout':        {'min_adx': None, 'max_adx': None, 'min_atr_pct': None, 'max_atr_pct': 5.0, 'min_roc': None, 'require_above_ema50': False},
-    'SR_Breakout_Enhanced':       {'min_adx': None, 'max_adx': None, 'min_atr_pct': None, 'max_atr_pct': 5.0, 'min_roc': None, 'require_above_ema50': False},
+    'BB_Squeeze_Breakout':        {'min_adx': None, 'max_adx': None, 'min_atr_pct': None, 'max_atr_pct': 5.0, 'min_roc': None},
+    'SR_Breakout_Enhanced':       {'min_adx': None, 'max_adx': None, 'min_atr_pct': None, 'max_atr_pct': 5.0, 'min_roc': None},
 }
 # احتياط لأي استراتيجية مستقبلية غير مدرجة: بوابة عقلانية واسعة فقط
 DEFAULT_STRATEGY_FILTER_PROFILE: Dict[str, Optional[float]] = {
-    'min_adx': None, 'max_adx': None, 'min_atr_pct': 0.20, 'max_atr_pct': 7.0, 'min_roc': None, 'require_above_ema50': False}
+    'min_adx': None, 'max_adx': None, 'min_atr_pct': 0.20, 'max_atr_pct': 7.0, 'min_roc': None}
+
+# --- [V9.17.0] محرك مطابقة الأزواج بالاستراتيجيات (Strategy-Pair Matching Engine) ---
+# المشكلة الحية من اللوحة: 4438 فحص → 16 نجاح → 0 صفقة، و98% من الرفضات سببها فحص
+# كل استراتيجية على كل عملات القائمة (المختارة بالسيولة/التذبذب) بلا أي مطابقة نمط:
+# ارتدادية على عملة اتجاهية، تقاطعات على عملة نطاق، انضغاط على عملة منفلت.
+# الحل: تصنيف نمط كل زوج من شموع 15م المجلوبة أصلًا داخل حلقة المسح (صفر وزن شبكي
+# إضافي) ثم تُفحص كل استراتيجية فقط على الأزواج التي يطابق نمطها السوقي شخصيتها —
+# ترشيح مخصص لكل استراتيجية على حدة بدل العشوائي والسيولة.
+PAIR_MATCHING_ENABLED: bool = os.environ.get('PAIR_MATCHING_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+PAIR_MATCH_MIN_SCORE: float = float(os.environ.get('PAIR_MATCH_MIN_SCORE', '45'))
+PAIR_POOL_DISPLAY_SIZE: int = int(os.environ.get('PAIR_POOL_DISPLAY_SIZE', '8'))
+
+REGIME_AR: Dict[str, str] = {
+    'trend_up': 'اتجاه صاعد', 'trend_down': 'اتجاه هابط', 'range': 'نطاق مترنم',
+    'squeeze': 'انضغاط سعري', 'transitional': 'انتقالي'}
+
+# ملف المطابقة لكل استراتيجية: أي ريماً تريد + نطاقات ADX/ATR% + بنونيهات البنية.
+# adx = (حد_أدنى, مثالي, سقف): سلم صعود 0→25 للتوجهية، أو سقف يتحلل فوقه ×2/وحدة للنطاقية
+STRATEGY_PAIR_PROFILES: Dict[str, Dict[str, Any]] = {
+    # التقاطعات الاتجاهية: اتجاه صاعد قائم بهيكل EMA سليم
+    'MACD_EMA_Crossover':         {'regimes': ('trend_up',),        'adx': (18.0, 28.0, None), 'atr_pct': (0.30, 5.0), 'struct_up_bonus': True, 'pos_roc_bonus': True},
+    'EMA_RSI_Cross':              {'regimes': ('trend_up',),        'adx': (18.0, 28.0, None), 'atr_pct': (0.30, 5.0), 'struct_up_bonus': True, 'pos_roc_bonus': True},
+    # Pullback — Raschke: اتجاه مثبت بأعمق من التقاطعات
+    'Pullback_MACD':              {'regimes': ('trend_up',),        'adx': (22.0, 32.0, None), 'atr_pct': (0.30, 5.0), 'struct_up_bonus': True, 'pos_roc_bonus': True},
+    # الزخم: قادة الحركة الصاعدة — زخم سالب نقض قاسٍ (لا سكين ساقطة)
+    'Bullish_Momentum':           {'regimes': ('trend_up',),        'adx': (20.0, 30.0, None), 'atr_pct': (0.40, 6.0), 'struct_up_bonus': True, 'pos_roc_bonus': True, 'require_pos_roc': True},
+    # الارتدادية — Connors: النطاق المترنم جوهرها، وتراجعات الاتجاه الصاعد ائتمان ثانوي
+    # (أفضل انعكاسات هي شراء الغرقى في صاعد — لكن الهابط نقض قاسٍ: لا غرقى في الغرق)
+    'BB_Stoch_Reversal_Enhanced': {'regimes': ('range',), 'secondary_regimes': ('trend_up',), 'adx': (None, None, 32.0), 'atr_pct': (0.25, 4.0), 'range_bonus': True, 'near_ema50': True},
+    # الاختراقية — Carter: الانضغاط جوهرها، والنطاق/الاتجاه الصاعد ائتمان ثانوي
+    # (نمط استمرار الاختراق في الاتجاه القوي كان يُخنق قديمًا — 72 رفضًا حيًا)
+    'BB_Squeeze_Breakout':        {'regimes': ('squeeze',), 'secondary_regimes': ('range', 'trend_up'), 'adx': (None, None, 35.0), 'atr_pct': (None, 5.0), 'low_bbwp_bonus': True},
+    'SR_Breakout_Enhanced':       {'regimes': ('range', 'squeeze'), 'secondary_regimes': ('trend_up',), 'adx': (None, None, 34.0), 'atr_pct': (None, 5.0), 'low_bbwp_bonus': True},
+}
+
+# ترشيحات آخر دورة مسح (للعرض في اللوحة عبر /api/strategy_pairs) + طابع زمني
+strategy_pair_pools: Dict[str, List[Dict[str, Any]]] = {}
+pair_pools_updated_at: Optional[str] = None
+pair_pools_lock = Lock()
 
 # --- [تحسين V9.9.1] إعدادات حماية الحظر من Binance (خطأ -1003) ---
 # حد Binance الرسمي 6000 وزن/دقيقة لكل IP — وعلى Render المجاني الـ IP مشترك مع خدمات أخرى،
@@ -1938,7 +1979,7 @@ def passes_market_sanity_filter(df: pd.DataFrame) -> bool:
         return False  # لا يمكن الحساب، نفترض أنه غير صالح
     atr_percent = (float(last['atr']) / float(last['close'])) * 100
     if atr_percent < 0.10 or atr_percent > 8.0:
-        log_rejection(df.name, "Market Sanity Filter Failed", {"atr_percent": f"{atr_percent:.2f}"})
+        log_rejection(getattr(df, 'name', 'UNKNOWN'), "Market Sanity Filter Failed", {"atr_percent": f"{atr_percent:.2f}"})
         return False
     return True
 
@@ -1960,7 +2001,7 @@ def passes_strategy_prefilters(df: pd.DataFrame, strategy_name: str) -> bool:
 
     def _fail(label: str, details: Dict[str, Any]) -> bool:
         _count_strategy_filter_reject(strategy_name, label)
-        log_rejection(df.name, "Strategy Prefilter Failed",
+        log_rejection(getattr(df, 'name', 'UNKNOWN'), "Strategy Prefilter Failed",
                       {'strategy': strategy_name, 'filter': label, **details})
         return False
 
@@ -1990,15 +2031,137 @@ def passes_strategy_prefilters(df: pd.DataFrame, strategy_name: str) -> bool:
         if roc_abs < min_roc:
             return _fail(f"زخم ROC أدنى من {min_roc:g}%", {roc_key: f"{roc_abs:.2f}"})
 
-    # 4) [V9.15.0] معيار Connors البنيوي لصفقات شراء التراجعات: السعر فوق EMA50
-    # (لا نشتري غرقى في عملة بنيوها هابط — أفضل انعكاسات هي تراجعات اتجاه صاعد)
-    if profile.get('require_above_ema50'):
-        if 'ema_50' in last and pd.notna(last['ema_50']) and last['close']:
-            if float(last['close']) <= float(last['ema_50']):
-                return _fail("السعر تحت EMA50 (معيار Connors)",
-                             {'close': f"{float(last['close']):.6g}", 'ema_50': f"{float(last['ema_50']):.6g}"})
+    # 4) [V9.17.0] معيار Connors المرن لصفقات شراء التراجعات: السعر قرب EMA50 أو فوقها
+    # (سماحية ATR واحدة تحت المتوسط) — الصرامة المطلقة رفضت 431 محاولة بلا نجاح واحد،
+    # لأن شراء الغرقى المقصود في الاستراتيجية يقع شرعًا تحت المتوسط بهامش ضئيل.
+    # الغرقى الحقيقي (أبعد من ATR واحد) يبقى مرفوضًا — بل يمنعه الآن نقض الريم أيضًا
+    tol_atr = profile.get('ema50_tol_atr')
+    if tol_atr is not None and 'ema_50' in last and 'atr' in last and pd.notna(last['ema_50']) and last['close'] and pd.notna(last['atr']) and float(last['atr']) > 0:
+        floor_price = float(last['ema_50']) - tol_atr * float(last['atr'])
+        if float(last['close']) < floor_price:
+            return _fail(f"السعر أبعد من EMA50 بأكثر من {tol_atr:g}×ATR (Connors المرن)",
+                         {'close': f"{float(last['close']):.6g}", 'ema_50': f"{float(last['ema_50']):.6g}", 'floor': f"{floor_price:.6g}"})
 
     return True
+
+
+# --- [V9.17.0] محرك مطابقة الأزواج: تصنيف النمط + درجة التوافق ---
+def compute_symbol_regime(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
+    """[V9.17.0] ملف النمط السوقي للزوج من شموع 15م المجلوبة أصلًا في حلقة المسح
+    (صفر وزن شبكي إضافي). يصنف الزوج إلى: اتجاه صاعد/هابط، نطاق مترنم، انضغاط
+    سعري، أو انتقالي — أساس ترشيح الأزواج لكل استراتيجية بدل العشوائي والسيولة.
+    المكونات: كفاءة كوفمان ER (اتجاهية الحركة)، انقلابات الجهة حول EMA50 (ترنم
+    النطاق)، مرتبة عرض بولنجر (انضغاط)، ADX، ATR%، ROC، وهيكل EMA21/EMA50.
+    يُرجع None عند تعذر الحساب — والبوابة تمرره بدل أن تخنق (درس V9.14)."""
+    try:
+        if df is None or len(df) < 100:
+            return None
+        last = df.iloc[-1]
+        for c in ('close', 'ema_50', 'atr', 'adx', 'bb_width'):
+            if c not in df.columns:
+                return None
+        adx = float(last['adx']) if pd.notna(last['adx']) else None
+        atr = float(last['atr']) if pd.notna(last['atr']) else None
+        close = float(last['close']) if pd.notna(last['close']) else None
+        if not adx or not atr or not close or atr <= 0 or close <= 0:
+            return None
+        atr_pct = (atr / close) * 100.0
+        # كفاءة كوفمان: صافي الحركة ÷ مجموع مقاطع الحركة (آخر 20 شمعة) — 0 فوضى، 1 سهم
+        w = closes_w = df['close'].astype(float).iloc[-21:]
+        net = abs(float(closes_w.iloc[-1]) - float(closes_w.iloc[0]))
+        gross = float(closes_w.diff().abs().sum())
+        er = (net / gross) if gross > 0 else 0.0
+        # انقلابات الجهة حول EMA50 على آخر 100 شمعة: كثرة الانقلاب = ترنم نطاق
+        side = np.sign(df['close'].astype(float) - df['ema_50'].astype(float)).iloc[-101:]
+        flips = int((side.diff().fillna(0) != 0).sum())
+        # مرتبة عرض بولنجر الحالي مقابل التاريخ الحديث مستبعدًا آخر 20 شمعة
+        # (الاستبعاد يمنع أن "يسابق" الهدوء الحالي نفسه فيصبح مئينه متوسطًا زورًا)
+        bbw_all = df['bb_width'].astype(float)
+        cur_bbw = float(bbw_all.iloc[-1]) if pd.notna(bbw_all.iloc[-1]) else None
+        bbw_hist = bbw_all.iloc[-220:-20]
+        bbwp = float((bbw_hist <= cur_bbw).mean()) if (cur_bbw is not None and len(bbw_hist) > 20) else None
+        ema50 = float(last['ema_50']) if pd.notna(last['ema_50']) else None
+        ema21 = float(last['ema_21']) if ('ema_21' in last and pd.notna(last['ema_21'])) else None
+        struct_up = bool(ema21 is not None and ema50 is not None and ema21 > ema50)
+        ema50_dist_atr = ((close - ema50) / atr) if ema50 is not None else None
+        roc_key = f'roc_{MOMENTUM_PERIOD}'
+        roc = float(last[roc_key]) if (roc_key in last and pd.notna(last[roc_key])) else None
+        # التصنيف: الانضغاط أولًا (أضيق بولنجر تاريخيًا + بلا اتجاه)، ثم النطاق
+        # بكثرة الانقلابات حول EMA50 (ER قصير الأمد يخدع في النطاق الناعم الدوري)،
+        # ثم الاتجاه بكفاءة + ADX، وأخيرًا الانتقالي لما لم يستقر
+        if bbwp is not None and bbwp <= 0.20 and adx < 25:
+            regime = 'squeeze'
+        elif flips >= 5 or er <= 0.18:
+            regime = 'range'
+        elif er >= 0.30 and adx >= 18:
+            regime = 'trend_up' if struct_up else 'trend_down'
+        else:
+            regime = 'transitional'
+        return {'regime': regime, 'er': er, 'flips': flips, 'bbwp': bbwp, 'adx': adx,
+                'atr_pct': atr_pct, 'roc': roc, 'struct_up': struct_up,
+                'ema50_dist_atr': ema50_dist_atr}
+    except Exception as reg_err:
+        logger.warning(f"⚠️ [ريم الزوج] فشل الحساب: {reg_err}")
+        return None
+
+
+def score_strategy_pair_fit(ri: Optional[Dict[str, Any]], strategy_name: str) -> Optional[float]:
+    """[V9.17.0] درجة مطابقة الزوج (0-100) لملف الاستراتيجية:
+    40 نقطة مطابقة الريم + 25 لـ ADX + 20 للتقلب ATR% + 15 للبنية.
+    نقض قاسٍ (0): ريم معاكس صراحةً (تقاطعات على نطاق، ارتدادية على هابط،
+    اختراق على اتجاه قائم) أو زخم سالب للاستراتيجية الزخمية.
+    None = تعذر التقييم — والمتصل يمرره بدل أن يرفض (لا اختناق جديد)."""
+    if not ri:
+        return None
+    prof = STRATEGY_PAIR_PROFILES.get(strategy_name)
+    if not prof:
+        return None
+    regime = ri.get('regime')
+    adx = ri.get('adx')
+    atr_pct = ri.get('atr_pct')
+    # القواعد القاسية أولًا
+    if prof.get('require_pos_roc') and (ri.get('roc') is None or ri['roc'] <= 0):
+        return 0.0
+    if regime in prof['regimes']:
+        score = 40.0
+    elif prof.get('secondary_regimes') and regime in prof['secondary_regimes']:
+        score = 25.0  # ائتمان ثانوي: بيئة مقبولة لكن ليست جوهر الاستراتيجية
+    elif regime == 'transitional':
+        score = 15.0  # ائتمان جزئي: الريم لم يستقر بعد
+    else:
+        return 0.0  # ريم معاكس صراحةً — لا تُجبر استراتيجية على بيئة تكرهها
+    # (ADX: 0-25) سلم صعود للتوجهية أو سقف متحلل للنطاقية
+    mn, ideal, mx = prof.get('adx', (None, None, None))
+    if adx is not None and (ideal is not None or mx is not None):
+        if mx is not None:
+            score += 25.0 if adx <= mx else max(0.0, 25.0 - (adx - mx) * 2.0)
+        else:
+            lo = (mn or 0.0) * 0.6
+            score += 25.0 * min(1.0, max(0.0, (adx - lo) / max(ideal - lo, 1e-9)))
+    # (التقلب النسبي: 0-20) داخل النطاق كاملة، وتتحلل خطيًا خارجه
+    lo_a, hi_a = prof.get('atr_pct', (None, None))
+    if atr_pct is not None:
+        if lo_a is not None and atr_pct < lo_a:
+            score += 20.0 * min(1.0, max(0.0, atr_pct / lo_a))
+        elif hi_a is not None and atr_pct > hi_a:
+            score += 20.0 * min(1.0, max(0.0, 1.0 - (atr_pct - hi_a) / hi_a))
+        else:
+            score += 20.0
+    # (البنية: 0-15) بنونيهات حسب شخصية الاستراتيجية
+    d = 0.0
+    if prof.get('struct_up_bonus') and ri.get('struct_up'):
+        d += 8.0
+    if prof.get('pos_roc_bonus') and (ri.get('roc') or 0) > 0:
+        d += 7.0
+    if prof.get('low_bbwp_bonus') and ri.get('bbwp') is not None and ri['bbwp'] <= 0.20:
+        d += 15.0
+    if prof.get('range_bonus') and ri.get('flips') is not None:
+        d += min(8.0, ri['flips'] * 2.0)
+    if prof.get('near_ema50') and ri.get('ema50_dist_atr') is not None:
+        if ri['ema50_dist_atr'] >= -1.0:
+            d += 7.0
+    score += min(15.0, d)
+    return round(min(100.0, score), 1)
 
 
 # --- [تحسين] دوال منطق الاستراتيجيات (تم تحسينها) ---
@@ -2785,12 +2948,12 @@ p{color:#5d8f6d;margin:.3rem 0;font-size:.9rem}
                     {"WWW-Authenticate": 'Basic realm="CryptoBot Dashboard"'})
 
 def get_dashboard_html():
-    return """
+    html = """
 <!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CryptoBot V9.16.0 // NEON TERMINAL</title>
+    <title>CryptoBot {__VER__} // NEON TERMINAL</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
         // [تحسين V9.9] ألوان الثيم الهاكر: أخضر مصفوفة + سماوي سيبراني على أسود
@@ -2871,7 +3034,7 @@ def get_dashboard_html():
         <header class="mb-6 flex flex-wrap justify-between items-center gap-4">
             <div>
                 <div dir="ltr" class="font-mono text-xs md:text-sm text-text-secondary mb-1">&gt;&gt; root@crypto-bot:~$ ./trading_engine --live --region=eu-frankfurt<span class="cursor"></span></div>
-                <h1 class="text-2xl md:text-3xl font-extrabold flicker"><span class="text-accent-green neon-text">لوحة تحكم</span> <span class="font-mono text-text-secondary text-lg md:text-xl" dir="ltr">V9.16.0//NEON</span></h1>
+                <h1 class="text-2xl md:text-3xl font-extrabold flicker"><span class="text-accent-green neon-text">لوحة تحكم</span> <span class="font-mono text-text-secondary text-lg md:text-xl" dir="ltr">{__VER__}//NEON</span></h1>
             </div>
             <div id="trend-lights-container" class="flex items-center gap-x-6 bg-black/40 px-4 py-2 rounded-lg border border-border-color"></div>
         </header>
@@ -3021,7 +3184,7 @@ def get_dashboard_html():
                 </div>
             </div>
             <div id="notifications-tab" class="tab-content hidden"><div id="notifications-list" class="card p-4 max-h-[60vh] overflow-y-auto space-y-2"></div></div>
-            <div id="rejections-tab" class="tab-content hidden"><div id="rejections-summary" class="mb-3"></div><div id="rejections-list" class="card p-4 max-h-[55vh] overflow-y-auto space-y-2"></div></div>
+            <div id="rejections-tab" class="tab-content hidden"><div id="strategy-pairs" class="mb-3"></div><div id="rejections-summary" class="mb-3"></div><div id="rejections-list" class="card p-4 max-h-[55vh] overflow-y-auto space-y-2"></div></div>
         </main>
     </div>
 <script>
@@ -3253,7 +3416,32 @@ function updateNotifications() {
         document.getElementById('notifications-list').innerHTML = data.map(n => `<div class="p-2 border-b border-border-color"><span class="font-mono text-xs text-text-secondary">${new Date(n.timestamp).toLocaleString('ar-EG')}</span>: ${n.message}</div>`).join('');
     });
 }
+function updateStrategyPairs() {
+    // [V9.17.0] الأزواج المرشحة لكل استراتيجية — مطابقة النمط السوقي بدل العشوائي
+    fetchData('/api/strategy_pairs').then(sp => {
+        if (!sp || sp.error) return;
+        const box = document.getElementById('strategy-pairs');
+        if (!box) return;
+        if (!sp.enabled) { box.innerHTML = ''; return; }
+        const rows = Object.entries(sp.pools || {}).sort((a, b) => (b[1][0]?.score || 0) - (a[1][0]?.score || 0)).map(([name, arr]) => {
+            const chips = (arr && arr.length)
+                ? arr.map(p => `<span class="inline-block px-2 py-0.5 m-0.5 rounded-full text-xs font-mono ${p.score >= 60 ? 'bg-accent-green/20 text-accent-green' : 'bg-accent-yellow/20 text-accent-yellow'}" title="النمط: ${p.regime_ar} — الدرجة ${p.score}">${p.symbol} ${p.score}%</span>`).join('')
+                : '<span class="text-xs text-text-secondary">لا أزواج مطابقة في هذا الريم حاليًا — لا فحص عبثًا</span>';
+            return `<div class="mb-2"><div class="text-xs font-bold text-neon mb-1 font-mono">${name}</div><div>${chips}</div></div>`;
+        }).join('');
+        const upd = sp.updated_at ? new Date(sp.updated_at).toLocaleTimeString('ar-EG') : '—';
+        box.innerHTML = `<div class="card p-4">
+            <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
+                <h4 class="text-sm font-bold text-neon">🎯 الأزواج المرشحة لكل استراتيجية (مطابقة النمط السوقي)</h4>
+                <div class="font-mono text-xs text-text-secondary">حد الدرجة: <span class="text-white">${sp.min_score}</span> | تحديث: <span class="text-white">${upd}</span></div>
+            </div>
+            ${rows || '<div class="text-xs text-text-secondary">بانتظار اكتمال أول دورة مسح...</div>'}
+            <div class="text-xs text-text-secondary mt-2">كل استراتيجية تُفحص فقط على العملات التي ينطبق نمطها السوقي الحالي (اتجاه صاعد / نطاق مترنم / انضغاط) على شخصيتها — بلا ترشيح عشوائي أو حسب السيولة فقط.</div>
+        </div>`;
+    });
+}
 function updateRejections() {
+    updateStrategyPairs();
     fetchData('/api/rejection_logs').then(data => {
         if (!data) return;
         document.getElementById('rejections-list').innerHTML = data.length
@@ -3448,6 +3636,8 @@ document.addEventListener('DOMContentLoaded', () => {
 </script>
 </body></html>
 """
+    # [V9.17.0] المصدر الوحيد للإصدار: حقن APP_VERSION وقت الطلب بدل النصوص المتفرقة
+    return html.replace('{__VER__}', APP_VERSION)
 
 @app.route('/')
 def home(): return render_template_string(get_dashboard_html())
@@ -3623,6 +3813,20 @@ def get_signals():
 @app.route('/api/notifications')
 def get_notifications():
     with notifications_lock: return jsonify(list(notifications_cache))
+
+@app.route('/api/strategy_pairs')
+def api_strategy_pairs():
+    """[V9.17.0] الأزواج المرشحة لكل استراتيجية من آخر دورة مسح — مطابقة النمط السوقي
+    بدل الترشيح العشوائي/السيولة: كل استراتيجية تُعرض قائمة أزواجها المطابقة بدرجاتها."""
+    try:
+        with pair_pools_lock:
+            pools = {k: list(v) for k, v in strategy_pair_pools.items()}
+            updated = pair_pools_updated_at
+        return jsonify({'pools': pools, 'updated_at': updated,
+                        'min_score': PAIR_MATCH_MIN_SCORE, 'enabled': PAIR_MATCHING_ENABLED})
+    except Exception as api_err:
+        logger.error(f"❌ [API أزواج الاستراتيجيات] خطأ: {api_err}", exc_info=True)
+        return jsonify({'error': str(api_err)}), 500
 
 @app.route('/api/rejection_logs')
 def get_rejection_logs():
@@ -4042,6 +4246,7 @@ def trade_management_loop():
 
 
 def main_loop_enhanced():
+    global strategy_pair_pools, pair_pools_updated_at
     logger.info("[الحلقة الرئيسية] انتظار اكتمال التهيئة...")
     time.sleep(15)
     if not validated_symbols_to_scan:
@@ -4073,6 +4278,8 @@ def main_loop_enhanced():
             determine_market_state_enhanced()
             btc_data = get_btc_data_for_bot()
             symbols_to_process = random.sample(validated_symbols_to_scan, len(validated_symbols_to_scan))
+            # [V9.17.0] ترشيحات هذه الدورة: الأزواج المطابقة لكل استراتيجية (تُنشر للوحة آخر الدورة)
+            cycle_pair_scores: Dict[str, List[Dict[str, Any]]] = {}
             total_batches = (len(symbols_to_process) + SYMBOL_PROCESSING_BATCH_SIZE - 1) // SYMBOL_PROCESSING_BATCH_SIZE
 
             for i in range(0, len(symbols_to_process), SYMBOL_PROCESSING_BATCH_SIZE):
@@ -4106,6 +4313,9 @@ def main_loop_enhanced():
                             with _scan_stats_lock: _filter_reject_stats['بوابة العقلانية العامة'] += 1
                             continue
 
+                        # [V9.17.0] نمط الزوج السوقي (اتجاه/نطاق/انضغاط) — من نفس الشموع بلا وزن شبكي
+                        regime_info = compute_symbol_regime(df_with_indicators)
+
                         signal_found, strategy_used = False, None
 
                         strategies_to_check = []
@@ -4128,6 +4338,19 @@ def main_loop_enhanced():
                         # مع فلتر خاص بكل استراتيجية حسب ملفها المنطقي بدل الفلاتر الشاملة
                         for key, check_func, name in strategies_to_check:
                             with _scan_stats_lock: _strategy_scan_stats[name]['checks'] += 1
+                            # [V9.17.0] بوابة مطابقة الزوج: لا فحص لاستراتيجية على زوج
+                            # لا ينطبق نمطه السوقي على شخصيتها — ترشيح مخصص لكل استراتيجية
+                            if PAIR_MATCHING_ENABLED:
+                                fit_score = score_strategy_pair_fit(regime_info, name)
+                                if fit_score is None or fit_score < PAIR_MATCH_MIN_SCORE:
+                                    _count_strategy_filter_reject(
+                                        name,
+                                        f"الزوج خارج نمط الاستراتيجية ({REGIME_AR.get(regime_info['regime'], 'غير محسوم')})" if regime_info else 'الزوج خارج نمط الاستراتيجية (نمط غير محسوم)')
+                                    continue
+                                cycle_pair_scores.setdefault(name, []).append(
+                                    {'symbol': symbol, 'score': fit_score,
+                                     'regime': regime_info['regime'],
+                                     'regime_ar': REGIME_AR.get(regime_info['regime'], regime_info['regime'])})
                             # [V9.14.0] فلتر الاستراتيجية الخاص (ملف منطقي لكل نمط)
                             if not passes_strategy_prefilters(df_with_indicators, name):
                                 continue
@@ -4206,6 +4429,17 @@ def main_loop_enhanced():
                         time.sleep(0.2)
                 
                 gc.collect()
+
+            # [V9.17.0] نشر ترشيحات هذه الدورة للوحة: أفضل الأزواج المطابقة لكل استراتيجية
+            try:
+                published: Dict[str, List[Dict[str, Any]]] = {}
+                for sname, recs in cycle_pair_scores.items():
+                    published[sname] = sorted(recs, key=lambda r: r['score'], reverse=True)[:PAIR_POOL_DISPLAY_SIZE]
+                with pair_pools_lock:
+                    strategy_pair_pools = published
+                    pair_pools_updated_at = datetime.now(timezone.utc).isoformat()
+            except Exception as pool_err:
+                logger.warning(f"⚠️ [مطابقة الأزواج] فشل نشر الترشيحات: {pool_err}")
 
             _, session_liquidity, _ = get_session_state()
             sleep_duration = 45 if session_liquidity == 'HIGH_LIQUIDITY' else 60

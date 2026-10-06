@@ -86,3 +86,10 @@ services:
         value: "-18.0"
       - key: LEADER_REFRESH_SEC
         value: "300"
+      # --- [V9.17.0] مطابقة الأزواج بالاستراتيجيات: ترشيح مخصص لكل استراتيجية ---
+      - key: PAIR_MATCHING_ENABLED
+        value: "True"
+      - key: PAIR_MATCH_MIN_SCORE
+        value: "45"
+      - key: PAIR_POOL_DISPLAY_SIZE
+        value: "8"
