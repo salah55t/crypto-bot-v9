@@ -42,7 +42,7 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-logger = logging.getLogger('CryptoBotV9.12.1')
+logger = logging.getLogger('CryptoBotV9.13.0')
 
 # زمن إقلاع العملية لحساب مدة التشغيل في لوحة التحكم
 BOOT_TIME = time.time()
@@ -172,6 +172,22 @@ DYNAMIC_UNIVERSE_MIN_QUOTE_VOLUME: float = config('DYNAMIC_UNIVERSE_MIN_QUOTE_VO
 # حد أدنى للتقلب: المدى اليومي % (يقصّ العملات الميتة ويستهدف الانفجارات السعرية)
 DYNAMIC_UNIVERSE_MIN_RANGE_PCT: float = config('DYNAMIC_UNIVERSE_MIN_RANGE_PCT', default=1.5, cast=float)
 
+# --- [تحسين V9.13.0] خريطة القيادة: أي قائد سيادي تتبعه كل عملة (BTC/ETH/SOL)؟ ---
+# الأصل: العملات الأصغر تتحرك تحت مظلة قادة السوق. نحسب ارتباط عوائد كل عملة مع كل
+# قائد من شموع 15م (المجلوبة أصلًا للمسح مقابل كاش القادة — صفر نداء إضافي للمسح)
+# ثم نأخذ القرار حسب سلوك القائد: لا شراء تابع إذا كان قائده هابطًا.
+USE_LEADER_FILTER: bool = config('USE_LEADER_FILTER', default=True, cast=bool)
+# القادة السياديون الثلاثة (طلب المستخدم: البتكوين والإثريوم والصول)
+LEADER_SYMBOLS: List[str] = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT']
+# نافذة الارتباط: 192 شمعة 15م = آخر 48 ساعة (توازن بين الاستجابة والضجيج)
+LEADER_CORR_WINDOW: int = config('LEADER_CORR_WINDOW', default=192, cast=int)
+# أدنى ارتباط يُعتد به لتصنيف العملة "تابعة" لقائد — تحته تُصنف "مستقلة"
+LEADER_CORR_MIN: float = config('LEADER_CORR_MIN', default=0.30, cast=float)
+# عتبة رفض الشراء: درجة سلوك القائد تحتها (هابط/هابط قوي) تُرفض إشارات التابع
+LEADER_BEARISH_SCORE: float = config('LEADER_BEARISH_SCORE', default=-18.0, cast=float)
+# فترة تحديث بيانات القادة (شموع 15م لكل قائد — وزن 2 للقائد)
+LEADER_REFRESH_SEC: int = config('LEADER_REFRESH_SEC', default=300, cast=int)
+
 
 BASE_ML_MODEL_NAME: str = 'LightGBM_Scalping_V9_With_Microstructure'
 MODEL_FOLDER: str = 'V9'
@@ -249,6 +265,13 @@ last_market_state_check = 0
 technical_signals_cache: Dict[str, Dict] = {}
 TECHNICAL_SIGNAL_CACHE_DURATION: int = 60 * 5
 technical_signals_lock = Lock()
+
+# --- [تحسين V9.13.0] حالة خريطة القيادة (بيانات القادة + تصنيف التابعين) ---
+_leader_data: Dict[str, Dict[str, Any]] = {}   # قائد -> {'closes': [...], 'trend': {...}, 'ts': float}
+_leader_data_lock = Lock()
+_leader_map: Dict[str, Dict[str, Any]] = {}    # عملة -> {'leader', 'corr', 'correlations', 'is_leader', 'updated'}
+_leader_map_lock = Lock()
+_leader_veto_stats: Counter = Counter()        # عداد رفضات بوابة القائد لكل قائد (منذ الإقلاع)
 
 # --- [تحسين V9.8] حالة قاطع الحماية اليومي وكاش ATR ---
 daily_realized_pnl_usdt: float = 0.0
@@ -552,6 +575,127 @@ def btc_trend_loop():
             logger.debug(f"[بوصلة BTC] خطأ: {e}")
         time.sleep(max(20, BTC_TREND_REFRESH_SEC))
 
+# ============================================================
+# [تحسين V9.13.0] خريطة القيادة: تصنيف العملات حسب القائد الذي تتبعه
+# (BTC / ETH / SOL) واتخاذ قرار الشراء وفق سلوك القائد المتبوع.
+# تكلفة الشبكة: 3 قادة × شموع 15م (وزن 2) كل 5 دقائق ≈ 1.2 وزن/دقيقة فقط.
+# ============================================================
+def _fetch_leader_closes(symbol: str) -> List[float]:
+    """شموع إغلاق 15م للقائد (300 شمعة = 75 ساعة، وزن 2 فقط)."""
+    klines = safe_api_call(client.get_klines, symbol=symbol, interval='15m', limit=300, weight=2)
+    if not klines:
+        return []
+    return [float(k[4]) for k in klines]
+
+def fetch_leader_data(force: bool = False) -> None:
+    """يحدّث كاش القادة (أسعار الإغلاق + سلوك كل قائد من compute_tf_trend)
+    خلال نافذة LEADER_REFRESH_SEC ما لم force=True — عند الفشل تبقى آخر بيانات صالحة."""
+    if not client:
+        return
+    now = time.time()
+    with _leader_data_lock:
+        fresh = (len(_leader_data) >= len(LEADER_SYMBOLS)
+                 and all(now - d.get('ts', 0) < LEADER_REFRESH_SEC for d in _leader_data.values()))
+    if fresh and not force:
+        return
+    for sym in LEADER_SYMBOLS:
+        try:
+            closes = _fetch_leader_closes(sym)
+            if len(closes) < 60:
+                continue
+            trend = compute_tf_trend(closes[-150:])
+            with _leader_data_lock:
+                _leader_data[sym] = {'closes': closes, 'trend': trend, 'ts': time.time()}
+        except Exception as e:
+            logger.debug(f"[خريطة القيادة] تعذر تحديث {sym}: {e}")
+
+def leader_data_loop():
+    """خيط خلفي: بيانات القادة كل LEADER_REFRESH_SEC — يستثمر فترات الحظر ولا يزاحم المسح."""
+    time.sleep(8)  # مهلة تهيئة العميل
+    while True:
+        try:
+            ban_remain = rate_guard.banned_until - time.time()
+            if ban_remain > 0:
+                time.sleep(min(ban_remain, 10.0)); continue
+            if client:
+                fetch_leader_data(force=True)
+        except Exception as e:
+            logger.debug(f"[خريطة القيادة] خطأ: {e}")
+        time.sleep(max(30, LEADER_REFRESH_SEC))
+
+def compute_leader_correlations(coin_closes: List[float]) -> Dict[str, float]:
+    """ارتباط عوائد العملة مع كل قائد على نافذة LEADER_CORR_WINDOW شمعة 15م.
+    محاذاة الذيل كافية (فرق دقائق بين لحظتي الجلب لا يغيّر الارتباط عمليًا).
+    سلاسل ثابتة (std=0) تُعامل كارتباط صفر لتجنب قسمة صفر."""
+    try:
+        coin = pd.Series([float(c) for c in coin_closes[-LEADER_CORR_WINDOW:]], dtype=float).pct_change().dropna()
+        with _leader_data_lock:
+            snaps = {sym: list(d.get('closes') or []) for sym, d in _leader_data.items()}
+        out: Dict[str, float] = {}
+        for sym, closes in snaps.items():
+            lead = pd.Series([float(c) for c in closes[-LEADER_CORR_WINDOW:]], dtype=float).pct_change().dropna()
+            n = min(len(coin), len(lead))
+            if n < 50 or float(coin.tail(n).std()) == 0 or float(lead.tail(n).std()) == 0:
+                out[sym] = 0.0
+                continue
+            out[sym] = float(np.corrcoef(coin.tail(n).values, lead.tail(n).values)[0, 1])
+        return out
+    except Exception as e:
+        logger.debug(f"[خريطة القيادة] خطأ حساب ارتباط: {e}")
+        return {}
+
+def update_leader_classification(symbol: str, coin_closes: List[float]) -> None:
+    """يُستدعى من حلقة المسح لكل عملة عند كل دورة (بلا شبكة إطلاقًا):
+    القائد = صاحب أعلى ارتباط إذا تجاوز LEADER_CORR_MIN، وإلا فالعملة "مستقلة".
+    القادة أنفسهم يُوسمون 'قائد سيادي' ولا يخضعون لبوابة السلوك."""
+    if symbol in LEADER_SYMBOLS:
+        with _leader_map_lock:
+            _leader_map[symbol] = {'leader': None, 'corr': 1.0, 'correlations': {},
+                                   'is_leader': True, 'updated': time.time()}
+        return
+    corrs = compute_leader_correlations(coin_closes)
+    if not corrs:
+        return
+    best_sym = max(corrs, key=corrs.get)
+    best_corr = float(corrs.get(best_sym, 0.0))
+    with _leader_map_lock:
+        _leader_map[symbol] = {
+            'leader': best_sym if best_corr >= LEADER_CORR_MIN else None,
+            'corr': round(best_corr, 3),
+            'correlations': {k: round(v, 3) for k, v in corrs.items()},
+            'is_leader': False, 'updated': time.time()}
+
+def passes_leader_behavior_filter(symbol: str) -> Tuple[bool, Optional[Dict[str, Any]]]:
+    """بوابة سلوك القائد (V9.13.0): القرار حسب سلوك ما تتبعه العملة.
+    - تابعة لقائد هابط (score <= LEADER_BEARISH_SCORE) → رفض الشراء:
+      فالتابع يتحرك عادة مع قائده، وشراء تابع مقابل قائد هابط = مواجهة السوق الحاكم.
+    - قائد صاعد/محايد، أو عملة مستقلة، أو قائد نفسه → سماح.
+    fail-open: بلا بيانات/تصنيف مؤقت نسمح — لا نحبس البوت بسبب نقص بيانات عابر."""
+    if not USE_LEADER_FILTER:
+        return True, None
+    with _leader_map_lock:
+        info = dict(_leader_map.get(symbol) or {})
+    if not info:
+        return True, None
+    if info.get('is_leader'):
+        return True, {**info, 'decision': 'leader_self'}
+    leader = info.get('leader')
+    corr = float(info.get('corr') or 0.0)
+    if not leader or corr < LEADER_CORR_MIN:
+        return True, {**info, 'decision': 'independent'}
+    with _leader_data_lock:
+        ld = _leader_data.get(leader) or {}
+        trend = dict(ld.get('trend') or {})
+    score = float(trend.get('score') or 0.0)
+    out = {**info, 'leader_trend_score': score, 'leader_trend_label': trend.get('label', ''),
+           'leader_trend_arrow': trend.get('arrow', ''), 'decision': 'pass'}
+    if score <= LEADER_BEARISH_SCORE:
+        out['decision'] = 'veto'
+        with _scan_stats_lock:
+            _leader_veto_stats[leader] += 1
+        return False, out
+    return True, out
+
 BAN_UNTIL_RE = re.compile(r'banned until (\d+)', re.IGNORECASE)
 
 def _is_rate_error(e: Exception) -> bool:
@@ -680,6 +824,7 @@ REJECTION_REASONS_AR = {
     "SR Breakout Strategy Conditions Not Met": "شروط استراتيجية اختراق الدعم/المقاومة لم تتحقق",
     "Price Peak Avoidance": "تجنب الدخول عند قمة آخر 24 ساعة (استراتيجية ارتدادية)",
     "Daily Loss Limit": "قاطع الحماية: تم إيقاف فتح صفقات جديدة بسبب تجاوز حد الخسارة اليومي",
+    "Leader Behavior Veto": "سلوك القائد معاكس: القائد هابط والعملة تابعة له",
 }
 
 
@@ -2004,11 +2149,16 @@ def insert_signal_into_db(signal_data: Dict) -> Optional[Dict]:
             logger.info(f"💾 [{signal_data['symbol']}] تم حفظ الإشارة الجديدة في قاعدة البيانات.")
 
             trade_type = "حقيقية" if signal_data.get('is_real_trade') else "تجريبية"
+            # [تحسين V9.13.0] سطر القائد التابع له في رسالة التوصية
+            leader_info = signal_data['signal_details'].get('leader_info') or {}
+            leader_line = (f"\n*القائد التابع له:* `{leader_info['leader']}` (ارتباط {float(leader_info.get('corr') or 0):.2f})"
+                           if leader_info.get('leader') else "")
             telegram_message = (
                 f"💡 *توصية شراء {trade_type} جديدة*\n\n"
                 f"*العملة:* `{signal_data['symbol']}`\n*الاستراتيجية:* `{signal_data['strategy_name'].replace('_', ' ')}`\n"
                 f"*سعر الدخول:* `{entry_price:.4f}`\n*الهدف الأول:* `{target_price:.4f}`\n"
-                f"*وقف الخسارة:* `{stop_loss:.4f}`\n*RR Ratio:* `{rr_ratio:.2f}`\n\n"
+                f"*وقف الخسارة:* `{stop_loss:.4f}`\n*RR Ratio:* `{rr_ratio:.2f}`"
+                f"{leader_line}\n\n"
                 f"Confidence: {signal_data['signal_details'].get('ML_Confidence', 'N/A')}"
             )
             send_telegram_message(telegram_message)
@@ -2084,7 +2234,7 @@ def get_dashboard_html():
 <html lang="ar" dir="rtl">
 <head>
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CryptoBot V9.12.1 // NEON TERMINAL</title>
+    <title>CryptoBot V9.13.0 // NEON TERMINAL</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
         // [تحسين V9.9] ألوان الثيم الهاكر: أخضر مصفوفة + سماوي سيبراني على أسود
@@ -2165,7 +2315,7 @@ def get_dashboard_html():
         <header class="mb-6 flex flex-wrap justify-between items-center gap-4">
             <div>
                 <div dir="ltr" class="font-mono text-xs md:text-sm text-text-secondary mb-1">&gt;&gt; root@crypto-bot:~$ ./trading_engine --live --region=eu-frankfurt<span class="cursor"></span></div>
-                <h1 class="text-2xl md:text-3xl font-extrabold flicker"><span class="text-accent-green neon-text">لوحة تحكم</span> <span class="font-mono text-text-secondary text-lg md:text-xl" dir="ltr">V9.12.1//NEON</span></h1>
+                <h1 class="text-2xl md:text-3xl font-extrabold flicker"><span class="text-accent-green neon-text">لوحة تحكم</span> <span class="font-mono text-text-secondary text-lg md:text-xl" dir="ltr">V9.13.0//NEON</span></h1>
             </div>
             <div id="trend-lights-container" class="flex items-center gap-x-6 bg-black/40 px-4 py-2 rounded-lg border border-border-color"></div>
         </header>
@@ -2195,6 +2345,33 @@ def get_dashboard_html():
                 <div class="lg:col-span-3 grid grid-cols-1 md:grid-cols-3 gap-3" id="btc-tf-grid">
                     <div class="text-text-secondary text-sm text-center py-6">جاري أول تحليل للفريمات (15م / 1س / 4س)...</div>
                 </div>
+            </div>
+        </section>
+        <!-- [تحسين V9.13.0] خريطة القيادة: أي قائد سيادي تتبعه كل عملة + سلوك القادة الآن -->
+        <section class="card p-4 mb-6">
+            <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
+                <h3 class="font-bold text-lg text-text-secondary">👑 خريطة القيادة — من يتبع من؟</h3>
+                <div class="text-xs text-text-secondary font-mono" id="leader-summary" dir="ltr">--</div>
+            </div>
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-3 mb-3" id="leader-cards">
+                <div class="text-text-secondary text-sm text-center py-4">جاري أول جلب لبيانات القادة (BTC / ETH / SOL)...</div>
+            </div>
+            <div class="overflow-x-auto rounded-lg border border-border-color">
+                <table class="min-w-full text-sm text-right">
+                    <thead class="border-b border-border-color bg-black/20"><tr>
+                        <th class="p-2 font-semibold">العملة</th>
+                        <th class="p-2 font-semibold">القائد التابع له</th>
+                        <th class="p-2 font-semibold">قوة الارتباط (48س)</th>
+                        <th class="p-2 font-semibold">سلوك القائد الآن</th>
+                        <th class="p-2 font-semibold">قرار البوابة</th>
+                    </tr></thead>
+                    <tbody id="leader-table"><tr><td colspan="5" class="text-center text-text-secondary py-4">لم يبدأ التصنيف بعد — يحدث تلقائيًا مع أول دورة مسح</td></tr></tbody>
+                </table>
+            </div>
+            <div class="mt-2 text-xs text-text-secondary flex flex-wrap gap-x-4">
+                <span>حد الارتباط للتبعية: <span id="leader-corr-min" class="font-mono text-accent-blue">--</span></span>
+                <span>عتبة رفض القائد الهابط: <span id="leader-bearish" class="font-mono text-accent-red">--</span></span>
+                <span>رفضات بوابة القائد منذ الإقلاع: <span id="leader-vetoes" class="font-mono text-accent-yellow">0</span></span>
             </div>
         </section>
         <!-- [تحسين V9.9] شريط مراقبة النظام الحي: وزن API، الاتصال، قاطع الحماية -->
@@ -2589,6 +2766,73 @@ function updateSystemStatus() {
     });
 }
 
+// [تحسين V9.13.0] خريطة القيادة: بطاقات القادة + جدول من يتبع من + قرارات البوابة
+function updateLeaderMap() {
+    fetchData('/api/leader_map').then(data => {
+        if (!data || !data.enabled) return;
+        const cMap = {green: 'text-accent-green', red: 'text-accent-red', yellow: 'text-accent-yellow'};
+        const barMap = {green: '#00ff41', red: '#ff3b3b', yellow: '#ffd60a'};
+        const names = {BTCUSDT: 'BTC 🟠', ETHUSDT: 'ETH 🔵', SOLUSDT: 'SOL 🟣'};
+        const bearish = data.settings?.bearish_score ?? -18;
+        // بطاقات القادة الثلاثة (سلوك كل قائد الآن — نفس محرك البوصلة)
+        const cards = document.getElementById('leader-cards');
+        const lkeys = Object.keys(data.leaders || {});
+        cards.innerHTML = lkeys.length ? lkeys.map(sym => {
+            const t = data.leaders[sym].trend || {};
+            const pct = Math.min(100, Math.abs(t.score || 0)) / 2;
+            const pos = (t.score || 0) >= 0 ? `left:50%;width:${pct}%` : `left:${50 - pct}%;width:${pct}%`;
+            return `<div class="bg-black/40 rounded-lg border border-border-color p-3 flex flex-col items-center justify-center gap-1">
+                <div class="text-sm font-bold text-text-secondary" dir="ltr">${names[sym] || sym}${data.leaders[sym].stale ? ' ⏳' : ''}</div>
+                <div class="text-2xl leading-none ${cMap[t.color] || ''}">${t.arrow || '▬'}</div>
+                <div class="font-bold ${cMap[t.color] || 'text-text-secondary'}">${t.label || '--'} <span class="font-mono text-xs">(${t.score ?? '--'})</span></div>
+                <div class="w-full h-1.5 bg-gray-800 rounded-full relative overflow-hidden" dir="ltr">
+                    <div class="absolute left-1/2 top-0 w-px h-full bg-gray-600"></div>
+                    <div class="absolute top-0 h-full rounded-full transition-all duration-700" style="${pos};background:${barMap[t.color] || '#888'}"></div>
+                </div>
+            </div>`;
+        }).join('') : '<div class="text-text-secondary text-sm py-3">لا بيانات قادة بعد (خيط البيانات يعمل...)</div>';
+        // جدول العملات: من يتبع من
+        const tbody = document.getElementById('leader-table');
+        const rows = (data.map || []);
+        tbody.innerHTML = rows.length ? rows.map(r => {
+            let leaderCell, behaviorCell, decisionCell;
+            if (r.is_leader) {
+                leaderCell = '<span class="text-accent-yellow font-bold">👑 قائد سيادي</span>';
+                behaviorCell = '--';
+                decisionCell = '<span class="text-accent-yellow">يُتبع</span>';
+            } else if (!r.leader) {
+                leaderCell = '<span class="text-text-secondary">مستقلة</span>';
+                behaviorCell = '--';
+                decisionCell = '<span class="text-text-secondary">على سلوكها</span>';
+            } else {
+                const lt = data.leaders?.[r.leader]?.trend || {};
+                const sc = lt.score ?? 0;
+                leaderCell = `<span class="font-bold text-accent-blue" dir="ltr">${names[r.leader] || r.leader}</span>`;
+                behaviorCell = `<span class="${cMap[lt.color] || 'text-text-secondary'}">${lt.arrow || '▬'} ${lt.label || '--'} <span class="font-mono">(${sc})</span></span>`;
+                decisionCell = sc <= bearish
+                    ? '<span class="text-accent-red">🚫 رفض شراء (قائد هابط)</span>'
+                    : (sc >= 18 ? '<span class="text-accent-green">✅ مواتٍ للشراء</span>' : '<span class="text-accent-yellow">▬ محايد</span>');
+            }
+            const c = Math.max(0, Math.min(1, r.corr || 0));
+            const cPct = Math.round(c * 100);
+            return `<tr class="border-b border-border-color/50 hover:bg-white/5">
+                <td class="p-2 font-bold font-mono" dir="ltr">${r.symbol}</td>
+                <td class="p-2">${leaderCell}</td>
+                <td class="p-2"><div class="flex items-center gap-2"><div class="flex-1 h-1.5 bg-black/40 rounded overflow-hidden min-w-[60px]"><div class="h-full bg-accent-blue" style="width:${cPct}%"></div></div><span class="font-mono text-xs w-10">${(r.corr || 0).toFixed(2)}</span></div></td>
+                <td class="p-2 text-xs">${behaviorCell}</td>
+                <td class="p-2 text-xs">${decisionCell}</td>
+            </tr>`;
+        }).join('') : '<tr><td colspan="5" class="text-center text-text-secondary py-4">لم يبدأ التصنيف بعد — يحدث تلقائيًا مع أول دورة مسح</td></tr>';
+        const sm = data.summary || {};
+        document.getElementById('leader-summary').textContent =
+            `BTC:${sm['BTCUSDT'] || 0} | ETH:${sm['ETHUSDT'] || 0} | SOL:${sm['SOLUSDT'] || 0} | مستقلة:${sm['independent'] || 0}`;
+        document.getElementById('leader-corr-min').textContent = data.settings?.corr_min ?? '--';
+        document.getElementById('leader-bearish').textContent = data.settings?.bearish_score ?? '--';
+        document.getElementById('leader-vetoes').textContent =
+            Object.values(data.veto_stats || {}).reduce((a, b) => a + b, 0);
+    });
+}
+
 function saveSettings() {
     const settings = {
         risk_percent: parseFloat(document.getElementById('risk-percent').value),
@@ -2629,13 +2873,14 @@ function saveSettings() {
 }
 
 document.addEventListener('DOMContentLoaded', () => {
-    ['MarketStatus', 'Signals', 'Stats', 'Notifications', 'Rejections', 'SystemStatus', 'BtcTrend'].forEach(f => window[`update${f}`]());
+    ['MarketStatus', 'Signals', 'Stats', 'Notifications', 'Rejections', 'SystemStatus', 'BtcTrend', 'LeaderMap'].forEach(f => window[`update${f}`]());
     // [تحسين V9.11.0] إيقاف الاستطلاع عند إخفاء التبويب — يمنع تراكم الطلبات
     // من التبويبات الخلفية ويخفف الضغط على خيوط الخادم (waitress queue)
     const whenVisible = (fn, ms) => setInterval(() => { if (!document.hidden) fn(); }, ms);
     whenVisible(updateMarketStatus, 5000); whenVisible(updateSignals, 7000); whenVisible(updateStats, 60000);
     whenVisible(updateNotifications, 15000); whenVisible(updateRejections, 15000); whenVisible(updateSystemStatus, 5000);
     whenVisible(updateBtcTrend, 30000);  // [تحسين V9.11] البوصلة تُحدّث كل 30 ثانية
+    whenVisible(updateLeaderMap, 60000); // [تحسين V9.13.0] خريطة القيادة تُحدّث كل دقيقة (التصنيف بطيء التغير)
 });
 </script>
 </body></html>
@@ -2647,7 +2892,7 @@ def home(): return render_template_string(get_dashboard_html())
 @app.route('/health')
 def health_check():
     """[تحسين V9.8] نقطة فحص صحة خفيفة لمراقبة الخدمة على Render وأدوات Uptime."""
-    return jsonify({"status": "ok", "version": "V9.12.1", "time": datetime.now(timezone.utc).isoformat()})
+    return jsonify({"status": "ok", "version": "V9.13.0", "time": datetime.now(timezone.utc).isoformat()})
 
 # --- [تحسين V9.9] نقطة حالة النظام: وزن الطلبات، الحظر، قاطع الحماية، التخزين ---
 @app.route('/api/system_status')
@@ -2666,7 +2911,7 @@ def api_system_status():
         except Exception:
             pass
         return jsonify({
-            'version': 'V9.12.1',
+            'version': 'V9.13.0',
             'client_ready': bool(client),
             'rate_guard': snap,
             'daily_pnl_usdt': pnl,
@@ -2732,6 +2977,30 @@ def api_btc_trend():
     if not data:
         return jsonify({'status': 'init', 'message': 'جاري أول تحليل للفريمات...'})
     return jsonify(data)
+
+@app.route('/api/leader_map')
+def api_leader_map():
+    """[تحسين V9.13.0] خريطة القيادة: من يتبع من + سلوك القادة الآن.
+    تقرأ الكاش فقط بلا أي نداء شبكي من خيوط الويب (نفس مبدأ V9.10.1)."""
+    now = time.time()
+    with _leader_data_lock:
+        leaders = {sym: {'trend': dict(d.get('trend') or {}),
+                         'stale': (now - d.get('ts', 0)) > 3 * LEADER_REFRESH_SEC}
+                   for sym, d in _leader_data.items()}
+    with _leader_map_lock:
+        rows = [{'symbol': sym, 'leader': info.get('leader'), 'corr': info.get('corr'),
+                 'correlations': info.get('correlations') or {}, 'is_leader': bool(info.get('is_leader')),
+                 'age_sec': int(now - info.get('updated', now)) if info.get('updated') else None}
+                for sym, info in _leader_map.items()]
+    rows.sort(key=lambda r: (-(r['corr'] if r['corr'] is not None else 0.0), r['symbol']))
+    summary: Dict[str, int] = {}
+    for r in rows:
+        key = r['symbol'] if r['is_leader'] else (r['leader'] or 'independent')
+        summary[key] = summary.get(key, 0) + 1
+    return jsonify({'enabled': USE_LEADER_FILTER, 'leaders': leaders, 'map': rows[:60],
+                    'summary': summary, 'veto_stats': dict(_leader_veto_stats),
+                    'settings': {'corr_min': LEADER_CORR_MIN, 'bearish_score': LEADER_BEARISH_SCORE,
+                                 'window_candles': LEADER_CORR_WINDOW, 'refresh_sec': LEADER_REFRESH_SEC}})
 
 @app.route('/api/stats')
 def get_stats():
@@ -3252,6 +3521,10 @@ def main_loop_enhanced():
                         if df_15m is None or len(df_15m) < 100:
                             continue
                         
+                        # [تحسين V9.13.0] تصنيف القائد (BTC/ETH/SOL) لكل عملة عند كل دورة
+                        # بلا أي نداء شبكي — من شموع 15م المجلوبة أصلًا مقابل كاش القادة
+                        update_leader_classification(symbol, df_15m['close'].tolist())
+                        
                         df_with_indicators = calculate_all_features(df_15m, btc_data)
                         df_with_indicators.name = symbol
                         if df_with_indicators.empty:
@@ -3297,6 +3570,15 @@ def main_loop_enhanced():
 
                         logger.info(f"  -> [{symbol}] إشارة ناجحة من {strategy_used}. جاري التحقق النهائي...")
                         
+                        # --- [تحسين V9.13.0] بوابة سلوك القائد: لا شراء تابع مقابل قائد هابط ---
+                        leader_ok, leader_info = passes_leader_behavior_filter(symbol)
+                        if not leader_ok:
+                            li = leader_info or {}
+                            log_rejection(symbol, "Leader Behavior Veto", {
+                                'leader': li.get('leader'), 'corr': li.get('corr'),
+                                'leader_trend_score': li.get('leader_trend_score')})
+                            continue
+                        
                         try: entry_price = float(safe_get_symbol_ticker(symbol=symbol)['price'])
                         except Exception as e: logger.error(f"❌ [{symbol}] فشل جلب سعر الدخول: {e}."); continue
 
@@ -3327,6 +3609,10 @@ def main_loop_enhanced():
                             'signal_details': {**tp_sl_data},
                             'entry_price': entry_price, **tp_sl_data
                         }
+                        # [تحسين V9.13.0] توثيق القائد التابع له داخل تفاصيل الإشارة (تليجرام/لوحة)
+                        if leader_info and leader_info.get('leader'):
+                            new_signal['signal_details']['leader_info'] = {
+                                k: leader_info.get(k) for k in ('leader', 'corr', 'leader_trend_score', 'leader_trend_label')}
 
                         with trading_status_lock: is_enabled = is_trading_enabled
                         if is_enabled:
@@ -3425,8 +3711,9 @@ def initialize_bot_services():
     Thread(target=trade_management_loop, daemon=True).start()
     Thread(target=balance_refresh_loop, daemon=True).start()  # [تحسين V9.11.0] كاش رصيد اللوحة
     Thread(target=btc_trend_loop, daemon=True).start()        # [تحسين V9.11] بوصلة اتجاه BTC
+    Thread(target=leader_data_loop, daemon=True).start()      # [تحسين V9.13.0] بيانات قادة خريطة القيادة
     logger.info("✅ [خدمات البوت] تم بدء جميع الخدمات الخلفية بنجاح.")
-    send_telegram_message("✅ *البوت قيد التشغيل الآن (نسخة V9.12.1 - Neon Security)*")
+    send_telegram_message("✅ *البوت قيد التشغيل الآن (نسخة V9.13.0 - Neon Security)*")
 
 # ---------------------- نقطة الدخول ----------------------
 if __name__ == "__main__":

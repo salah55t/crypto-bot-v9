@@ -75,3 +75,14 @@ services:
       # --- [V9.12] مهلة عميل Binance: تقطع النداءات المعلقة التي كانت تتجمد اللوحة ---
       - key: BINANCE_CLIENT_TIMEOUT_SEC
         value: "25"
+      # --- [V9.13.0] خريطة القيادة: تصنيف العملات حسب القائد (BTC/ETH/SOL) وقرار حسب سلوكه ---
+      - key: USE_LEADER_FILTER
+        value: "True"
+      - key: LEADER_CORR_WINDOW
+        value: "192"
+      - key: LEADER_CORR_MIN
+        value: "0.30"
+      - key: LEADER_BEARISH_SCORE
+        value: "-18.0"
+      - key: LEADER_REFRESH_SEC
+        value: "300"
