@@ -195,7 +195,7 @@ PRICE_UPDATE_INTERVAL_SEC: int = config('PRICE_UPDATE_INTERVAL_SEC', default=5, 
 # الشموع والأسعار عبر تدفقات Binance العامة (بلا مفاتيح وبلا أوزان REST وتعمل أثناء الحظر)،
 # ويبقى REST للتهيئة/الأوامر/تعبئة أولى لكل رمز — بصمة وزن شبه معدومة على IP الخروج المشترك.
 USE_STREAM_HUB: bool = config('USE_STREAM_HUB', default=True, cast=bool)
-STREAM_HUB_BASE_URL: str = config('STREAM_HUB_BASE_URL', default='wss://stream.binance.com:9443/stream')
+STREAM_HUB_BASE_URL: str = config('STREAM_HUB_BASE_URL', default='wss://stream.binance.com:443/stream')
 # عمق المخازن (شمعة مكتملة): 15م يغطي lookback المسح (920 ساعة = 3680 شمعة) + هامش
 STREAM_HUB_BUFFER_15M: int = config('STREAM_HUB_BUFFER_15M', default=4200, cast=int)
 STREAM_HUB_BUFFER_1H: int = config('STREAM_HUB_BUFFER_1H', default=1300, cast=int)
@@ -1017,9 +1017,12 @@ class MarketStreamHub:
 
     # ---------------- حلقة الاتصال ----------------
     def start(self) -> None:
-        Thread(self._run_loop, daemon=True).start()
-        Thread(self._backfill_loop, daemon=True).start()
-        Thread(self._maintain_loop, daemon=True).start()
+        # [إصلاح عاجل V9.16.0] target= صريح — النسخة الأولى كانت تمرر الأسلوب موضعيًا
+        # فيدخل معامل group فيرفع TypeError بصمت ويُبطل المركز كله
+        websocket.setdefaulttimeout(15)  # مهلة اتصال TCP/TLS بدل التعليق الافتراضي
+        Thread(target=self._run_loop, daemon=True).start()
+        Thread(target=self._backfill_loop, daemon=True).start()
+        Thread(target=self._maintain_loop, daemon=True).start()
         logger.info("🛰️ [مركز البيانات] انطلق — WebSocket لقنوات الشموع الحية (يعمل حتى أثناء حظر REST)")
 
     def _run_loop(self) -> None:
