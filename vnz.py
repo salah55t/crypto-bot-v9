@@ -49,7 +49,7 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-APP_VERSION: str = 'V9.18.0'  # [V9.18.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
+APP_VERSION: str = 'V9.19.0'  # [V9.19.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
 logger = logging.getLogger(f'CryptoBot{APP_VERSION}')
 
 # زمن إقلاع العملية لحساب مدة التشغيل في لوحة التحكم
@@ -243,9 +243,9 @@ BAN_RESUME_RAMP_SEC: int = config('BAN_RESUME_RAMP_SEC', default=120, cast=int)
 # الاستجابة: الميزانية تهبط للأرضية مباشرة + تبريد استئناف ممتد + إشعار تليجرام
 # بموعد النهاية الفعلي بدل الضرب المتكرر أثناء الحظر
 BAN_LONG_THRESHOLD_SEC: int = config('BAN_LONG_THRESHOLD_SEC', default=600, cast=int)
-# فاصل تحديث أسعار Redis بالثواني (كل طلب أسعار شامل وزنه 4) — [V9.15.1] 3→5ث
-# (80→48 وزن/دقيقة): تقليل بصمتنا على IP مشترك بلا أثر عملي على حيوية اللوحة
-PRICE_UPDATE_INTERVAL_SEC: int = config('PRICE_UPDATE_INTERVAL_SEC', default=5, cast=int)
+# فاصل تحديث أسعار Redis بالثواني — [V9.19.0] 5→2ث: النشر من مركز WebSocket داخل
+# العملية (صفر وزن شبكي) فالزمن الحقيقي أصبح مجانيًا — اللوحة والإدارة يقرآن أسعارًا بعمر ≤2ث
+PRICE_UPDATE_INTERVAL_SEC: int = config('PRICE_UPDATE_INTERVAL_SEC', default=2, cast=int)
 
 # --- [V9.16.0] مركز بيانات WebSocket — الشفاء الجذري لحظر -1003 على IP مشترك ---
 # الشموع والأسعار عبر تدفقات Binance العامة (بلا مفاتيح وبلا أوزان REST وتعمل أثناء الحظر)،
@@ -3680,7 +3680,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // [تحسين V9.11.0] إيقاف الاستطلاع عند إخفاء التبويب — يمنع تراكم الطلبات
     // من التبويبات الخلفية ويخفف الضغط على خيوط الخادم (waitress queue)
     const whenVisible = (fn, ms) => setInterval(() => { if (!document.hidden) fn(); }, ms);
-    whenVisible(updateMarketStatus, 5000); whenVisible(updateSignals, 7000); whenVisible(updateStats, 60000);
+    whenVisible(updateMarketStatus, 5000); whenVisible(updateSignals, 4000); whenVisible(updateStats, 60000);
     whenVisible(updateNotifications, 15000); whenVisible(updateRejections, 15000); whenVisible(updateSystemStatus, 5000);
     whenVisible(updateBtcTrend, 30000);  // [تحسين V9.11] البوصلة تُحدّث كل 30 ثانية
     whenVisible(updateLeaderMap, 60000); // [تحسين V9.13.0] خريطة القيادة تُحدّث كل دقيقة (التصنيف بطيء التغير)
@@ -4163,6 +4163,16 @@ def trade_management_loop():
                 continue
 
             current_prices = redis_client.hgetall(REDIS_PRICES_HASH_NAME)
+            # [V9.19.0] الأسعار الحية من مركز WebSocket أولًا (زمن حقيقي ~2ث، صفر وزن REST)
+            # — قبل هذا كان الصفقات خارج القائمة الديناميكية تُهمل تمامًا هنا (لا سعر →
+            # لا إدارة → لا وقف خسارة ولا أهداف!) — والآن WS يغطيها لأنها مثبتة في المركز
+            if stream_hub is not None and signals_to_check:
+                try:
+                    hub_live = stream_hub.get_prices([str(s['symbol']).upper() for s in signals_to_check])
+                    if hub_live:
+                        current_prices = {**current_prices, **hub_live}
+                except Exception as hub_price_err:
+                    logger.debug(f"[مدير الصفقات] تعذر جلب أسعار WS: {hub_price_err}")
             _, session_liquidity, _ = get_session_state()
 
             for signal in signals_to_check:
@@ -4529,6 +4539,11 @@ def main_loop_enhanced():
                         saved_signal = insert_signal_into_db(new_signal)
                         if saved_signal:
                             with signal_cache_lock: open_signals_cache[saved_signal['symbol']] = saved_signal
+                            # [V9.19.0] تثبيت فوري لتدفق WS للرمز المفتوح حديثًا — بدل انتظار
+                            # دورة الصيانة (≤60ث) كان أول دقيقة من الصفقة بلا سعر حي
+                            if stream_hub is not None:
+                                try: stream_hub.set_universe(validated_symbols_to_scan)
+                                except Exception: pass
                             if signal_source == 'filter_recommendation':
                                 # [V9.18.0] محاسبة التوصية المفتوحة (كليًا ولكل استراتيجية)
                                 with _scan_stats_lock:
@@ -4565,27 +4580,43 @@ def main_loop_enhanced():
         except Exception as main_err:
             log_and_notify("error", f"خطأ حرج في الحلقة الرئيسية: {main_err}", "SYSTEM"); time.sleep(120)
 
+def collect_price_symbols() -> List[str]:
+    """[V9.19.0] رموز النشر السعري: القائمة الديناميكية + الصفقات المفتوحة.
+    الجذر الحي للجمود: حلقة الأسعار كانت تنشر للقائمة الديناميكية فقط (20 رمزًا)
+    — أي صفقة مفتوحة خرجت من القائمة بعد تحديث الترشيح (كل 30د) كان سعرها
+    يتجمد في اللوحة وتهملها إدارة الصفقات تمامًا (لا TP/SL ولا وقف متحرك).
+    الصفقات المثبتة في مركز WS أصلًا (pinned) — الآن تُنشر أسعارها كذلك."""
+    syms = {str(s).upper() for s in (validated_symbols_to_scan or [])}
+    try:
+        with signal_cache_lock:
+            syms |= {str(s).upper() for s in open_signals_cache.keys()}
+    except Exception:
+        pass
+    return list(syms)
+
 def price_update_loop():
     if not redis_client: return
     while True:
         try:
-            # [تحسين V9.9] احترام فترة الحظر المؤقت بدل تكرار الطلبات المرفوضة
-            ban_remain = rate_guard.banned_until - time.time()
-            if ban_remain > 0:
-                time.sleep(min(ban_remain, 10.0)); continue
-            if validated_symbols_to_scan and client:
-                # [V9.16.0] الأسعار من مركز WebSocket أولًا (تحديث ~2ث بلا وزن — وتعمل أثناء الحظر)
-                prices_to_set = {}
+            # [V9.19.0] لا تفادي كامل للحلقة أثناء حظر REST بعد الآن: أسعار مركز
+            # WebSocket حية ومجانية وتعمل أثناء الحظر (لاحظ الحي: حظر 21 دقيقة
+            # واللمركز يرسل رسائل كل 0.1ث — كانت تُرمى وتتجمد اللوحة معها!)
+            # الحظر يحكم فقط احتياط REST أدناه.
+            if validated_symbols_to_scan or open_signals_cache:
+                # [V9.19.0] القائمة الديناميكية + الصفقات المفتوحة (كانت الأخيرة مهملة)
+                symbols_for_prices = collect_price_symbols()
+                prices_to_set: Dict[str, float] = {}
                 if stream_hub is not None:
-                    prices_to_set = stream_hub.get_prices(validated_symbols_to_scan)
-                missing = [s for s in validated_symbols_to_scan if s not in prices_to_set]
-                if missing and (rate_guard.banned_until - time.time()) <= 0:
+                    prices_to_set = stream_hub.get_prices(symbols_for_prices)
+                missing = [s for s in symbols_for_prices if s not in prices_to_set]
+                if missing and (rate_guard.banned_until - time.time()) <= 0 and client:
+                    # احتياط REST فقط (وزن 4 لطلب شامل) — لا يُلامس أثناء الحظر إطلاقًا
                     tickers = safe_get_symbol_ticker()
                     for t in tickers:
                         if t['symbol'] in missing:
                             prices_to_set[t['symbol']] = t['price']
                 if prices_to_set: redis_client.hset(REDIS_PRICES_HASH_NAME, mapping=prices_to_set)
-            time.sleep(max(2, PRICE_UPDATE_INTERVAL_SEC))
+            time.sleep(max(1.0, PRICE_UPDATE_INTERVAL_SEC))
         except Exception as e: logger.error(f"خطأ في حلقة تحديث الأسعار: {e}"); time.sleep(10)
 
 def initialize_bot_services():
