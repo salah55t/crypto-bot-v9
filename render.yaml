@@ -45,8 +45,9 @@ services:
       - key: USE_HTF_CONFIRMATION
         value: "True"
       # --- [V9.9.1] حماية من حظر Binance (-1003): ميزانية تكيفية + تبريد استئناف ---
+      # [V9.22.0] 1500→500: استهلاكنا الفعلي <2% من الميزانية — سقف متحفظ بلا أي كلفة
       - key: RATE_LIMIT_BUDGET_PER_MIN
-        value: "1500"
+        value: "500"
       - key: API_MIN_SPACING_SEC
         value: "0.15"
       - key: BAN_RESUME_COOLDOWN_SEC
@@ -93,3 +94,6 @@ services:
         value: "45"
       - key: PAIR_POOL_DISPLAY_SIZE
         value: "8"
+      # --- [V9.22.0] محرك الإدارة المثبت بالباك تيست (60 يومًا × 24 رمزًا: -85% ← +181%) ---
+      - key: ATR_TRAIL_ACTIVATE_PROFIT_PCT
+        value: "1.5"
