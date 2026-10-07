@@ -49,7 +49,7 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-APP_VERSION: str = 'V9.20.0'  # [V9.20.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
+APP_VERSION: str = 'V9.21.0'  # [V9.21.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
 logger = logging.getLogger(f'CryptoBot{APP_VERSION}')
 
 # زمن إقلاع العملية لحساب مدة التشغيل في لوحة التحكم
@@ -243,6 +243,10 @@ BAN_RESUME_RAMP_SEC: int = config('BAN_RESUME_RAMP_SEC', default=120, cast=int)
 # الاستجابة: الميزانية تهبط للأرضية مباشرة + تبريد استئناف ممتد + إشعار تليجرام
 # بموعد النهاية الفعلي بدل الضرب المتكرر أثناء الحظر
 BAN_LONG_THRESHOLD_SEC: int = config('BAN_LONG_THRESHOLD_SEC', default=600, cast=int)
+# [V9.21.0] استقلال طائرة البيانات عن حظر باينانس: المسح والبوصلة وخريطة القادة تُغذّى
+# من مركز WebSocket والمزودين البديلين (محصنة ضد الحظر) فتواصل العمل أثناء الحظر،
+# ويُؤجَّل التنفيذ الحقيقي فقط (الأوامر/الرصيد). False = السلوك القديم (تجميد كامل).
+SCAN_DURING_BAN: bool = config('SCAN_DURING_BAN', default=True, cast=bool)
 # فاصل تحديث أسعار Redis بالثواني — [V9.19.0] 5→2ث: النشر من مركز WebSocket داخل
 # العملية (صفر وزن شبكي) فالزمن الحقيقي أصبح مجانيًا — اللوحة والإدارة يقرآن أسعارًا بعمر ≤2ث
 PRICE_UPDATE_INTERVAL_SEC: int = config('PRICE_UPDATE_INTERVAL_SEC', default=2, cast=int)
@@ -745,13 +749,11 @@ def fetch_btc_trend_matrix(force: bool = False) -> Optional[Dict[str, Any]]:
         return data
 
 def btc_trend_loop():
-    """خيط خلفي: يحدّث بوصلة BTC دوريًا — يستثمر فترات الحظر ولا يزاحم المسح."""
+    """خيط خلفي: يحدّث بوصلة BTC دوريًا — [V9.21.0] لا يتوقف عند حظر باينانس:
+    مصادر البيانات (مركز WS + المزودون البديلون) محصنة ضد الحظر، وREST احتياط أخير فقط."""
     time.sleep(5)  # مهلة تهيئة العميل
     while True:
         try:
-            ban_remain = rate_guard.banned_until - time.time()
-            if ban_remain > 0:
-                time.sleep(min(ban_remain, 10.0)); continue
             if client:
                 fetch_btc_trend_matrix(force=True)
         except Exception as e:
@@ -804,13 +806,11 @@ def fetch_leader_data(force: bool = False) -> None:
             logger.debug(f"[خريطة القيادة] تعذر تحديث {sym}: {e}")
 
 def leader_data_loop():
-    """خيط خلفي: بيانات القادة كل LEADER_REFRESH_SEC — يستثمر فترات الحظر ولا يزاحم المسح."""
+    """خيط خلفي: بيانات القادة كل LEADER_REFRESH_SEC — [V9.21.0] لا يتوقف عند حظر
+    باينانس: الأغلاق من مركز WS والمزودين البديلين (محصنة ضد الحظر)."""
     time.sleep(8)  # مهلة تهيئة العميل
     while True:
         try:
-            ban_remain = rate_guard.banned_until - time.time()
-            if ban_remain > 0:
-                time.sleep(min(ban_remain, 10.0)); continue
             if client:
                 fetch_leader_data(force=True)
         except Exception as e:
@@ -958,6 +958,33 @@ def estimate_klines_weight(interval: str, lookback_str: str, limit: int = 1000) 
         return per_page * pages
     except Exception:
         return 15
+
+def get_entry_price_ban_aware(symbol: str, exec_blocked: bool = False) -> Optional[float]:
+    """[V9.21.0] سعر الدخول دون أن يحبس الحظر خيط المسح:
+    1) باينانس REST عند سماح الحالة (السعر المرجعي لمنصة التنفيذ)
+    2) مركز WebSocket — سعر باينانص حي (~2ث) بلا وزن ويعمل أثناء الحظر
+    3) المزودون البديلون (Bybit/OKX/Gate) — إغلاق شمعة 1م الجارية
+    يعيد None إن فشل الجميع فيتخطى الإشارة بدل التعلّق."""
+    if not exec_blocked:
+        try:
+            return float(safe_get_symbol_ticker(symbol=symbol)['price'])
+        except Exception as e:
+            logger.warning(f"⚠️ [{symbol}] فشل سعر باينانس ({str(e)[:80]}) — التحويل للمصادر البديلة...")
+    if stream_hub is not None:
+        try:
+            p = (stream_hub.get_prices([symbol.upper()]) or {}).get(symbol.upper())
+            if p and float(p) > 0:
+                return float(p)
+        except Exception:
+            pass
+    if data_feed is not None:
+        try:
+            kl = data_feed.get_klines(symbol, '1m', limit=2)
+            if kl:
+                return float(kl[-1][4])
+        except Exception:
+            pass
+    return None
 
 def safe_get_klines(symbol: str, interval: str, lookback_str: str, **kw):
     w = estimate_klines_weight(interval, lookback_str, limit=int(kw.get('limit', 1000)))
@@ -2300,7 +2327,9 @@ def fetch_historical_data(symbol: str, interval: str, days: int) -> Optional[pd.
                 klines = data_feed.get_klines(symbol, interval, limit=max(50, min(1000, n_candles)))
             except Exception:
                 klines = None
-        if not klines:
+        if not klines and (rate_guard.banned_until - time.time()) <= 0:
+            # [V9.21.0] احتياط REST فقط حين لا حظر — أثناء الحظر يمنع تعلّق خيط المسح
+            # في acquire() لساعات: يُعيد None فيُتخطى الرمز وتواصل الدورة عملها
             klines = safe_get_klines(symbol, interval, lookback_str)
         if not klines: return None
         cols = ['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_volume', 'trades', 'taker_buy_base', 'taker_buy_quote', 'ignore']
@@ -3209,8 +3238,13 @@ def passes_final_order_book_check(symbol: str, entry_price: float) -> bool:
 
         # [V9.20.0] عمق السوق من المزودين البديلين — النسب النسبية للعرض/الطلب صالحة عبر المنصات المتشابهة
         order_book = data_feed.get_order_book(symbol, ORDER_BOOK_DEPTH_LIMIT) if data_feed is not None else None
-        if not order_book:
+        if not order_book and (rate_guard.banned_until - time.time()) <= 0:
+            # [V9.21.0] احتياط REST فقط حين لا حظر — أثناء الحظر يُرفض الإشارة
+            # بدل تعليق خيط المسح في acquire() حتى نهاية الحظر
             order_book = safe_get_order_book(symbol, ORDER_BOOK_DEPTH_LIMIT)
+        if not order_book:
+            log_rejection(symbol, "Order Book Fetch Failed", {"error": "لا مصدر متاح (مركز WS/البدائل/REST أثناء الحظر)"})
+            return False
         bids = pd.DataFrame(order_book['bids'], columns=['price', 'qty'], dtype=float)
         asks = pd.DataFrame(order_book['asks'], columns=['price', 'qty'], dtype=float)
 
@@ -3754,6 +3788,7 @@ def get_dashboard_html():
                     <div class="sys-bar"><div id="sys-weight-bar" style="width:0%"></div></div>
                 </div>
                 <div class="flex items-center gap-2"><span class="text-text-secondary">الاتصال:</span><span id="sys-conn" class="font-mono">--</span></div>
+                <div class="flex items-center gap-2"><span class="text-text-secondary">التنفيذ:</span><span id="sys-exec" class="font-mono">--</span></div>
                 <div class="flex items-center gap-2"><span class="text-text-secondary">PnL اليوم:</span><span id="sys-pnl" class="font-mono">--</span></div>
                 <div class="flex items-center gap-2"><span class="text-text-secondary">قاطع الحماية:</span><span id="sys-lossguard" class="font-mono">--</span></div>
                 <div class="flex items-center gap-2"><span class="text-text-secondary">التخزين:</span><span id="sys-storage" class="font-mono text-accent-blue">--</span></div>
@@ -4149,6 +4184,10 @@ function updateSystemStatus() {
         if (rg.banned_until) { conn.textContent = 'محظور مؤقتًا'; conn.className = 'font-mono text-accent-red'; }
         else if (data.client_ready) { conn.textContent = 'متصل'; conn.className = 'font-mono text-accent-green'; }
         else { conn.textContent = 'غير مهيأ'; conn.className = 'font-mono text-accent-yellow'; }
+        // [V9.21.0] حالة التنفيذ: مؤجل أثناء حظر باينانس بينما المسح مستمر عبر البدائل
+        const execEl = document.getElementById('sys-exec');
+        if (data.exec_blocked) { execEl.textContent = data.scan_during_ban ? 'مؤجل (حظر) — المسح مستمر' : 'متوقف (حظر)'; execEl.className = 'font-mono text-accent-yellow'; }
+        else { execEl.textContent = 'حر'; execEl.className = 'font-mono text-accent-green'; }
         const pnl = document.getElementById('sys-pnl');
         pnl.textContent = `${data.daily_pnl_usdt} / -${data.daily_max_loss_usdt}$`;
         pnl.className = 'font-mono ' + (data.daily_pnl_usdt >= 0 ? 'text-accent-green' : 'text-accent-red');
@@ -4335,6 +4374,9 @@ def api_system_status():
             'version': APP_VERSION,
             'client_ready': bool(client),
             'rate_guard': snap,
+            # [V9.21.0] حالة التنفيذ: مؤجل أثناء حظر باينانس (المسح مستمر عبر البدائل)
+            'exec_blocked': snap.get('banned_until') is not None,
+            'scan_during_ban': bool(SCAN_DURING_BAN),
             # [V9.16.0] حالة مركز بيانات WebSocket للوحة التحكم
             'stream_hub': stream_hub.snapshot() if stream_hub is not None else {'enabled': False},
             'daily_pnl_usdt': pnl,
@@ -4965,12 +5007,17 @@ def main_loop_enhanced():
         try:
             logger.info("🔄 [الحلقة الرئيسية] بدء دورة مسح جديدة...")
 
-            # [تحسين V9.9] انتظار انتهاء الحظر المؤقت من Binance قبل بدء الدورة
+            # [V9.21.0] حظر باينانس لم يعد يوقف المسح: كل بيانات الدورة (شموع/تكه/عمق/بوصلة)
+            # من مركز WebSocket والمزودين البديلين وهي محصنة ضد الحظر. يُؤجَّل التنفيذ الحقيقي
+            # فقط (أوامر باينانس) وتُؤخذ أسعار الدخول من مصادر بديلة — انظر get_entry_price_ban_aware.
             ban_remain = rate_guard.banned_until - time.time()
-            if ban_remain > 0:
-                logger.warning(f"🚫 [الحلقة الرئيسية] حظر API ساري — الانتظار {int(ban_remain)} ثانية...")
+            exec_blocked = ban_remain > 0
+            if exec_blocked and not SCAN_DURING_BAN:
+                logger.warning(f"🚫 [الحلقة الرئيسية] حظر API ساري — الانتظار {int(ban_remain)} ثانية... (SCAN_DURING_BAN=False)")
                 time.sleep(min(ban_remain, 60.0))
                 continue
+            if exec_blocked:
+                logger.warning(f"🚫 [الحلقة الرئيسية] حظر باينانس ساري ({int(ban_remain)}ث) — المسح مستمر عبر التغذية البديلة والتنفيذ الحقيقي مؤجل")
 
             # [تحسين V9.8] قاطع الحماية اليومي: إيقاف فتح صفقات جديدة عند تجاوز حد الخسارة
             if is_daily_loss_limit_hit():
@@ -5112,8 +5159,11 @@ def main_loop_enhanced():
                                 'leader_trend_score': li.get('leader_trend_score')})
                             continue
 
-                        try: entry_price = float(safe_get_symbol_ticker(symbol=symbol)['price'])
-                        except Exception as e: logger.error(f"❌ [{symbol}] فشل جلب سعر الدخول: {e}."); continue
+                        # [V9.21.0] سعر الدخول بلا تعلّق أثناء الحظر: باينانس ← مركز WS ← البدائل
+                        entry_price = get_entry_price_ban_aware(symbol, exec_blocked=exec_blocked)
+                        if not entry_price:
+                            logger.error(f"❌ [{symbol}] فشل جلب سعر الدخول من كل المصادر.")
+                            continue
 
                         # --- [تحسين V9.8] فلاتر تأكيد مستوى الإشارة ---
                         # [V9.18.0] فلاتر توقيت الدخول (HTF/القمة/الزخم القصير) خاصة بإشارات
@@ -5162,6 +5212,11 @@ def main_loop_enhanced():
                                 k: leader_info.get(k) for k in ('leader', 'corr', 'leader_trend_score', 'leader_trend_label')}
 
                         with trading_status_lock: is_enabled = is_trading_enabled
+                        if is_enabled and exec_blocked:
+                            # [V9.21.0] التنفيذ الحقيقي ينتظر انتهاء الحظر — ولا صفقة ورقية
+                            # توهم موقعًا غير موجود على منصة التنفيذ
+                            log_rejection(symbol, "Execution Deferred (Binance Ban)", {'ban_remain_sec': int(ban_remain)})
+                            continue
                         if is_enabled:
                             quantity = calculate_position_size(symbol, entry_price, new_signal['stop_loss'])
                             if quantity and quantity > 0:

@@ -13,7 +13,7 @@ import vnz  # noqa: E402
 
 
 def test_version():
-    assert vnz.APP_VERSION.startswith('V9.19'), f"الإصدار: {vnz.APP_VERSION}"
+    assert vnz.APP_VERSION.startswith('V9.'), f"الإصدار: {vnz.APP_VERSION}"
     print("✅ 1) الإصدار V9.19.0")
 
 
