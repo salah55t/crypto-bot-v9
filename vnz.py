@@ -49,7 +49,7 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-APP_VERSION: str = 'V9.17.0'  # [V9.17.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
+APP_VERSION: str = 'V9.18.0'  # [V9.18.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
 logger = logging.getLogger(f'CryptoBot{APP_VERSION}')
 
 # زمن إقلاع العملية لحساب مدة التشغيل في لوحة التحكم
@@ -183,6 +183,21 @@ DEFAULT_STRATEGY_FILTER_PROFILE: Dict[str, Optional[float]] = {
 PAIR_MATCHING_ENABLED: bool = os.environ.get('PAIR_MATCHING_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
 PAIR_MATCH_MIN_SCORE: float = float(os.environ.get('PAIR_MATCH_MIN_SCORE', '45'))
 PAIR_POOL_DISPLAY_SIZE: int = int(os.environ.get('PAIR_POOL_DISPLAY_SIZE', '8'))
+
+# --- [V9.18.0] وضع التوصيات: اجتياز الفلاتر = توصية شراء مفتوحة تُدار كأي صفقة ---
+# طلب المستخدم الصريح: "العملات التي تجتاز الفلاتر تظهر في اللوحة كتوصيات شراء
+# ويقوم بتتبعها وتحديث أهدافها ووقف خسارتها كأنها صفقات مفتوحة".
+# التشخيص الحي (لوحة V9.17.0): 248 (زوج×استراتيجية) يجتازون سلسلة الفلاتر كاملة
+# (مطابقة النمط + الفلاتر الخاصة) لكن مُطلِق الشمعة الواحدة (التقاطع اللحظي)
+# لا يكتمل أبدًا في لحظة الفحص → 0 صفقة. الحل: أفضل اجتياز فلاتر في الدورة
+# يُفتح فورًا كتوصية شراء ورقية تدخل مسار الإدارة الكامل (تتبع/أهداف/وقف متحرك/إغلاق).
+RECOMMENDATIONS_ENABLED: bool = config('RECOMMENDATIONS_ENABLED', default=True, cast=bool)
+# أقصى توصيات فلاتر جديدة في الدورة الواحدة (بجانب إشارات المُطلِقات العادية)
+RECOMMENDATIONS_PER_CYCLE: int = config('RECOMMENDATIONS_PER_CYCLE', default=2, cast=int)
+# أدنى درجة مطابقة زوج (0-100) تؤهل الاجتياز للتحول إلى توصية — جودة قبل الكمية
+RECOMMENDATION_MIN_FIT_SCORE: float = config('RECOMMENDATION_MIN_FIT_SCORE', default=60.0, cast=float)
+# تهدئة بعد إغلاق أي صفقة لرمز معين: لا توصية جديدة لنفس الرمز خلالها (منع التأرجح)
+RECOMMENDATION_COOLDOWN_MIN: int = config('RECOMMENDATION_COOLDOWN_MIN', default=240, cast=int)
 
 REGIME_AR: Dict[str, str] = {
     'trend_up': 'اتجاه صاعد', 'trend_down': 'اتجاه هابط', 'range': 'نطاق مترنم',
@@ -361,6 +376,11 @@ _strategy_scan_stats: Dict[str, Counter] = defaultdict(lambda: Counter({'checks'
 # [V9.14.0] رفضات الفلتر الخاص بكل استراتيجية: {الاستراتيجية: {اسم الفلتر: عدد}}
 _strategy_filter_stats: Dict[str, Counter] = defaultdict(Counter)
 _scan_stats_lock = Lock()
+# [V9.18.0] إحصاء التوصيات المفتوحة من اجتياز الفلاتر (لللوحة):
+# opened = فُتحت فعليًا | gate_rejected = رفضتها بوابات التأكيد النهائية
+# cooldown_skipped = الرمز ضمن تهدئة ما بعد الإغلاق | below_min_score = درجة المطابقة دون الحد
+_recommendation_stats: Counter = Counter({'opened': 0, 'gate_rejected': 0, 'cooldown_skipped': 0, 'below_min_score': 0})
+_recent_close_ts: Dict[str, float] = {}   # رمز -> طابع زمني إغلاقه الأخير (تهدئة سريعة الذاكرة)
 current_market_state: Dict[str, Any] = {"overall_regime": "INITIALIZING", "trend_details_by_tf": {}, "last_updated": None}
 market_state_lock = Lock()
 last_market_state_check = 0
@@ -2808,6 +2828,8 @@ def close_signal(signal_id: int, closing_price: float, reason: str) -> bool:
             # حذف نهائي من الكاش — تحت القفل لحظة واحدة
             with signal_cache_lock:
                 open_signals_cache.pop(symbol_to_close, None)
+                # [V9.18.0] توثيق الإغلاق لتهدئة الرمز (لا توصية فورية بنفس الرمز)
+                _recent_close_ts[symbol_to_close] = time.time()
 
             log_and_notify('info', f"تم الإغلاق: {symbol_to_close} عند {closing_price:.4f}. السبب: {reason}. الربح/الخسارة: {profit_percentage:.2f}%", "TRADE_CLOSED")
             register_realized_pnl(signal_to_close, entry_price, closing_price)
@@ -2833,6 +2855,30 @@ def close_signal(signal_id: int, closing_price: float, reason: str) -> bool:
         # تحرير حارس الازدواجية في كل الحالات (نجاح/فشل/استثناء)
         with signal_cache_lock:
             _closing_signal_ids.discard(signal_id)
+
+
+def _symbol_recently_closed(symbol: str) -> bool:
+    """[V9.18.0] هل أُغلقت صفقة لهذا الرمز خلال نافذة التهدئة؟
+    توصيات الفلاتر بلا مُطلِق لحظي قد تعيد شراء الرمز نفسه فور إغلاقه (SL/TP)
+    فتتأرجح حول نفس السعر — التهدئة تمنع ذلك. الذاكرة أولًا (فورية)، وقاعدة
+    البيانات احتياط يصمد لإعادة التشغيل. الفشل الشبكي لا يمنع الدخول (يُسجل فقط)."""
+    cooldown_sec = RECOMMENDATION_COOLDOWN_MIN * 60
+    ts = _recent_close_ts.get(symbol)
+    if ts and (time.time() - ts) < cooldown_sec:
+        return True
+    try:
+        if check_db_connection() and conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT EXTRACT(EPOCH FROM (NOW() - closed_at)) AS sec "
+                    "FROM signals WHERE symbol = %s AND status = 'closed' AND closed_at IS NOT NULL "
+                    "ORDER BY closed_at DESC LIMIT 1", (symbol,))
+                row = cur.fetchone()
+                if row and row[0] is not None and float(row[0]) < cooldown_sec:
+                    return True
+    except Exception as cd_err:
+        logger.debug(f"[تهدئة الرمز] تعذر فحص قاعدة البيانات لـ {symbol}: {cd_err}")
+    return False
 
 def insert_signal_into_db(signal_data: Dict) -> Optional[Dict]:
     if not check_db_connection() or not conn: return None
@@ -2868,6 +2914,12 @@ def insert_signal_into_db(signal_data: Dict) -> Optional[Dict]:
             logger.info(f"💾 [{signal_data['symbol']}] تم حفظ الإشارة الجديدة في قاعدة البيانات.")
 
             trade_type = "حقيقية" if signal_data.get('is_real_trade') else "تجريبية"
+            # [V9.18.0] سطر المصدر: مُطلِق استراتيجية أو اجتياز فلاتر (توصية مفتوحة)
+            _src = signal_data['signal_details'].get('source')
+            _fit = signal_data['signal_details'].get('fit_score')
+            source_line = ("\n*المصدر:* 💡 اجتياز فلاتر الاستراتيجية (توصية مفتوحة)"
+                           + (f" — مطابقة {_fit:.0f}/100" if _fit is not None else "")) \
+                if _src == 'filter_recommendation' else "\n*المصدر:* مُطلِق الاستراتيجية"
             # [تحسين V9.13.0] سطر القائد التابع له في رسالة التوصية
             leader_info = signal_data['signal_details'].get('leader_info') or {}
             leader_line = (f"\n*القائد التابع له:* `{leader_info['leader']}` (ارتباط {float(leader_info.get('corr') or 0):.2f})"
@@ -2877,7 +2929,7 @@ def insert_signal_into_db(signal_data: Dict) -> Optional[Dict]:
                 f"*العملة:* `{signal_data['symbol']}`\n*الاستراتيجية:* `{signal_data['strategy_name'].replace('_', ' ')}`\n"
                 f"*سعر الدخول:* `{entry_price:.4f}`\n*الهدف الأول:* `{target_price:.4f}`\n"
                 f"*وقف الخسارة:* `{stop_loss:.4f}`\n*RR Ratio:* `{rr_ratio:.2f}`"
-                f"{leader_line}\n\n"
+                f"{source_line}{leader_line}\n\n"
                 f"Confidence: {signal_data['signal_details'].get('ML_Confidence', 'N/A')}"
             )
             send_telegram_message(telegram_message)
@@ -3350,7 +3402,7 @@ function updateSignals() {
 
             tableBody.innerHTML += `
             <tr class="border-b border-border-color hover:bg-white/5">
-                <td class="p-4 font-bold">${s.symbol}<br><span class="text-xs text-text-secondary">${s.strategy_name.replace(/_/g, ' ')}</span></td>
+                <td class="p-4 font-bold">${s.symbol}<br><span class="text-xs text-text-secondary">${s.strategy_name.replace(/_/g, ' ')}</span><br>${(() => { const src = s.signal_details && s.signal_details.source; const fit = s.signal_details && s.signal_details.fit_score; return src === 'filter_recommendation' ? `<span class="text-[10px] px-1.5 py-0.5 rounded border border-accent-green/40 text-accent-green">💡 توصية فلاتر${fit ? ' · ' + fit : ''}</span>` : `<span class="text-[10px] px-1.5 py-0.5 rounded border border-accent-blue/40 text-accent-blue">إشارة استراتيجية</span>`; })()}</td>
                 <td class="p-4 font-mono ${pClass}">${profit.toFixed(2)}%</td>
                 <td class="p-4 font-mono text-xs">
                     <div><span class="text-text-secondary">الدخول:</span> ${entry.toFixed(pricePrecision)}</div>
@@ -3842,6 +3894,7 @@ def api_rejection_summary():
             filters = dict(_filter_reject_stats)
             strategies = {name: dict(c) for name, c in _strategy_scan_stats.items()}
             strategy_filters = {name: dict(c) for name, c in _strategy_filter_stats.items()}
+            rec_stats = dict(_recommendation_stats)  # [V9.18.0] إحصاء التوصيات المفتوحة
         with rejection_logs_lock:
             recent = list(rejection_logs_cache)
 
@@ -3857,6 +3910,7 @@ def api_rejection_summary():
             strategy_rows.append({
                 'strategy': name, 'checks': checks, 'passes': passes,
                 'pass_rate_pct': round(passes / checks * 100, 2) if checks else 0.0,
+                'recommendations': s.get('recommendations', 0),  # [V9.18.0] توصيات فلاتر مفتوحة
                 'prefilter_rejects': prefilter_rejects,
                 'filter_breakdown': strategy_filters.get(name, {})
             })
@@ -3872,6 +3926,14 @@ def api_rejection_summary():
             'strategy_filters': strategy_filters,
             'recent_rejections_count': len(recent),
             'last_rejection_at': recent[0].get('timestamp') if recent else None,
+            # [V9.18.0] وضع التوصيات: العملات المجتازة للفلاتر تُفتح كصفقات مُدارة
+            'recommendations': {
+                'enabled': bool(RECOMMENDATIONS_ENABLED and PAIR_MATCHING_ENABLED),
+                'per_cycle': RECOMMENDATIONS_PER_CYCLE,
+                'min_fit_score': RECOMMENDATION_MIN_FIT_SCORE,
+                'cooldown_min': RECOMMENDATION_COOLDOWN_MIN,
+                **rec_stats,
+            },
         })
     except Exception as e:
         logger.error(f"❌ [API ملخص الرفض] خطأ: {e}", exc_info=True)
@@ -4280,6 +4342,8 @@ def main_loop_enhanced():
             symbols_to_process = random.sample(validated_symbols_to_scan, len(validated_symbols_to_scan))
             # [V9.17.0] ترشيحات هذه الدورة: الأزواج المطابقة لكل استراتيجية (تُنشر للوحة آخر الدورة)
             cycle_pair_scores: Dict[str, List[Dict[str, Any]]] = {}
+            # [V9.18.0] رصيد توصيات الفلاتر لهذه الدورة
+            recommendations_opened_this_cycle = 0
             total_batches = (len(symbols_to_process) + SYMBOL_PROCESSING_BATCH_SIZE - 1) // SYMBOL_PROCESSING_BATCH_SIZE
 
             for i in range(0, len(symbols_to_process), SYMBOL_PROCESSING_BATCH_SIZE):
@@ -4317,6 +4381,11 @@ def main_loop_enhanced():
                         regime_info = compute_symbol_regime(df_with_indicators)
 
                         signal_found, strategy_used = False, None
+                        # [V9.18.0] مصدر الإشارة ودرجة المطابقة (للعرض والتوثيق)
+                        signal_source, signal_fit_score = 'strategy_trigger', None
+                        # [V9.18.0] الاستراتيجيات التي اجتاز هذا الزوج فلاترها كاملة
+                        # (مطابقة النمط + الفلاتر الخاصة) دون اكتمال مُطلِق الشمعة
+                        filter_passed_candidates: List[Tuple[str, float]] = []
 
                         strategies_to_check = []
                         with macd_ema_strategy_lock:
@@ -4340,6 +4409,7 @@ def main_loop_enhanced():
                             with _scan_stats_lock: _strategy_scan_stats[name]['checks'] += 1
                             # [V9.17.0] بوابة مطابقة الزوج: لا فحص لاستراتيجية على زوج
                             # لا ينطبق نمطه السوقي على شخصيتها — ترشيح مخصص لكل استراتيجية
+                            fit_score: Optional[float] = None
                             if PAIR_MATCHING_ENABLED:
                                 fit_score = score_strategy_pair_fit(regime_info, name)
                                 if fit_score is None or fit_score < PAIR_MATCH_MIN_SCORE:
@@ -4357,41 +4427,71 @@ def main_loop_enhanced():
                             if check_func(df_with_indicators):
                                 with _scan_stats_lock: _strategy_scan_stats[name]['passes'] += 1
                                 signal_found, strategy_used = True, name
+                                signal_fit_score = fit_score
                                 break
+                            # [V9.18.0] الفلاتر اجتازت كاملة (مطابقة + خاصة) دون مُطلِق
+                            # الشمعة → مرشّح توصية شراء (يُختار الأفضل درجةً بعد الحلقة)
+                            filter_passed_candidates.append((name, float(fit_score) if fit_score is not None else 50.0))
+
+                        # --- [V9.18.0] وضع التوصيات: أفضل اجتياز فلاتر يصبح توصية شراء مفتوحة ---
+                        if (not signal_found and RECOMMENDATIONS_ENABLED and PAIR_MATCHING_ENABLED
+                                and filter_passed_candidates):
+                            if recommendations_opened_this_cycle >= RECOMMENDATIONS_PER_CYCLE:
+                                pass  # نفد رصيد الدورة — تبقى الترشيحات معروضة في /api/strategy_pairs
+                            else:
+                                rec_name, rec_score = max(filter_passed_candidates, key=lambda t: t[1])
+                                if rec_score < RECOMMENDATION_MIN_FIT_SCORE:
+                                    with _scan_stats_lock: _recommendation_stats['below_min_score'] += 1
+                                elif _symbol_recently_closed(symbol):
+                                    with _scan_stats_lock: _recommendation_stats['cooldown_skipped'] += 1
+                                    logger.info(f"⏳ [{symbol}] ضمن تهدئة ما بعد الإغلاق — لا توصية جديدة الآن")
+                                else:
+                                    signal_found, strategy_used = True, rec_name
+                                    signal_source, signal_fit_score = 'filter_recommendation', rec_score
+                                    logger.info(f"  -> [{symbol}] 💡 اجتياز فلاتر {rec_name} (مطابقة {rec_score:.0f}) → توصية شراء مفتوحة")
                         
                         if not signal_found:
                             continue
 
-                        logger.info(f"  -> [{symbol}] إشارة ناجحة من {strategy_used}. جاري التحقق النهائي...")
-                        
+                        logger.info(f"  -> [{symbol}] {'💡 توصية فلاتر' if signal_source == 'filter_recommendation' else 'إشارة ناجحة'} من {strategy_used}. جاري التحقق النهائي...")
+
                         # --- [تحسين V9.13.0] بوابة سلوك القائد: لا شراء تابع مقابل قائد هابط ---
+                        # [V9.18.0] تُطبق على التوصيات والإشارات معًا — نقيض القائد نقض للاثنين
                         leader_ok, leader_info = passes_leader_behavior_filter(symbol)
                         if not leader_ok:
                             li = leader_info or {}
+                            if signal_source == 'filter_recommendation':
+                                with _scan_stats_lock: _recommendation_stats['gate_rejected'] += 1
                             log_rejection(symbol, "Leader Behavior Veto", {
                                 'leader': li.get('leader'), 'corr': li.get('corr'),
                                 'leader_trend_score': li.get('leader_trend_score')})
                             continue
-                        
+
                         try: entry_price = float(safe_get_symbol_ticker(symbol=symbol)['price'])
                         except Exception as e: logger.error(f"❌ [{symbol}] فشل جلب سعر الدخول: {e}."); continue
 
                         # --- [تحسين V9.8] فلاتر تأكيد مستوى الإشارة ---
-                        if strategy_used == 'BB_Stoch_Reversal_Enhanced':
-                            # استراتيجية ارتدادية: تجنب الشراء عند قمة آخر 24 ساعة
-                            if not check_price_peak_filter(df_with_indicators, entry_price):
-                                continue
-                        elif USE_HTF_CONFIRMATION:
-                            # استراتيجيات الاتجاه/الاختراق: تأكيد الترند الصاعد على فريم الساعة (مع كاش 15 دقيقة)
-                            if not is_htf_bullish_confirmation_cached(symbol):
-                                log_rejection(symbol, "HTF Trend Confirmation Failed")
-                                continue
+                        # [V9.18.0] فلاتر توقيت الدخول (HTF/القمة/الزخم القصير) خاصة بإشارات
+                        # المُطلِقات — التوصية فعلها هو حكم الفلاتر نفسها، فتكفي بوابات:
+                        # القائد + دفتر الطلبات + قابلية حساب الهدف/الوقف
+                        if signal_source != 'filter_recommendation':
+                            if strategy_used == 'BB_Stoch_Reversal_Enhanced':
+                                # استراتيجية ارتدادية: تجنب الشراء عند قمة آخر 24 ساعة
+                                if not check_price_peak_filter(df_with_indicators, entry_price):
+                                    continue
+                            elif USE_HTF_CONFIRMATION:
+                                # استراتيجيات الاتجاه/الاختراق: تأكيد الترند الصاعد على فريم الساعة (مع كاش 15 دقيقة)
+                                if not is_htf_bullish_confirmation_cached(symbol):
+                                    log_rejection(symbol, "HTF Trend Confirmation Failed")
+                                    continue
 
-                        if USE_SHORT_TERM_MOMENTUM_FILTER and not passes_short_term_momentum_filter(symbol, df_with_indicators):
-                            log_rejection(symbol, "Short-Term Momentum Filter Failed")
-                            continue
+                            if USE_SHORT_TERM_MOMENTUM_FILTER and not passes_short_term_momentum_filter(symbol, df_with_indicators):
+                                log_rejection(symbol, "Short-Term Momentum Filter Failed")
+                                continue
 
                         if not passes_final_order_book_check(symbol, entry_price):
+                            if signal_source == 'filter_recommendation':
+                                with _scan_stats_lock: _recommendation_stats['gate_rejected'] += 1
                             continue
 
                         logger.info(f"  -> [{symbol}] ✅ نجح فلتر دفتر الطلبات. جاري تحضير الصفقة...")
@@ -4403,6 +4503,14 @@ def main_loop_enhanced():
                             'signal_details': {**tp_sl_data},
                             'entry_price': entry_price, **tp_sl_data
                         }
+                        # [V9.18.0] توثيق مصدر الإشارة (مُطلِق استراتيجية / اجتياز فلاتر) ودرجة
+                        # المطابقة والنمط السوقي — للعرض في اللوحة والتليجرام والتحليل اللاحق
+                        new_signal['signal_details']['source'] = signal_source
+                        if signal_fit_score is not None:
+                            new_signal['signal_details']['fit_score'] = round(float(signal_fit_score), 1)
+                        if regime_info:
+                            new_signal['signal_details']['regime'] = regime_info.get('regime')
+                            new_signal['signal_details']['regime_ar'] = REGIME_AR.get(regime_info.get('regime'), regime_info.get('regime'))
                         # [تحسين V9.13.0] توثيق القائد التابع له داخل تفاصيل الإشارة (تليجرام/لوحة)
                         if leader_info and leader_info.get('leader'):
                             new_signal['signal_details']['leader_info'] = {
@@ -4421,6 +4529,12 @@ def main_loop_enhanced():
                         saved_signal = insert_signal_into_db(new_signal)
                         if saved_signal:
                             with signal_cache_lock: open_signals_cache[saved_signal['symbol']] = saved_signal
+                            if signal_source == 'filter_recommendation':
+                                # [V9.18.0] محاسبة التوصية المفتوحة (كليًا ولكل استراتيجية)
+                                with _scan_stats_lock:
+                                    _recommendation_stats['opened'] += 1
+                                    _strategy_scan_stats[strategy_used]['recommendations'] += 1
+                                recommendations_opened_this_cycle += 1
                             log_and_notify('info', f"إشارة: إشارة شراء جديدة لـ {symbol} من استراتيجية {strategy_used}", "NEW_SIGNAL")
 
                     except Exception as e:
