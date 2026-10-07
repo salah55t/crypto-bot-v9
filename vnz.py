@@ -49,7 +49,7 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-APP_VERSION: str = 'V9.19.1'  # [V9.19.1] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
+APP_VERSION: str = 'V9.20.0'  # [V9.20.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
 logger = logging.getLogger(f'CryptoBot{APP_VERSION}')
 
 # زمن إقلاع العملية لحساب مدة التشغيل في لوحة التحكم
@@ -298,6 +298,18 @@ LEADER_SYMBOLS: List[str] = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT']
 LEADER_CORR_WINDOW: int = config('LEADER_CORR_WINDOW', default=192, cast=int)
 # أدنى ارتباط يُعتد به لتصنيف العملة "تابعة" لقائد — تحته تُصنف "مستقلة"
 LEADER_CORR_MIN: float = config('LEADER_CORR_MIN', default=0.30, cast=float)
+
+# --- [V9.20.0] طبقة البيانات متعددة المصادر: وداع ابتلاع وزن باينانس في جلب البيانات ---
+# بيانات السوق (شموع/تكه 24س/عمق السوق) تُجلب من منصات أسواقها مطابقة تقريبًا لباينانس
+# بحدود طلبات سخية: Bybit → OKX → Gate.io، وباينانس احتياط أخير عبر المسارات القديمة.
+# التنفيذ (أوامر/أرصدة/حالة الأوامر) يبقى على باينانس حصرًا دون أي تغيير.
+# 'multi' = تناوب المزودين مع تبريد تلقائي للمعطوب، 'binance_only' = السلوك القديم كاملًا.
+DATA_FEED_MODE: str = config('DATA_FEED_MODE', default='multi', cast=str)
+DATA_FEED_PROVIDERS: str = config('DATA_FEED_PROVIDERS', default='bybit,okx,gate', cast=str)
+DATA_FEED_TIMEOUT_SEC: int = config('DATA_FEED_TIMEOUT_SEC', default=8, cast=int)
+# عدد الإخفاقات المتتالية قبل تبريد المزود مؤقتًا (يفسح المجال لغيره)
+DATA_FEED_FAIL_THRESHOLD: int = config('DATA_FEED_FAIL_THRESHOLD', default=4, cast=int)
+DATA_FEED_COOLDOWN_SEC: int = config('DATA_FEED_COOLDOWN_SEC', default=300, cast=int)
 # عتبة رفض الشراء: درجة سلوك القائد تحتها (هابط/هابط قوي) تُرفض إشارات التابع
 LEADER_BEARISH_SCORE: float = config('LEADER_BEARISH_SCORE', default=-18.0, cast=float)
 # فترة تحديث بيانات القادة (شموع 15م لكل قائد — وزن 2 للقائد)
@@ -696,6 +708,11 @@ def fetch_btc_trend_matrix(force: bool = False) -> Optional[Dict[str, Any]]:
         for tf in BTC_TREND_TFS:
             # [V9.16.0] أغلاق BTC من مركز WebSocket أولًا — REST احتياطي فقط
             closes = stream_hub.get_closes(BTC_SYMBOL, tf, 150) if stream_hub is not None else None
+            if not closes and data_feed is not None:
+                # [V9.20.0] شموع القائد من المزودين البديلين — صفر وزن باينانس
+                kl = data_feed.get_klines(BTC_SYMBOL, tf, limit=150)
+                if kl:
+                    closes = [float(k[4]) for k in kl]
             if not closes:
                 klines = safe_api_call(client.get_klines, symbol=BTC_SYMBOL, interval=tf, limit=150, weight=2)
                 closes = [float(k[4]) for k in klines] if klines else []
@@ -751,6 +768,14 @@ def _fetch_leader_closes(symbol: str) -> List[float]:
     closes = stream_hub.get_closes(symbol, '15m', 300) if stream_hub is not None else None
     if closes:
         return closes
+    if data_feed is not None:
+        # [V9.20.0] شموع القادة من المزودين البديلين أولًا
+        try:
+            kl = data_feed.get_klines(symbol, '15m', limit=300)
+            if kl:
+                return [float(k[4]) for k in kl]
+        except Exception:
+            pass
     klines = safe_api_call(client.get_klines, symbol=symbol, interval='15m', limit=300, weight=2)
     if not klines:
         return []
@@ -954,6 +979,555 @@ def safe_get_exchange_info():
 def safe_get_order_book(symbol: str, limit: int = 100):
     w = 5 if limit <= 100 else 25
     return safe_api_call(client.get_order_book, symbol=symbol, limit=limit, weight=w)
+
+# ============================================================
+# [V9.20.0] طبقة البيانات متعددة المصادر — نهاية ابتلاع وزن باينانس
+# ------------------------------------------------------------
+# الفكرة: بيانات السوق (شموع/تكه 24س/عمق السوق) لا علاقة لها بالتنفيذ،
+# فتُجلب من منصات أسواقها مطابقة تقريبًا لباينانس وحدود طلباتها سخية:
+#   Bybit → OKX → Gate.io — وباينانس احتياط أخير عبر المسارات القديمة.
+# كل مزود يطبّع مخرجاته إلى صيغة Binance الأصلية (12 عمودًا للشموع،
+# مفاتيح ticker القياسية، {'bids','asks'} للعمق) فلا يتغير أي مستهلك لاحق.
+# عقد الواجهة: get_* تُعيد None عند تعذر كل المزودين → يستدعي الموقع
+# مسار باينانس القديم (تدهور رشيق دائمًا دون استثناءات).
+# ============================================================
+def lookback_to_candles(lookback_str: str, interval: str) -> int:
+    """[V9.20.0] يحوّل نص lookback ('800 hour') إلى عدد شموع لطلبات المزودين البديلين."""
+    interval_min = _INTERVAL_MINUTES.get(str(interval).lower(), 15)
+    m = re.match(r'\s*(\d+)\s*([a-zA-Z]+)', str(lookback_str))
+    if not m:
+        return 500
+    qty = int(m.group(1))
+    unit_min = _LOOKBACK_UNIT_MINUTES.get(m.group(2).lower(), 1440)
+    return max(50, min(1000, int(math.ceil(qty * unit_min / float(interval_min)))))
+
+class DataProvider:
+    """أساس مزود بيانات سوق خارجي — التطبيع إلى صيغة Binance هنا."""
+    name: str = 'base'
+    base_url: str = ''
+    # خريطة فريم البوت → فريم المنصة (الفريمات غير المدعومة تُحذف فيقرَ التالي)
+    INTERVAL_MAP: Dict[str, str] = {}
+
+    def to_symbol(self, symbol: str) -> Optional[str]:
+        return symbol
+
+    def supports(self, symbol: str, interval: str) -> bool:
+        return (self.to_symbol(symbol) is not None and str(interval).lower() in self.INTERVAL_MAP)
+
+    def _get_json(self, path: str, params: Optional[Dict[str, Any]] = None) -> Optional[Any]:
+        try:
+            r = requests.get(self.base_url + path, params=params or {},
+                             timeout=max(3, int(DATA_FEED_TIMEOUT_SEC)),
+                             headers={'User-Agent': 'crypto-bot-datafeed/9.20'})
+            if r.status_code != 200:
+                logger.debug(f"[تغذية البيانات:{self.name}] HTTP {r.status_code} من {path}")
+                return None
+            return r.json()
+        except Exception as e:
+            logger.debug(f"[تغذية البيانات:{self.name}] فشل {path}: {str(e)[:120]}")
+            return None
+
+    @staticmethod
+    def _interval_ms(interval: str) -> int:
+        return int(_INTERVAL_MINUTES.get(str(interval).lower(), 15)) * 60 * 1000
+
+    @staticmethod
+    def _f(v) -> Optional[float]:
+        try:
+            x = float(v)
+            return x if x == x and abs(x) != float('inf') else None
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _binance_row(cls, ts_ms, o, h, l, c, vol, qvol, interval: str) -> Optional[list]:
+        """صف شمعة موحّد بصيغة Binance (12 عمودًا) — يستقبله كل الكود القائم دون تعديل."""
+        try:
+            ts = int(ts_ms)
+        except (TypeError, ValueError):
+            return None
+        if ts <= 0:
+            return None
+        fo, fh, fl, fc, fv = (cls._f(x) for x in (o, h, l, c, vol))
+        if None in (fo, fh, fl, fc) or fv is None or min(fo, fh, fl, fc) <= 0:
+            return None
+        qv = cls._f(qvol)
+        return [ts, fo, fh, fl, fc, fv, ts + cls._interval_ms(interval) - 1,
+                qv if qv is not None else 0.0, 0, 0.0, 0.0, '0']
+
+    @staticmethod
+    def _ob_pairs(side) -> List[List[float]]:
+        out: List[List[float]] = []
+        for e in side or []:
+            try:
+                out.append([float(e[0]), float(e[1])])
+            except (TypeError, ValueError, IndexError):
+                continue
+        return out
+
+    # --- واجهة الجلب (تُطبق في كل مزود) ---
+    def fetch_klines(self, symbol: str, interval: str, limit: int = 300) -> Optional[List[list]]:
+        raise NotImplementedError
+
+    def fetch_all_24h_tickers(self) -> Optional[List[dict]]:
+        raise NotImplementedError
+
+    def fetch_order_book(self, symbol: str, limit: int = 25) -> Optional[Dict[str, list]]:
+        raise NotImplementedError
+
+    def fetch_symbols(self) -> Optional[Set[str]]:
+        raise NotImplementedError
+
+class BybitProvider(DataProvider):
+    """Bybit API v5 (spot) — أقرب أسواق لباينانس، حدود عامة سخية جدًا."""
+    name = 'bybit'
+    base_url = 'https://api.bybit.com'
+    INTERVAL_MAP = {'1m': '1', '3m': '3', '5m': '5', '15m': '15', '30m': '30',
+                    '1h': '60', '2h': '120', '4h': '240', '6h': '360', '12h': '720', '1d': 'D'}
+
+    def to_symbol(self, symbol: str) -> Optional[str]:
+        s = str(symbol)
+        return s if s.endswith('USDT') and len(s) > 4 else None
+
+    def fetch_klines(self, symbol: str, interval: str, limit: int = 300) -> Optional[List[list]]:
+        bsym, biv = self.to_symbol(symbol), self.INTERVAL_MAP.get(str(interval).lower())
+        if not bsym or not biv:
+            return None
+        lim = max(25, min(1000, int(limit)))
+        data = self._get_json('/v5/market/kline',
+                              {'category': 'spot', 'symbol': bsym, 'interval': biv, 'limit': lim})
+        if not isinstance(data, dict) or data.get('retCode') != 0:
+            return None
+        rows = (data.get('result') or {}).get('list') or []
+        out: List[list] = []
+        for r in rows:
+            try:
+                # r = [startMs, open, high, low, close, volume, turnover] — الأحدث أولًا
+                br = self._binance_row(r[0], r[1], r[2], r[3], r[4], r[5], r[6], interval)
+                if br:
+                    out.append(br)
+            except (TypeError, ValueError, IndexError):
+                continue
+        if not out:
+            return None
+        out.sort(key=lambda k: k[0])
+        return out[-lim:]
+
+    def fetch_all_24h_tickers(self) -> Optional[List[dict]]:
+        data = self._get_json('/v5/market/tickers', {'category': 'spot'})
+        if not isinstance(data, dict) or data.get('retCode') != 0:
+            return None
+        out: List[dict] = []
+        for t in (data.get('result') or {}).get('list') or []:
+            try:
+                last = self._f(t.get('lastPrice'))
+                if not last or last <= 0:
+                    continue
+                out.append({'symbol': t.get('symbol'),
+                            'lastPrice': last,
+                            'highPrice': self._f(t.get('highPrice24h')) or 0.0,
+                            'lowPrice': self._f(t.get('lowPrice24h')) or 0.0,
+                            'quoteVolume': self._f(t.get('turnover24h')) or 0.0,
+                            'priceChangePercent': (self._f(t.get('price24hPcnt')) or 0.0) * 100.0})
+            except (TypeError, ValueError):
+                continue
+        return out or None
+
+    def fetch_order_book(self, symbol: str, limit: int = 25) -> Optional[Dict[str, list]]:
+        bsym = self.to_symbol(symbol)
+        if not bsym:
+            return None
+        lim = max(1, min(200, int(limit)))
+        data = self._get_json('/v5/market/orderbook',
+                              {'category': 'spot', 'symbol': bsym, 'limit': lim})
+        if not isinstance(data, dict) or data.get('retCode') != 0:
+            return None
+        res = data.get('result') or {}
+        # Bybit v5 يعيد مفاتيح مختصرة 'b'/'a' (مدقق حيًا) — نقبل الصيغتين
+        bids = res.get('bids') or res.get('b')
+        asks = res.get('asks') or res.get('a')
+        if not bids or not asks:
+            return None
+        return {'bids': self._ob_pairs(bids), 'asks': self._ob_pairs(asks)}
+
+    def fetch_symbols(self) -> Optional[Set[str]]:
+        out: Set[str] = set()
+        cursor = ''
+        for _ in range(6):  # حتى ~6000 رمز
+            params: Dict[str, Any] = {'category': 'spot', 'limit': 1000}
+            if cursor:
+                params['cursor'] = cursor
+            data = self._get_json('/v5/market/instruments-info', params)
+            if not isinstance(data, dict) or data.get('retCode') != 0:
+                break
+            res = data.get('result') or {}
+            for s in res.get('list') or []:
+                if str(s.get('status', 'Trading')).lower() == 'trading' and s.get('symbol'):
+                    out.add(s['symbol'])
+            cursor = res.get('nextPageCursor') or ''
+            if not cursor:
+                break
+        return out or None
+
+class OKXProvider(DataProvider):
+    """OKX API v5 (spot) — موثوقة بشموع دقيقة؛ تعليم الرموز BTC-USDT."""
+    name = 'okx'
+    base_url = 'https://www.okx.com'
+    INTERVAL_MAP = {'1m': '1m', '3m': '3m', '5m': '5m', '15m': '15m', '30m': '30m',
+                    '1h': '1H', '2h': '2H', '4h': '4H', '6h': '6H', '12h': '12H', '1d': '1D'}
+
+    def to_symbol(self, symbol: str) -> Optional[str]:
+        s = str(symbol)
+        return f"{s[:-4]}-USDT" if s.endswith('USDT') and len(s) > 4 else None
+
+    def fetch_klines(self, symbol: str, interval: str, limit: int = 300) -> Optional[List[list]]:
+        inst, bar = self.to_symbol(symbol), self.INTERVAL_MAP.get(str(interval).lower())
+        if not inst or not bar:
+            return None
+        lim = max(25, min(1000, int(limit)))
+        # endpoint الحديث يعطي حتى 300 شمعة؛ النواقص تُستكمل من history-candles (100/صفحة)
+        data = self._get_json('/api/v5/market/candles',
+                              {'instId': inst, 'bar': bar, 'limit': min(300, lim)})
+        rows: list = []
+        if isinstance(data, dict) and str(data.get('code')) == '0' and isinstance(data.get('data'), list):
+            rows = list(data['data'])
+        tries = 0
+        while rows and len(rows) < lim and tries < 4:
+            tries += 1
+            try:
+                oldest = min(int(r[0]) for r in rows)
+            except (TypeError, ValueError):
+                break
+            hdata = self._get_json('/api/v5/market/history-candles',
+                                   {'instId': inst, 'bar': bar, 'after': oldest, 'limit': 100})
+            if not (isinstance(hdata, dict) and str(hdata.get('code')) == '0'
+                    and isinstance(hdata.get('data'), list) and hdata['data']):
+                break
+            rows.extend(hdata['data'])
+        if not rows:
+            return None
+        out: List[list] = []
+        for r in rows:
+            try:
+                # r = [ts, o, h, l, c, vol(base), volCcy, volCcyQuote, confirm]
+                qv = self._f(r[7])
+                if qv is None:
+                    qv = self._f(r[6]) or 0.0
+                br = self._binance_row(r[0], r[1], r[2], r[3], r[4], r[5], qv, interval)
+                if br:
+                    out.append(br)
+            except (TypeError, ValueError, IndexError):
+                continue
+        if not out:
+            return None
+        uniq = {k[0]: k for k in out}
+        return [uniq[k] for k in sorted(uniq)][-lim:]
+
+    def fetch_all_24h_tickers(self) -> Optional[List[dict]]:
+        data = self._get_json('/api/v5/market/tickers', {'instType': 'SPOT'})
+        if not (isinstance(data, dict) and str(data.get('code')) == '0'):
+            return None
+        out: List[dict] = []
+        for t in data.get('data') or []:
+            try:
+                last, open24 = self._f(t.get('last')), self._f(t.get('open24h'))
+                if not last or last <= 0:
+                    continue
+                pct = ((last - open24) / open24 * 100.0) if (open24 and open24 > 0) else 0.0
+                out.append({'symbol': str(t.get('instId', '')).replace('-', ''),
+                            'lastPrice': last,
+                            'highPrice': self._f(t.get('high24h')) or 0.0,
+                            'lowPrice': self._f(t.get('low24h')) or 0.0,
+                            'quoteVolume': self._f(t.get('volCcy24h')) or 0.0,
+                            'priceChangePercent': pct})
+            except (TypeError, ValueError, ZeroDivisionError):
+                continue
+        return out or None
+
+    def fetch_order_book(self, symbol: str, limit: int = 25) -> Optional[Dict[str, list]]:
+        inst = self.to_symbol(symbol)
+        if not inst:
+            return None
+        lim = max(1, min(400, int(limit)))
+        data = self._get_json('/api/v5/market/books', {'instId': inst, 'sz': lim})
+        if not (isinstance(data, dict) and str(data.get('code')) == '0' and data.get('data')):
+            return None
+        d = (data['data'] or [{}])[0]
+        if not d.get('bids') or not d.get('asks'):
+            return None
+        return {'bids': self._ob_pairs(d['bids']), 'asks': self._ob_pairs(d['asks'])}
+
+    def fetch_symbols(self) -> Optional[Set[str]]:
+        data = self._get_json('/api/v5/public/instruments', {'instType': 'SPOT'})
+        if not (isinstance(data, dict) and str(data.get('code')) == '0'):
+            return None
+        out = {str(t['instId']).replace('-', '') for t in data.get('data') or []
+               if t.get('state') == 'live' and t.get('instId')}
+        return out or None
+
+class GateProvider(DataProvider):
+    """Gate.io API v4 (spot) — أوسع تغطية أزواج؛ تعليم الرموز BTC_USDT.
+    لا يدعم 3m/2h/6h/12h — تُتخطى تلقائيًا لصالح غيره."""
+    name = 'gate'
+    base_url = 'https://api.gateio.ws/api/v4'
+    INTERVAL_MAP = {'1m': '1m', '5m': '5m', '15m': '15m', '30m': '30m',
+                    '1h': '1h', '4h': '4h', '8h': '8h', '1d': '1d'}
+
+    def to_symbol(self, symbol: str) -> Optional[str]:
+        s = str(symbol)
+        return f"{s[:-4]}_USDT" if s.endswith('USDT') and len(s) > 4 else None
+
+    def fetch_klines(self, symbol: str, interval: str, limit: int = 300) -> Optional[List[list]]:
+        pair, giv = self.to_symbol(symbol), self.INTERVAL_MAP.get(str(interval).lower())
+        if not pair or not giv:
+            return None
+        lim = max(25, min(1000, int(limit)))
+        data = self._get_json('/spot/candlesticks',
+                              {'currency_pair': pair, 'interval': giv, 'limit': lim})
+        if not isinstance(data, list) or not data:
+            return None
+        out: List[list] = []
+        for r in data:
+            try:
+                if isinstance(r, dict):
+                    # صيغة كائن (احتياط): حقول مسماة — sum=اقتباسي، volume=أساسي
+                    ts = int(r.get('time') or r.get('current') or 0)
+                    o, h, l, c = r.get('open'), r.get('high'), r.get('low'), r.get('close')
+                    qv_raw, bv_raw = r.get('sum'), r.get('volume')
+                else:
+                    # الصيغة الفعلية (مدققة حيًا): [t(ث), quote_vol, o, c, h, l, base_vol, done]
+                    ts = int(r[0])
+                    o, c, h, l = r[2], r[3], r[4], r[5]
+                    qv_raw, bv_raw = r[1], r[6]
+                if 0 < ts < 10**12:  # Gate يعيد ثوانٍ
+                    ts *= 1000
+                qv = self._f(qv_raw)
+                if qv is None:
+                    qv = self._f(bv_raw) or 0.0
+                br = self._binance_row(ts, o, h, l, c, bv_raw, qv, interval)
+                if br:
+                    out.append(br)
+            except (TypeError, ValueError, IndexError):
+                continue
+        if not out:
+            return None
+        uniq = {k[0]: k for k in out}
+        return [uniq[k] for k in sorted(uniq)][-lim:]
+
+    def fetch_all_24h_tickers(self) -> Optional[List[dict]]:
+        data = self._get_json('/spot/tickers')
+        if not isinstance(data, list) or not data:
+            return None
+        out: List[dict] = []
+        for t in data:
+            try:
+                last = self._f(t.get('last'))
+                if not last or last <= 0:
+                    continue
+                out.append({'symbol': str(t.get('currency_pair', '')).replace('_', ''),
+                            'lastPrice': last,
+                            'highPrice': self._f(t.get('high_24h')) or 0.0,
+                            'lowPrice': self._f(t.get('low_24h')) or 0.0,
+                            'quoteVolume': self._f(t.get('quote_volume')) or 0.0,
+                            'priceChangePercent': self._f(t.get('change_percentage')) or 0.0})
+            except (TypeError, ValueError):
+                continue
+        return out or None
+
+    def fetch_order_book(self, symbol: str, limit: int = 25) -> Optional[Dict[str, list]]:
+        pair = self.to_symbol(symbol)
+        if not pair:
+            return None
+        allowed = (5, 10, 20, 50, 100)
+        lim = min([x for x in allowed if x >= int(limit)] or [100])
+        data = self._get_json('/spot/order_book', {'currency_pair': pair, 'limit': lim})
+        if not isinstance(data, dict) or not data.get('bids') or not data.get('asks'):
+            return None
+        return {'bids': self._ob_pairs(data['bids']), 'asks': self._ob_pairs(data['asks'])}
+
+    def fetch_symbols(self) -> Optional[Set[str]]:
+        data = self._get_json('/spot/currency_pairs')
+        if not isinstance(data, list) or not data:
+            return None
+        out = {str(p['id']).replace('_', '') for p in data
+               if p.get('trade_status') == 'tradable' and p.get('id')}
+        return out or None
+
+_PROVIDER_REGISTRY: Dict[str, type] = {'bybit': BybitProvider, 'okx': OKXProvider, 'gate': GateProvider}
+
+class MultiSourceDataFeed:
+    """موجّه البيانات: يجرب المزودين بالترتيب المُعدّ، وعند فشلهم كلهم يُعيد None
+    ليمرّ الموقع القديم إلى مسار باينانس المعروف (الحارس/الميزانية/إعادة المحاولة)."""
+    def __init__(self):
+        self.providers: List[DataProvider] = []
+        self.coverage: Dict[str, Set[str]] = {}
+        self.health: Dict[str, Dict[str, Any]] = {}
+        self.stats: Counter = Counter()
+        self.lock = Lock()
+        self.last_source: Dict[str, str] = {'klines': 'binance', 'tickers': 'binance', 'orderbook': 'binance'}
+        for nm in [x.strip().lower() for x in str(DATA_FEED_PROVIDERS).split(',') if x.strip()]:
+            cls = _PROVIDER_REGISTRY.get(nm)
+            if cls is None:
+                logger.warning(f"🌐 [تغذية البيانات] مزود مجهول في الإعداد: {nm}")
+                continue
+            p = cls()
+            self.providers.append(p)
+            self.health[p.name] = {'ok': 0, 'fail': 0, 'consec_fail': 0,
+                                   'cooldown_until': 0.0, 'last_error': ''}
+            logger.info(f"🌐 [تغذية البيانات] مزود مفعّل: {p.name} ({p.base_url})")
+
+    def _enabled(self) -> bool:
+        return DATA_FEED_MODE == 'multi' and bool(self.providers)
+
+    def start_coverage_worker(self) -> None:
+        """خيط خلفي: يبني خريطة رموز كل مزود مرة واحدة عند الإقلاع (طلب لكل صفحة)."""
+        if not self._enabled():
+            return
+        Thread(target=self._coverage_loop, daemon=True).start()
+
+    def _coverage_loop(self) -> None:
+        time.sleep(4.0)  # مهلة اهتداء الشبكة
+        for attempt in range(4):
+            for p in self.providers:
+                if p.name in self.coverage:
+                    continue
+                try:
+                    syms = p.fetch_symbols()
+                except Exception as e:
+                    logger.debug(f"[تغذية البيانات] خريطة {p.name} فشلت: {e}")
+                    syms = None
+                if syms:
+                    with self.lock:
+                        self.coverage[p.name] = syms
+                    logger.info(f"🌐 [تغذية البيانات] خريطة رموز {p.name}: {len(syms)} زوج")
+            if len(self.coverage) >= len(self.providers):
+                return
+            time.sleep(45)
+        logger.warning("🌐 [تغذية البيانات] بعض خرائط الرموز غير مكتملة — وضع تفاؤلي (التجربة عند الطلب)")
+
+    def _record_ok(self, name: str) -> None:
+        with self.lock:
+            h = self.health[name]
+            h['ok'] += 1
+            h['consec_fail'] = 0
+            h['last_error'] = ''
+        self.stats[f'{name}_ok'] += 1
+
+    def _record_fail(self, name: str, err: str = '') -> None:
+        with self.lock:
+            h = self.health[name]
+            h['fail'] += 1
+            h['consec_fail'] += 1
+            h['last_error'] = str(err)[:140]
+            if h['consec_fail'] >= max(1, DATA_FEED_FAIL_THRESHOLD):
+                h['cooldown_until'] = time.time() + max(30, DATA_FEED_COOLDOWN_SEC)
+                h['consec_fail'] = 0
+                logger.warning(f"🌐 [تغذية البيانات] تبريد {name} لمدة {DATA_FEED_COOLDOWN_SEC}ث بعد فشل متكرر")
+        self.stats[f'{name}_fail'] += 1
+
+    def _healthy(self, name: str) -> bool:
+        with self.lock:
+            return time.time() >= self.health.get(name, {}).get('cooldown_until', 0.0)
+
+    def _covered(self, provider: DataProvider, bsym: str) -> bool:
+        with self.lock:
+            cov = self.coverage.get(provider.name)
+        if cov is None:
+            return True  # تفاؤل قبل اكتمال الخريطة
+        return bsym in cov
+
+    def _candidates(self, symbol: str, interval: Optional[str] = None) -> List[DataProvider]:
+        out: List[DataProvider] = []
+        for p in self.providers:
+            if not self._healthy(p.name):
+                continue
+            bsym = p.to_symbol(symbol)
+            if bsym is None:
+                continue
+            if interval is not None and str(interval).lower() not in p.INTERVAL_MAP:
+                continue
+            if not self._covered(p, bsym):
+                continue
+            out.append(p)
+        return out
+
+    def get_klines(self, symbol: str, interval: str, limit: int = 300) -> Optional[List[list]]:
+        """شموع بصيغة Binance (12 عمودًا) من أول مزود ينجح — None = احتياط باينانس."""
+        if not self._enabled():
+            return None
+        for p in self._candidates(symbol, interval):
+            try:
+                rows = p.fetch_klines(symbol, interval, limit)
+            except Exception as e:
+                rows = None
+                self._record_fail(p.name, f'klines استثناء: {e}')
+            if rows:
+                self._record_ok(p.name)
+                self.last_source['klines'] = p.name
+                self.stats['klines_served'] += 1
+                return rows
+            else:
+                self._record_fail(p.name, f'klines {symbol} {interval} فارغة/غير متاحة')
+        self.stats['klines_binance_fallback'] += 1
+        return None
+
+    def get_24h_tickers(self) -> Optional[List[dict]]:
+        """تكه 24 ساعة لكل السوق في طلب واحد مجاني (بديل وزن 80 لدى باينانس)."""
+        if not self._enabled():
+            return None
+        for p in self._candidates('BTCUSDT'):
+            try:
+                tk = p.fetch_all_24h_tickers()
+            except Exception as e:
+                tk = None
+                self._record_fail(p.name, f'tickers استثناء: {e}')
+            if tk:
+                self._record_ok(p.name)
+                self.last_source['tickers'] = p.name
+                self.stats['tickers_served'] += 1
+                return tk
+            else:
+                self._record_fail(p.name, 'tickers فارغة')
+        self.stats['tickers_binance_fallback'] += 1
+        return None
+
+    def get_order_book(self, symbol: str, limit: int = 25) -> Optional[Dict[str, list]]:
+        """عمق السوق بصيغة Binance — النِسَب النسبية للعرض/الطلب صالحة عبر المنصات المتشابهة."""
+        if not self._enabled():
+            return None
+        for p in self._candidates(symbol):
+            try:
+                ob = p.fetch_order_book(symbol, limit)
+            except Exception as e:
+                ob = None
+                self._record_fail(p.name, f'orderbook استثناء: {e}')
+            if ob and ob.get('bids') and ob.get('asks'):
+                self._record_ok(p.name)
+                self.last_source['orderbook'] = p.name
+                self.stats['orderbook_served'] += 1
+                return ob
+            else:
+                self._record_fail(p.name, f'orderbook {symbol} فارغ')
+        self.stats['orderbook_binance_fallback'] += 1
+        return None
+
+    def status_snapshot(self) -> Dict[str, Any]:
+        with self.lock:
+            provs = []
+            for p in self.providers:
+                h = self.health.get(p.name, {})
+                provs.append({'name': p.name, 'base_url': p.base_url,
+                              'intervals': sorted(p.INTERVAL_MAP.keys()),
+                              'symbols_mapped': len(self.coverage.get(p.name, []) or []),
+                              'ok': h.get('ok', 0), 'fail': h.get('fail', 0),
+                              'consec_fail': h.get('consec_fail', 0),
+                              'cooling_down': time.time() < h.get('cooldown_until', 0.0),
+                              'last_error': h.get('last_error', '')})
+        return {'mode': DATA_FEED_MODE, 'enabled': self._enabled(),
+                'providers': provs, 'stats': dict(self.stats),
+                'last_source': dict(self.last_source)}
+
+data_feed: Optional[MultiSourceDataFeed] = MultiSourceDataFeed()
 
 def safe_get_asset_balance(asset: str):
     return safe_api_call(client.get_asset_balance, asset=asset, weight=5)
@@ -1217,8 +1791,16 @@ class MarketStreamHub:
         lookback = self._backfill_lookback.get(iv)
         if not lookback:
             raise ValueError(f"لا lookback معرّف للفريم {iv}")
-        # safe_get_klines يمر عبر الحارس (يحترم الحظر والميزانية) — نفس مسار المسح القديم
-        klines = safe_get_klines(sym, iv, lookback)
+        klines = None
+        if data_feed is not None:
+            # [V9.20.0] تعبئة المركز من المزودين البديلين — باينانس احتياط أخير عبر الحارس
+            try:
+                klines = data_feed.get_klines(sym, iv, limit=lookback_to_candles(lookback, iv))
+            except Exception:
+                klines = None
+        if not klines:
+            # safe_get_klines يمر عبر الحارس (يحترم الحظر والميزانية) — نفس مسار المسح القديم
+            klines = safe_get_klines(sym, iv, lookback)
         if not klines:
             raise RuntimeError('REST أعاد بيانات فارغة')
         merged: Dict[int, tuple] = {}
@@ -1592,7 +2174,11 @@ def compute_dynamic_universe(size: Optional[int] = None) -> Tuple[List[str], Dic
     trading_usdt = {s for s, info in exchange_info_map.items()
                     if info.get('quoteAsset') == 'USDT' and info.get('status') == 'TRADING'}
     rows: List[Dict[str, Any]] = []
-    for t in safe_get_24h_stats():
+    # [V9.20.0] تكه 24 ساعة من المزودين البديلين (طلب مجاني واحد) — باينانس (وزن 80) احتياطًا
+    all_tickers = data_feed.get_24h_tickers() if data_feed is not None else None
+    if not all_tickers:
+        all_tickers = safe_get_24h_stats()
+    for t in all_tickers:
         sym = str(t.get('symbol', '') or '')
         if sym not in trading_usdt:
             continue
@@ -1706,7 +2292,16 @@ def fetch_historical_data(symbol: str, interval: str, days: int) -> Optional[pd.
     try:
         lookback_str = f"{days + 50} day" if 'd' in interval.lower() else f"{days * 24 + 200} hour"
         
-        klines = safe_get_klines(symbol, interval, lookback_str)
+        klines = None
+        if data_feed is not None:
+            # [V9.20.0] الشموع التاريخية للاستراتيجيات من المزودين البديلين أولًا
+            try:
+                n_candles = (days + 50) if 'd' in interval.lower() else (days * 24 + 200)
+                klines = data_feed.get_klines(symbol, interval, limit=max(50, min(1000, n_candles)))
+            except Exception:
+                klines = None
+        if not klines:
+            klines = safe_get_klines(symbol, interval, lookback_str)
         if not klines: return None
         cols = ['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_volume', 'trades', 'taker_buy_base', 'taker_buy_quote', 'ignore']
         df = pd.DataFrame(klines, columns=cols)
@@ -2612,7 +3207,10 @@ def passes_final_order_book_check(symbol: str, entry_price: float) -> bool:
         with order_book_ratio_lock:
              current_ratio_threshold = ORDER_BOOK_MIN_BID_ASK_RATIO
 
-        order_book = safe_get_order_book(symbol, ORDER_BOOK_DEPTH_LIMIT)
+        # [V9.20.0] عمق السوق من المزودين البديلين — النسب النسبية للعرض/الطلب صالحة عبر المنصات المتشابهة
+        order_book = data_feed.get_order_book(symbol, ORDER_BOOK_DEPTH_LIMIT) if data_feed is not None else None
+        if not order_book:
+            order_book = safe_get_order_book(symbol, ORDER_BOOK_DEPTH_LIMIT)
         bids = pd.DataFrame(order_book['bids'], columns=['price', 'qty'], dtype=float)
         asks = pd.DataFrame(order_book['asks'], columns=['price', 'qty'], dtype=float)
 
@@ -3087,7 +3685,7 @@ def get_dashboard_html():
         <header class="mb-6 flex flex-wrap justify-between items-center gap-4">
             <div>
                 <div dir="ltr" class="font-mono text-xs md:text-sm text-text-secondary mb-1">&gt;&gt; root@crypto-bot:~$ ./trading_engine --live --region=eu-frankfurt<span class="cursor"></span></div>
-                <h1 class="text-2xl md:text-3xl font-extrabold flicker"><span class="text-accent-green neon-text">لوحة تحكم</span> <span class="font-mono text-text-secondary text-lg md:text-xl" dir="ltr">{__VER__}//NEON</span></h1>
+                <h1 class="text-2xl md:text-3xl font-extrabold flicker"><span class="text-accent-green neon-text">لوحة تحكم</span> <span class="font-mono text-text-secondary text-lg md:text-xl" dir="ltr">{__VER__}//NEON</span> <span id="df-chip" class="font-mono text-xs px-2 py-0.5 rounded border border-gray-600 text-text-secondary" dir="ltr">FEED:…</span></h1>
             </div>
             <div id="trend-lights-container" class="flex items-center gap-x-6 bg-black/40 px-4 py-2 rounded-lg border border-border-color"></div>
         </header>
@@ -3676,8 +4274,24 @@ function saveSettings() {
     });
 }
 
+// [V9.20.0] شارة مصدر بيانات السوق (طبقة متعددة المصادر) — قراءة ذاكرة كل دقيقة
+const updateDataFeed = () => {
+    fetch('/api/datafeed').then(r => r.json()).then(d => {
+        const el = document.getElementById('df-chip');
+        if (!el || !d) return;
+        const st = d.stats || {};
+        const served = (st.klines_served || 0) + (st.tickers_served || 0) + (st.orderbook_served || 0);
+        const fb = (st.klines_binance_fallback || 0) + (st.tickers_binance_fallback || 0) + (st.orderbook_binance_fallback || 0);
+        const src = d.enabled ? String((d.last_source || {}).klines || 'binance').toUpperCase() : 'BINANCE';
+        el.textContent = 'FEED:' + src + ' ✓' + served + ' ↩' + fb;
+        el.style.color = (d.enabled && served > 0) ? '#34d399' : '#9ca3af';
+        el.title = d.enabled ? ('مصادر السوق: ' + (d.providers || []).map(p => p.name + (p.cooling_down ? ' (تبريد)' : ' (نشط)')).join('، ')) : 'وضع باينانس فقط';
+    }).catch(() => {});
+};
+
 document.addEventListener('DOMContentLoaded', () => {
     ['MarketStatus', 'Signals', 'Stats', 'Notifications', 'Rejections', 'SystemStatus', 'BtcTrend', 'LeaderMap'].forEach(f => window[`update${f}`]());
+    updateDataFeed();  // [V9.20.0] شارة مصدر البيانات
     // [تحسين V9.11.0] إيقاف الاستطلاع عند إخفاء التبويب — يمنع تراكم الطلبات
     // من التبويبات الخلفية ويخفف الضغط على خيوط الخادم (waitress queue)
     const whenVisible = (fn, ms) => setInterval(() => { if (!document.hidden) fn(); }, ms);
@@ -3685,6 +4299,7 @@ document.addEventListener('DOMContentLoaded', () => {
     whenVisible(updateNotifications, 15000); whenVisible(updateRejections, 15000); whenVisible(updateSystemStatus, 5000);
     whenVisible(updateBtcTrend, 30000);  // [تحسين V9.11] البوصلة تُحدّث كل 30 ثانية
     whenVisible(updateLeaderMap, 60000); // [تحسين V9.13.0] خريطة القيادة تُحدّث كل دقيقة (التصنيف بطيء التغير)
+    whenVisible(updateDataFeed, 60000);  // [V9.20.0] شارة مصدر البيانات كل دقيقة
 });
 </script>
 </body></html>
@@ -3777,6 +4392,14 @@ def get_market_status():
             "use_sr_breakout_strategy": use_sr_breakout,
         }
     })
+
+@app.route('/api/datafeed')
+def api_datafeed():
+    """[V9.20.0] حالة طبقة البيانات متعددة المصادر — قراءة ذاكرة فقط، بلا شبكة من خيوط الويب."""
+    try:
+        return jsonify(data_feed.status_snapshot())
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/btc_trend')
 def api_btc_trend():
@@ -4644,6 +5267,11 @@ def initialize_bot_services():
             stream_hub.start()
         except Exception as hub_start_err:
             logger.warning(f"🛰️ [مركز البيانات] تعذر الإطلاق — REST فقط: {hub_start_err}")
+    # [V9.20.0] بناء خريطة تغطية رموز المزودين البديلين في الخلفية (طلب واحد لكل مزود)
+    try:
+        data_feed.start_coverage_worker()
+    except Exception as df_err:
+        logger.warning(f"🌐 [تغذية البيانات] تعذر بدء خريطة التغطية: {df_err}")
     try:
         init_db()
         init_redis()
