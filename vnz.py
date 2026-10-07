@@ -49,7 +49,7 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-APP_VERSION: str = 'V9.21.0'  # [V9.21.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
+APP_VERSION: str = 'V9.22.0'  # [V9.21.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
 logger = logging.getLogger(f'CryptoBot{APP_VERSION}')
 
 # زمن إقلاع العملية لحساب مدة التشغيل في لوحة التحكم
@@ -230,7 +230,9 @@ pair_pools_lock = Lock()
 # --- [تحسين V9.9.1] إعدادات حماية الحظر من Binance (خطأ -1003) ---
 # حد Binance الرسمي 6000 وزن/دقيقة لكل IP — وعلى Render المجاني الـ IP مشترك مع خدمات أخرى،
 # لذا الميزانية الافتراضية متحفظة (1500) وتنخفض تلقائيًا 40% عند كل حظر ثم تتعافى تدريجيًا
-RATE_LIMIT_BUDGET_PER_MIN: int = config('RATE_LIMIT_BUDGET_PER_MIN', default=1500, cast=int)
+RATE_LIMIT_BUDGET_PER_MIN: int = config('RATE_LIMIT_BUDGET_PER_MIN', default=500, cast=int)
+# [V9.22.0] 1500→500: المراقبة أثبتت أن استهلاكنا <2% من الميزانية، والتعافي حتى 1410
+# على IP مسموم من الجيران بلا فائدة — سقف متحفظ يمنع أي انفجار وزن من جانبنا
 # الفاصل الأدنى بالثواني بين أي طلبين REST متتاليين
 API_MIN_SPACING_SEC: float = config('API_MIN_SPACING_SEC', default=0.15, cast=float)
 # تبريد إضافي (ثوانٍ) بعد انتهاء الحظر قبل استئناف الطلبات — يمنع انفجار الخيوط
@@ -359,7 +361,14 @@ ORDER_BOOK_DEPTH_LIMIT: int = 100
 ORDER_BOOK_ANALYSIS_RANGE_PCT: float = 0.005
 USE_ATR_TRAILING_STOP: bool = True
 ATR_TS_PERIOD: int = 14
-ATR_TS_MULTIPLIER: float = 2.2
+# [V9.22.0] باك تيست 60 يومًا × 24 رمزًا (نفس منطق المنتج حرفيًا):
+# الأساس (2.2 من أول قمة): صافي -85%، PF 0.94 — التفعيل بعد +1.5% + مضاعف 2.8: صافي +181%، PF 1.18
+# موجب في الشرائح الزمنية الثلاث ويصمد مع رسوم 0.3%. التفاصيل: scripts/bt_run.py
+ATR_TS_MULTIPLIER: float = 2.8
+# [V9.22.0] حد ربح أدنى لتفعيل الوقف المتحرك: لا يُرفع الوقف قبل أن تبلوغ القمة
+# هذا الحد فوق سعر الدخول (0 = السلوك القديم). كان الرفع من أول قمة غبارية
+# يُغلق الرابحين مبكرًا (+0.03→+0.74) ويستنزف بالدوران والرسوم
+ATR_TRAIL_ACTIVATE_PROFIT_PCT: float = config('ATR_TRAIL_ACTIVATE_PROFIT_PCT', default=1.5, cast=float)
 
 # --- متغيرات الحالة والكاش ---
 conn: Optional[psycopg2.extensions.connection] = None
@@ -433,8 +442,9 @@ class BinanceRateGuard:
     2) انفجار الخيوط فور انتهاء الحظر Thundering Herd → تبريد استئناف + تدرج في الفاصل
     3) ميزانية ثابتة تعيد ضرب الحظر على IP مشترك (Render مجاني) → ميزانية تكيفية:
        تنخفض 40% عند كل حظر وتتعافى 8% كل 3 دقائق نظيفة حتى المستوى المُعدّ."""
-    def __init__(self, budget_per_min: int = 1500, min_spacing: float = 0.15):
-        self.configured_budget = max(400, int(budget_per_min))
+    def __init__(self, budget_per_min: Optional[int] = None, min_spacing: float = 0.15):
+        # [V9.22.0] الافتراضي من الإعداد لا قيمة قديمة مضمّنة (كانت 1500)
+        self.configured_budget = max(400, int(budget_per_min if budget_per_min is not None else RATE_LIMIT_BUDGET_PER_MIN))
         self.budget = self.configured_budget
         self.budget_floor = max(300, int(self.configured_budget * 0.25))
         self.min_spacing = max(0.0, float(min_spacing))
@@ -1026,7 +1036,8 @@ def lookback_to_candles(lookback_str: str, interval: str) -> int:
         return 500
     qty = int(m.group(1))
     unit_min = _LOOKBACK_UNIT_MINUTES.get(m.group(2).lower(), 1440)
-    return max(50, min(1000, int(math.ceil(qty * unit_min / float(interval_min)))))
+    # [V9.22.0] السقف 1000→5000: المزود يدعم الآن الترقيم الرجعي — العمق الكامل يُطلب فعلًا
+    return max(50, min(5000, int(math.ceil(qty * unit_min / float(interval_min)))))
 
 class DataProvider:
     """أساس مزود بيانات سوق خارجي — التطبيع إلى صيغة Binance هنا."""
@@ -1116,25 +1127,47 @@ class BybitProvider(DataProvider):
         s = str(symbol)
         return s if s.endswith('USDT') and len(s) > 4 else None
 
+    # [V9.22.0] سقف الصفحة الواحدة لدى Bybit — الأعمق من ذلك يُجلب بترقيم صفحات رجعي
+    _PAGE_MAX = 1000
+
     def fetch_klines(self, symbol: str, interval: str, limit: int = 300) -> Optional[List[list]]:
         bsym, biv = self.to_symbol(symbol), self.INTERVAL_MAP.get(str(interval).lower())
         if not bsym or not biv:
             return None
-        lim = max(25, min(1000, int(limit)))
-        data = self._get_json('/v5/market/kline',
-                              {'category': 'spot', 'symbol': bsym, 'interval': biv, 'limit': lim})
-        if not isinstance(data, dict) or data.get('retCode') != 0:
-            return None
-        rows = (data.get('result') or {}).get('list') or []
+        lim = max(25, min(5000, int(limit)))
         out: List[list] = []
-        for r in rows:
-            try:
-                # r = [startMs, open, high, low, close, volume, turnover] — الأحدث أولًا
-                br = self._binance_row(r[0], r[1], r[2], r[3], r[4], r[5], r[6], interval)
-                if br:
-                    out.append(br)
-            except (TypeError, ValueError, IndexError):
-                continue
+        seen: Set[int] = set()
+        end_ms: Optional[int] = None
+        # [V9.22.0] كان القص الصامت عند 1000 يمنع بلوغ هدف تدفئة مركز WebSocket
+        # (3680 شمعة 15م = عمق 30 يومًا) فتعُلّق buffers_warm عند 1/37 وتتحول كل
+        # القراءات إلى REST احتياطي (~119/ساعة). الترقيم الرجعي يعيد العمق الكامل
+        for _page in range(max(1, -(-lim // self._PAGE_MAX))):
+            params: Dict[str, Any] = {'category': 'spot', 'symbol': bsym, 'interval': biv,
+                                      'limit': max(1, min(self._PAGE_MAX, lim - len(out)))}
+            if end_ms is not None:
+                params['end'] = int(end_ms)
+            data = self._get_json('/v5/market/kline', params)
+            if not isinstance(data, dict) or data.get('retCode') != 0:
+                break
+            rows = (data.get('result') or {}).get('list') or []
+            if not rows:
+                break
+            page_oldest = None
+            for r in rows:
+                try:
+                    ot = int(r[0])
+                    if ot in seen:
+                        continue
+                    seen.add(ot)
+                    br = self._binance_row(r[0], r[1], r[2], r[3], r[4], r[5], r[6], interval)
+                    if br:
+                        out.append(br)
+                    page_oldest = ot if page_oldest is None else min(page_oldest, ot)
+                except (TypeError, ValueError, IndexError):
+                    continue
+            if page_oldest is None or len(out) >= lim:
+                break
+            end_ms = page_oldest - 1
         if not out:
             return None
         out.sort(key=lambda k: k[0])
@@ -1606,12 +1639,12 @@ class MarketStreamHub:
         self._target_count: Dict[str, int] = {
             '15m': (SIGNAL_GENERATION_LOOKBACK_DAYS * 24 + 200) * 4,
             '1h': (htf_days * 24 + 200),
-            '4h': 200,
+            '4h': 320,  # [V9.22.0] 200→320: بوصلة BTC تستدعي days=20 ← (20*24+200)*60/240
         }
         self._backfill_lookback: Dict[str, str] = {
             '15m': f"{SIGNAL_GENERATION_LOOKBACK_DAYS * 24 + 200} hour",
             '1h': f"{htf_days * 24 + 200} hour",
-            '4h': '800 hour',
+            '4h': '1300 hour',  # [V9.22.0] 800→1300: يغطي هدف 320 شمعة
         }
         self._maxlen: Dict[str, int] = {'15m': STREAM_HUB_BUFFER_15M, '1h': STREAM_HUB_BUFFER_1H}
 
@@ -2323,8 +2356,15 @@ def fetch_historical_data(symbol: str, interval: str, days: int) -> Optional[pd.
         if data_feed is not None:
             # [V9.20.0] الشموع التاريخية للاستراتيجيات من المزودين البديلين أولًا
             try:
-                n_candles = (days + 50) if 'd' in interval.lower() else (days * 24 + 200)
-                klines = data_feed.get_klines(symbol, interval, limit=max(50, min(1000, n_candles)))
+                if 'd' in interval.lower():
+                    n_candles = days + 50
+                else:
+                    # [V9.22.0] العمق الحقيقي بالشموع: كان يُطلب 920 شمعة فقط لفريم 15م
+                    # (الخلط بين الساعات والشموع) بينما العمق المصمم ~3680 = 30 يومًا —
+                    # مع الترقيم الرجعي في BybitProvider استُعيد العمق الكامل بمطابقة المركز
+                    iv_min = _INTERVAL_MINUTES.get(str(interval).lower(), 15)
+                    n_candles = ((days * 24 + 200) * 60) // iv_min
+                klines = data_feed.get_klines(symbol, interval, limit=max(50, min(5000, n_candles)))
             except Exception:
                 klines = None
         if not klines and (rate_guard.banned_until - time.time()) <= 0:
@@ -4973,12 +5013,19 @@ def trade_management_loop():
                 if new_peak > peak_price:
                     signal['current_peak_price'] = new_peak
                     if USE_ATR_TRAILING_STOP:
-                        # [تحسين V9.8] استخدام كاش ATR (60 ثانية) بدلاً من جلب الشموع مع كل تحديث للسعر
-                        latest_atr = get_cached_atr(symbol)
-                        if latest_atr and latest_atr > 0:
-                            new_trailing_stop_price = new_peak - (latest_atr * ATR_TS_MULTIPLIER)
-                            if new_trailing_stop_price > sl:
-                                signal['stop_loss'] = new_trailing_stop_price
+                        # [V9.22.0] بوت التفعيل: لا يُرفع الوقف المتحرك قبل أن تبلوغ القمة
+                        # حد ربح أدنى (ATR_TRAIL_ACTIVATE_PROFIT_PCT). الرفع من أول قمة
+                        # غبارية كان يخنق الرابحين ويضخم الدوران — الباك تيست 60 يومًا:
+                        # هذه البوابة + المضاعف 2.8 قلبت الصافي من -85% إلى +181%
+                        trail_ok = (ATR_TRAIL_ACTIVATE_PROFIT_PCT <= 0) or \
+                                   (new_peak >= entry * (1.0 + ATR_TRAIL_ACTIVATE_PROFIT_PCT / 100.0))
+                        if trail_ok:
+                            # [تحسين V9.8] استخدام كاش ATR (60 ثانية) بدلاً من جلب الشموع مع كل تحديث للسعر
+                            latest_atr = get_cached_atr(symbol)
+                            if latest_atr and latest_atr > 0:
+                                new_trailing_stop_price = new_peak - (latest_atr * ATR_TS_MULTIPLIER)
+                                if new_trailing_stop_price > sl:
+                                    signal['stop_loss'] = new_trailing_stop_price
 
                     with signal_cache_lock: open_signals_cache[symbol] = signal
                     try:

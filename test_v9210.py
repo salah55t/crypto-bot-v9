@@ -15,10 +15,12 @@ import vnz  # noqa: E402
 
 
 def test_version_and_dashboard():
-    assert vnz.APP_VERSION == 'V9.21.0', f"الإصدار: {vnz.APP_VERSION}"
+    # [V9.22.0] مرن عبر الإصدارات: V9.* — الرقم المصدر APP_VERSION نفسه
+    import re as _re
+    assert _re.match(r'^V9\.\d+\.\d+$', vnz.APP_VERSION), f"الإصدار: {vnz.APP_VERSION}"
     html = vnz.get_dashboard_html()
-    assert 'V9.21.0' in html and 'sys-exec' in html
-    print("✅ 1) الإصدار V9.21.0 + شارة حالة التنفيذ في شريط المراقبة")
+    assert vnz.APP_VERSION in html and 'sys-exec' in html
+    print(f"✅ 1) الإصدار {vnz.APP_VERSION} + شارة حالة التنفيذ في شريط المراقبة")
 
 
 def test_scan_during_ban_config():

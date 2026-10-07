@@ -45,9 +45,9 @@ def test_symbol_conversion_and_intervals():
 def test_lookback_to_candles():
     assert vnz.lookback_to_candles('800 hour', '4h') == 200
     assert vnz.lookback_to_candles('2 day', '1h') == 50   # أرضية 50 شمعة
-    big = vnz.lookback_to_candles('496 hour', '15m')  # 1984 → سقف 1000
-    assert big == 1000
-    print("✅ 4) تحويل lookback إلى عدد شموع (بأرضية وسقف آمنين)")
+    big = vnz.lookback_to_candles('496 hour', '15m')  # 1984 — [V9.22.0] السقف 1000→5000 (الترقيم الرجعي)
+    assert big == 1984
+    print("✅ 4) تحويل lookback إلى عدد شموع (بأرضية وسقف 5000 مع الترقيم)")
 
 
 def test_bybit_kline_normalization():
