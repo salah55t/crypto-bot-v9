@@ -49,7 +49,7 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-APP_VERSION: str = 'V9.19.0'  # [V9.19.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
+APP_VERSION: str = 'V9.19.1'  # [V9.19.1] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
 logger = logging.getLogger(f'CryptoBot{APP_VERSION}')
 
 # زمن إقلاع العملية لحساب مدة التشغيل في لوحة التحكم
@@ -381,6 +381,7 @@ _scan_stats_lock = Lock()
 # cooldown_skipped = الرمز ضمن تهدئة ما بعد الإغلاق | below_min_score = درجة المطابقة دون الحد
 _recommendation_stats: Counter = Counter({'opened': 0, 'gate_rejected': 0, 'cooldown_skipped': 0, 'below_min_score': 0})
 _recent_close_ts: Dict[str, float] = {}   # رمز -> طابع زمني إغلاقه الأخير (تهدئة سريعة الذاكرة)
+_last_cache_reconcile: float = 0.0        # [V9.19.1] آخر مصالحة كاش الصفقات الفارغ
 current_market_state: Dict[str, Any] = {"overall_regime": "INITIALIZING", "trend_details_by_tf": {}, "last_updated": None}
 market_state_lock = Lock()
 last_market_state_check = 0
@@ -4147,6 +4148,7 @@ def get_cached_atr(symbol: str) -> Optional[float]:
         return cached[1] if cached else None
 
 def trade_management_loop():
+    global _last_cache_reconcile
     logger.info("✅ [مدير الصفقات] بدء حلقة إدارة الصفقات...")
     while True:
         try:
@@ -4160,6 +4162,16 @@ def trade_management_loop():
 
             if not has_signals or not redis_client:
                 time.sleep(5)  # النوم خارج القفل الآن
+                # [V9.19.1] مصالحة دورية للكاش الفارغ: إقلاع بارد فشل فيه التحميل
+                # الأولي (قاعدة باردة + حظر REST) يترك صفقات مفتوحة يتيمة في قاعدة
+                # البيانات — غير مرئية في اللوحة وغير مُدارة. كل 60ث محاولة خفيفة
+                # (استعلام واحد) حتى يظهر الكاش أو يثبت أن لا صفقات فعلًا.
+                if not has_signals and redis_client and (time.time() - _last_cache_reconcile) >= 60:
+                    _last_cache_reconcile = time.time()
+                    try:
+                        load_open_signals_to_cache(retries=1, delay=0)
+                    except Exception as rec_err:
+                        logger.warning(f"⚠️ [مصالحة الكاش] فشل محاولة المواءمة: {rec_err}")
                 continue
 
             current_prices = redis_client.hgetall(REDIS_PRICES_HASH_NAME)
@@ -4581,12 +4593,15 @@ def main_loop_enhanced():
             log_and_notify("error", f"خطأ حرج في الحلقة الرئيسية: {main_err}", "SYSTEM"); time.sleep(120)
 
 def collect_price_symbols() -> List[str]:
-    """[V9.19.0] رموز النشر السعري: القائمة الديناميكية + الصفقات المفتوحة.
+    """[V9.19.0] رموز النشر السعري: القائمة الديناميكية + الصفقات المفتوحة + القادة.
     الجذر الحي للجمود: حلقة الأسعار كانت تنشر للقائمة الديناميكية فقط (20 رمزًا)
     — أي صفقة مفتوحة خرجت من القائمة بعد تحديث الترشيح (كل 30د) كان سعرها
     يتجمد في اللوحة وتهملها إدارة الصفقات تمامًا (لا TP/SL ولا وقف متحرك).
-    الصفقات المثبتة في مركز WS أصلًا (pinned) — الآن تُنشر أسعارها كذلك."""
+    الصفقات المثبتة في مركز WS أصلًا (pinned) — الآن تُنشر أسعارها كذلك.
+    [V9.19.1] القادة (BTC/ETH/SOL) مثبتة منذ الإقلاع — بوصلة BTC والسعر العلوي
+    يعملان حتى أثناء حظر وقبل تحميل القائمة الديناميكية."""
     syms = {str(s).upper() for s in (validated_symbols_to_scan or [])}
+    syms |= {str(s).upper() for s in LEADER_SYMBOLS}
     try:
         with signal_cache_lock:
             syms |= {str(s).upper() for s in open_signals_cache.keys()}

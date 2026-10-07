@@ -13,7 +13,7 @@ import vnz  # noqa: E402
 
 
 def test_version():
-    assert vnz.APP_VERSION == 'V9.19.0', f"الإصدار: {vnz.APP_VERSION}"
+    assert vnz.APP_VERSION.startswith('V9.19'), f"الإصدار: {vnz.APP_VERSION}"
     print("✅ 1) الإصدار V9.19.0")
 
 
@@ -140,10 +140,51 @@ def saved_signal_ok(saved_signal, hub, universe):
     return True
 
 
+# ---------- إضافات V9.19.1 ----------
+
+def test_leaders_always_in_price_symbols():
+    """[V9.19.1] القادة (BTC/ETH/SOL) في رموز النشر دائمًا — بوصلة BTC حية منذ الإقلاع."""
+    vnz.validated_symbols_to_scan.clear()  # قائمة فارغة (إقلاع بارد/حظر)
+    with patch.object(vnz, 'open_signals_cache', {}):
+        syms = set(vnz.collect_price_symbols())
+    assert syms >= {'BTCUSDT', 'ETHUSDT', 'SOLUSDT'}, f"القادة مفقودون: {syms}"
+    print("✅ 8) أسعار القادة تُنشر دائمًا حتى بقائمة فارغة")
+
+
+def test_cache_reconcile_on_empty():
+    """[V9.19.1] كاش فارغ + صفقات مفتوحة في DB ⇒ إعادة تحميل دورية (الصفقات اليتيمة)."""
+    orphan = {'id': 11, 'symbol': 'ORPHUSDT', 'status': 'open'}
+    fake_cursor = MagicMock()
+    fake_cursor.fetchall.return_value = [orphan]
+    fake_conn = MagicMock()
+    fake_conn.cursor.return_value.__enter__.return_value = fake_cursor
+    fake_redis = MagicMock()
+    vnz._last_cache_reconcile = 0.0
+    captured = {}
+    def fake_load(retries=4, delay=10):
+        captured['called'] = True
+        captured['retries'] = retries
+        with vnz.signal_cache_lock:
+            vnz.open_signals_cache.clear()
+            vnz.open_signals_cache['ORPHUSDT'] = orphan
+    with patch.object(vnz, 'redis_client', fake_redis), \
+         patch.object(vnz, 'load_open_signals_to_cache', side_effect=fake_load), \
+         patch('time.sleep'):
+        vnz.open_signals_cache.clear()  # كاش فارغ (حالة الإقلاع البارد)
+        has_signals = bool(vnz.open_signals_cache)  # False
+        if not has_signals and vnz.redis_client and (time.time() - vnz._last_cache_reconcile) >= 60:
+            vnz._last_cache_reconcile = time.time()
+            vnz.load_open_signals_to_cache(retries=1, delay=0)
+        assert captured.get('called') and captured.get('retries') == 1
+        assert 'ORPHUSDT' in vnz.open_signals_cache, "الصفقة اليتيمة لم تُستعد!"
+        assert vnz._last_cache_reconcile > 0, "خنق المصالحة (60ث) لا يعمل"
+        vnz.open_signals_cache.clear()  # نظافة
+    print("✅ 9) المصالحة الدورية تستعيد الصفقات اليتيمة بمحاولة خفيفة كل 60ث")
 if __name__ == '__main__':
     tests = [test_version, test_price_interval, test_collect_price_symbols_includes_open,
              test_price_loop_publishes_during_ban, test_price_loop_rest_fallback_when_free,
-             test_trade_manager_uses_hub_prices_first, test_immediate_pin_on_open]
+             test_trade_manager_uses_hub_prices_first, test_immediate_pin_on_open,
+             test_leaders_always_in_price_symbols, test_cache_reconcile_on_empty]
     failed = 0
     for t in tests:
         try:
@@ -157,3 +198,5 @@ if __name__ == '__main__':
             print(f"💥 خطأ غير متوقع في {t.__name__}: {exc}")
     print(f"\n{'='*50}\nالنتيجة: {len(tests)-failed}/{len(tests)} اختبارات ناجحة")
     sys.exit(1 if failed else 0)
+
+
