@@ -4937,7 +4937,7 @@ function updateStrategyCandidates() {
 }
 
 document.addEventListener('DOMContentLoaded', () => {
-    ['MarketStatus', 'Signals', 'Stats', 'Notifications', 'Rejections', 'SystemStatus', 'BtcTrend', 'LeaderMap', 'SmartPicks'].forEach(f => window[`update${f}`]());
+    ['MarketStatus', 'Signals', 'Stats', 'Notifications', 'Rejections', 'SystemStatus', 'BtcTrend', 'LeaderMap', 'SmartPicks', 'StrategyCandidates'].forEach(f => window[`update${f}`]());
     updateDataFeed();  // [V9.20.0] شارة مصدر البيانات
     // [تحسين V9.11.0] إيقاف الاستطلاع عند إخفاء التبويب — يمنع تراكم الطلبات
     // من التبويبات الخلفية ويخفف الضغط على خيوط الخادم (waitress queue)
