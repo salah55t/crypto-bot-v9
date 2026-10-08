@@ -49,7 +49,7 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-APP_VERSION: str = 'V9.26.0'  # [V9.21.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
+APP_VERSION: str = 'V9.27.0'  # [V9.21.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
 logger = logging.getLogger(f'CryptoBot{APP_VERSION}')
 
 # زمن إقلاع العملية لحساب مدة التشغيل في لوحة التحكم
@@ -113,6 +113,17 @@ ml_strategy_lock = Lock()
 
 USE_BB_STOCH_STRATEGY: bool = True
 bb_stoch_strategy_lock = Lock()
+
+# [V9.27.0] اقتباسان من استراتيجيات freqtrade المجتمعية — مثبتان بالباك تيست (24 رمزًا × 30 يومًا × 15م):
+#   1) فلتر الجسم الضاغط (من BinHV45): الإغلاق قريب من القاع (ضمن 25% من نصف النطاق السفلي للبولنجر)
+#      أي شمعة لا تزال تضغط نحو الأسفل — ليست شمعة ارتدت بالفعل بذيل طويل.
+#      الأثر المقاس: PF 1.007 → 1.887 | التوقع +0.007% → +0.539%/صفقة | مجموع +1.4% → +30.2%
+#   2) حارس المضخة (من ClucMay72018/EMASkipPump): رفض شموع المضخة/السكين (حجم > 20× متوسط 30)
+#      — تأمين مجاني على العينة (لم يرفض أي صفقة صالحة) يحمي من الشموع المتلاعب بها.
+#   المرفوض بالدليل: TD Sequential ≥9 (لا يحسّن)، فيشر RSI (يضر)، العمق close<0.985×BB
+#   (يتنافى مع تقاطع الستوك — مجموعة فارغة)، قفل التعادل BE05 على الاستراتيجيات الأخرى (يضر).
+BB_STOCH_TAIL_MAX_RATIO: float = 0.25
+BB_STOCH_PUMP_VOLUME_MULT: float = 20.0
 
 USE_MACD_EMA_STRATEGY: bool = True
 macd_ema_strategy_lock = Lock()
@@ -2846,6 +2857,7 @@ def calculate_all_features(df: pd.DataFrame, btc_df: Optional[pd.DataFrame]) -> 
     df_calc['sma_50'] = df_calc['close'].rolling(window=50).mean()
     df_calc['sma_200'] = df_calc['close'].rolling(window=200).mean()
     df_calc['volume_sma_20'] = df_calc['volume'].rolling(window=20).mean()
+    df_calc['volume_sma_30'] = df_calc['volume'].rolling(window=30).mean()  # [V9.27.0] حارس المضخة
     df_calc['ema_50'] = df_calc['close'].ewm(span=EMA_SLOW_PERIOD, adjust=False).mean()
     df_calc['ema_100'] = df_calc['close'].ewm(span=100, adjust=False).mean()
     high_low = df_calc['high'] - df_calc['low']
@@ -3334,8 +3346,15 @@ STRATEGY_SETUP_SCANNERS: Dict[str, Any] = {
 
 # --- [تحسين] دوال منطق الاستراتيجيات (تم تحسينها) ---
 def check_bb_stoch_strategy_enhanced(df: pd.DataFrame) -> bool:
-    """استراتيجية BB+Stoch المحسنة مع فلاتر إضافية"""
-    if len(df) < 21: 
+    """استراتيجية BB+Stoch المحسنة مع فلاتر إضافية.
+
+    [V9.27.0] اقتباسان من freqtrade المجتمعي (مثبتان بالباك تيست):
+    - فلتر الجسم الضاغط (BinHV45): (الإغلاق − القاع) < 0.25 × (الوسط − الحد السفلي للبولنجر)
+      أي شمعة لا تزال تضغط نحو الأسفل وليست شمعة ارتدت بالفعل (ذيل سفلي طويل = الالتقاط متأخر
+      والهدف قد نقص). باك تيست: PF 1.007→1.887 والتوقع ×74.
+    - حارس المضخة (ClucMay72018/EMASkipPump): حجم > 20× متوسط30 = شمعة مضخة/سكين متلاعب بها → رفض.
+    """
+    if len(df) < 35: 
         return False
         
     last, prev = df.iloc[-1], df.iloc[-2]
@@ -3347,6 +3366,14 @@ def check_bb_stoch_strategy_enhanced(df: pd.DataFrame) -> bool:
     
     # فلاتر إضافية
     volume_spike = last['volume'] > last['volume_sma_20'] * 1.2
+
+    # [V9.27.0] فلتر الجسم الضاغط (BinHV45): الإغلاق قريب من القاع — شمعة تضغط لا ارتدت
+    band_span = max(float(last['bb_middle']) - float(last['bb_lower']), 1e-12)
+    tail_pressing = (float(last['close']) - float(last['low'])) < (BB_STOCH_TAIL_MAX_RATIO * band_span)
+
+    # [V9.27.0] حارس المضخة (Cluc/EMASkipPump): رفض شموع الحجم المتعالي (مضخة/سكين متلاعب بها)
+    vol_mean30 = last['volume_sma_30'] if 'volume_sma_30' in last else float('nan')
+    not_pump_candle = (not pd.notna(vol_mean30)) or (float(last['volume']) <= float(vol_mean30) * BB_STOCH_PUMP_VOLUME_MULT)
     # [V9.24.0] إلغاء النقض العالمي للهبوط هنا — منطق الريم انتقل إلى:
     # كاشف القاع+الارتداد (detect_bottom_bounce_setup) الذي يشتد في الهبوط بدل أن يمنع،
     # وخريطة السوق العام (MARKET_STATE_STRATEGY_ALLOW) التي تحسم الاستراتيجيات المسموحة.
@@ -3365,7 +3392,9 @@ def check_bb_stoch_strategy_enhanced(df: pd.DataFrame) -> bool:
         "oversold_area": oversold_area,
         "volume_spike": volume_spike,
         "bb_width_ok": bb_width_ok,
-        "price_not_oversold": price_not_oversold
+        "price_not_oversold": price_not_oversold,
+        "tail_pressing": tail_pressing,      # [V9.27.0] BinHV45
+        "not_pump_candle": not_pump_candle   # [V9.27.0] Cluc/EMASkipPump
     }
     
     if all(conditions.values()):

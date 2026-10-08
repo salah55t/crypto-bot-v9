@@ -35,8 +35,15 @@ def _feed_close(symbol, reason, profit):
 
 
 def test_version():
-    assert vnz.APP_VERSION == 'V9.26.0', f"الإصدار: {vnz.APP_VERSION}"
-    print("✅ 1) الإصدار V9.26.0")
+    # [V9.27.0] مرن: V9.26.0 أو أحدث (طبقة الحمايات لا تتغير بلا علم)
+    ver = vnz.APP_VERSION
+    def _vt(v):
+        try:
+            return tuple(int(x) for x in v[1:].split('.'))
+        except Exception:
+            return (0,)
+    assert _vt(ver) >= (9, 26, 0), f"الإصدار: {ver}"
+    print("✅ 1) الإصدار V9.26.0+ (الحمايات موجودة)")
 
 
 def test_constants():
