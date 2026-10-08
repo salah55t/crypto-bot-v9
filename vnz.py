@@ -49,7 +49,7 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-APP_VERSION: str = 'V9.23.0'  # [V9.21.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
+APP_VERSION: str = 'V9.24.0'  # [V9.21.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
 logger = logging.getLogger(f'CryptoBot{APP_VERSION}')
 
 # زمن إقلاع العملية لحساب مدة التشغيل في لوحة التحكم
@@ -206,7 +206,7 @@ RECOMMENDATION_COOLDOWN_MIN: int = config('RECOMMENDATION_COOLDOWN_MIN', default
 # الأخيرة، ويقيس توقع كل خلية (استراتيجية × نمط سوقي) صافي الرسوم والانزلاق.
 # لا توصية/إشارة إلا إذا أثبتت الخلية توقعًا موجبًا حقيقيًا — مغلق أمام بلا دليل (fail-closed).
 EVIDENCE_ENABLED: bool = os.environ.get('EVIDENCE_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
-EVIDENCE_WINDOW_BARS: int = int(os.environ.get('EVIDENCE_WINDOW_BARS', '960'))      # 10 أيام شموع 15م
+EVIDENCE_WINDOW_BARS: int = int(os.environ.get('EVIDENCE_WINDOW_BARS', '1440'))     # 15 يومًا شموع 15م — نافذة أوسع تمنح الخلايا النادرة (الارتداد/الانضغاط) عينات كافية
 EVIDENCE_REFRESH_MIN: int = int(os.environ.get('EVIDENCE_REFRESH_MIN', '240'))      # تحديث كل 4 ساعات
 EVIDENCE_STRIDE: int = int(os.environ.get('EVIDENCE_STRIDE', '4'))                  # تقييم كل ساعة (خفة)
 EVIDENCE_ENTRY_SPACING: int = int(os.environ.get('EVIDENCE_ENTRY_SPACING', '4'))    # تباعد صفقات الدليل
@@ -215,6 +215,10 @@ EVIDENCE_MAX_SYMBOLS: int = int(os.environ.get('EVIDENCE_MAX_SYMBOLS', '24'))   
 EVIDENCE_MIN_TRADES: int = int(os.environ.get('EVIDENCE_MIN_TRADES', '5'))
 EVIDENCE_MIN_EXP_PCT: float = float(os.environ.get('EVIDENCE_MIN_EXP_PCT', '0.12'))
 EVIDENCE_MIN_PF: float = float(os.environ.get('EVIDENCE_MIN_PF', '1.15'))
+# [V9.24.0] عتبات العينة الصغيرة (3-4 صفقات): صرامة أعلى تعوّض قلة الدليل —
+# بدونها تبقى الخلايا الجديدة (قاع-صيد الارتداد مثلًا) بلا فرصة إثبات حي أبديًا
+EVIDENCE_MIN_EXP_PCT_SMALL: float = float(os.environ.get('EVIDENCE_MIN_EXP_PCT_SMALL', '0.30'))
+EVIDENCE_MIN_PF_SMALL: float = float(os.environ.get('EVIDENCE_MIN_PF_SMALL', '1.40'))
 SMART_PICKS_TOP: int = int(os.environ.get('SMART_PICKS_TOP', '8'))                  # عرض اللوحة
 EVIDENCE_FEE_PCT: float = float(os.environ.get('EVIDENCE_FEE_PCT', '0.10'))         # رسوم/جانب
 EVIDENCE_SLIP_PCT: float = float(os.environ.get('EVIDENCE_SLIP_PCT', '0.03'))       # انزلاق/جانب
@@ -233,14 +237,50 @@ STRATEGY_PAIR_PROFILES: Dict[str, Dict[str, Any]] = {
     'Pullback_MACD':              {'regimes': ('trend_up',),        'adx': (22.0, 32.0, None), 'atr_pct': (0.30, 5.0), 'struct_up_bonus': True, 'pos_roc_bonus': True},
     # الزخم: قادة الحركة الصاعدة — زخم سالب نقض قاسٍ (لا سكين ساقطة)
     'Bullish_Momentum':           {'regimes': ('trend_up',),        'adx': (20.0, 30.0, None), 'atr_pct': (0.40, 6.0), 'struct_up_bonus': True, 'pos_roc_bonus': True, 'require_pos_roc': True},
-    # الارتدادية — Connors: النطاق المترنم جوهرها، وتراجعات الاتجاه الصاعد ائتمان ثانوي
-    # (أفضل انعكاسات هي شراء الغرقى في صاعد — لكن الهابط نقض قاسٍ: لا غرقى في الغرق)
-    'BB_Stoch_Reversal_Enhanced': {'regimes': ('range',), 'secondary_regimes': ('trend_up',), 'adx': (None, None, 32.0), 'atr_pct': (0.25, 4.0), 'range_bonus': True, 'near_ema50': True},
-    # الاختراقية — Carter: الانضغاط جوهرها، والنطاق/الاتجاه الصاعد ائتمان ثانوي
-    # (نمط استمرار الاختراق في الاتجاه القوي كان يُخنق قديمًا — 72 رفضًا حيًا)
-    'BB_Squeeze_Breakout':        {'regimes': ('squeeze',), 'secondary_regimes': ('range', 'trend_up'), 'adx': (None, None, 35.0), 'atr_pct': (None, 5.0), 'low_bbwp_bonus': True},
+    # الارتدادية — Connors [V9.24.0]: النطاق جوهرها، والتراجعات في الصاعد ائتمان ثانوي،
+    # والهابط مقبول شرط كاشف القاع+الارتداد (detect_bottom_bounce_setup) يصادق بشروطه
+    # المشددة (تشبع أعمق RSI<30 + قاع ≤0.8×ATR + شمعة ارتداد) — المنع المطلق كان يُعطّل
+    # استراتيجية القاع في السوق الوحيد الذي تكون فيه هي الفكرة الصحيحة (820 فحص/0 إشارة)
+    'BB_Stoch_Reversal_Enhanced': {'regimes': ('range', 'trend_down'), 'secondary_regimes': ('trend_up', 'transitional'), 'adx': (None, None, None), 'atr_pct': (0.25, 4.0), 'range_bonus': True, 'near_ema50': True},
+    # الاختراقية — Carter [V9.24.0+BT]: الانضغاط جوهرها، والاتجاه الصاعد ائتمان ثانوي.
+    # (range أُزيلت من الثانوية بالباك تيست: كل صفقات الاختراق في رموز مترنمة (flips≥5)
+    # كانت انفجارات زائفة — 4/4 خاسرة، الاختراق يحتاج انضغاطًا حقيقيًا لا رملًا)
+    'BB_Squeeze_Breakout':        {'regimes': ('squeeze',), 'secondary_regimes': ('trend_up',), 'adx': (None, None, 35.0), 'atr_pct': (None, 5.0), 'low_bbwp_bonus': True},
     'SR_Breakout_Enhanced':       {'regimes': ('range', 'squeeze'), 'secondary_regimes': ('trend_up',), 'adx': (None, None, 34.0), 'atr_pct': (None, 5.0), 'low_bbwp_bonus': True},
 }
+
+# --- [V9.24.0] خريطة السوق العام → الاستراتيجيات المسموحة (حتمية لا تكهن) ---
+# طلب المستخدم الصريح: "كل استراتيجية تفحص الرموز التي يمكن تحقق الاستراتيجية بها على حسب الاستراتيجية".
+# في سوق هابط حاد لا يُفتح الزخم/الاختراق الصاعد ضد الاتجاه (كان مصدر كل خسائر V9.21→V9.23:
+# 10 توصيات BB_Squeeze في STRONG_DOWNTREND كلها stop_loss) — بل قاع-صيد الارتداد واختراق الدعوم.
+# المفاتيح نفسها المستخدمة في حلقة المسح. القيمة None = بلا تقييد (سقوط آمن عند حالة غير معروفة).
+MARKET_STATE_STRATEGY_ALLOW: Dict[str, Optional[Tuple[str, ...]]] = {
+    'STRONG_DOWNTREND': ('BB_STOCH', 'SR_BREAKOUT'),
+    'DOWNTREND':        ('BB_STOCH', 'SR_BREAKOUT', 'BB_SQUEEZE'),
+    'RANGING':          ('BB_STOCH', 'SR_BREAKOUT', 'BB_SQUEEZE', 'MACD_EMA', 'EMA_RSI', 'PULLBACK'),
+    'UNCERTAIN':        ('BB_STOCH', 'SR_BREAKOUT', 'BB_SQUEEZE', 'MACD_EMA', 'EMA_RSI', 'PULLBACK', 'BULLISH_MOMENTUM'),
+    'UPTREND':          ('BB_STOCH', 'SR_BREAKOUT', 'BB_SQUEEZE', 'MACD_EMA', 'EMA_RSI', 'PULLBACK', 'BULLISH_MOMENTUM'),
+    'STRONG_UPTREND':   ('BB_STOCH', 'SR_BREAKOUT', 'BB_SQUEEZE', 'MACD_EMA', 'EMA_RSI', 'PULLBACK', 'BULLISH_MOMENTUM'),
+}
+# ثوابت كاشف القاع والارتداد الحتمي [V9.24.0] — طلب المستخدم: "عملات في قاع سعرها
+# أعطت مؤشرات على ارتدادها تفحص هذه الرموز باستراتيجية الارتداد".
+# في الهبوط الحاد تشتد الصرامة (تشبع أعمق + قاع أقرب) لأن السكين الساقطة تكرر القيعان.
+BOTTOM_WINDOW_BARS: int = 96                  # قاع 24 ساعة على فريم 15م
+BOTTOM_DIST_LOW_ATR: float = 1.2              # القاع: السعر ضمن 1.2×ATR من أدنى قاع النافذة
+BOTTOM_DIST_LOW_ATR_DOWNTREND: float = 0.8    # وفي الهبوط: أقرب للقاع (≤0.8×ATR)
+BOTTOM_RSI_MAX_RANGE: float = 35.0            # تشبع بيعي في السوق العادي
+BOTTOM_RSI_MAX_DOWNTREND: float = 30.0        # تشبع أعمق إلزامي في الهبوط الحاد
+BOTTOM_STOCH_MAX: float = 40.0                # ستوكاستك RSI في المنطقة السفلية بدوران صاعد
+BOTTOM_WICK_MIN_RATIO: float = 0.45           # ذيل سفلي ≥45% من مدى الشمعة = دليل رفض بيع
+SQUEEZE_BBWP_MAX: float = 0.30                # انضغاط فعلي: عرض بولنجر في أدنى 30% من تاريخه الحديث
+# [V9.24.0] فلتر ثبات الريم العام للاستراتيجيات الاستمرارية (مستوحى من الباك تيست):
+# في السوق المنشاري يتنقل الريم بين UPTREND و DOWNTREND بسرعة — شراء الزخم/الاختراق
+# في ارتداد دببة "قوي صاعد" كان يخسر -0.33%/صفقة. القاعدة: لا استراتيجيات استمرارية
+# إلا بعد ثبات عائلة الريم الصاعد MARKET_REGIME_PERSIST_MIN دقيقة متصلة (الحتمية لا التكهن).
+MARKET_REGIME_PERSIST_MIN: int = int(os.environ.get('MARKET_REGIME_PERSIST_MIN', '480'))  # 8 ساعات
+TREND_CONTINUATION_KEYS: Tuple[str, ...] = ('MACD_EMA', 'EMA_RSI', 'PULLBACK', 'BULLISH_MOMENTUM', 'BB_SQUEEZE')
+# سجل تاريخ الريم العام للحية (تُملأ في determine_market_state_enhanced) لحساب الثبات
+MARKET_REGIME_HISTORY: deque = deque(maxlen=400)   # ~20 ساعة بعينات كل 3 دقائق
 
 # ترشيحات آخر دورة مسح (للعرض في اللوحة عبر /api/strategy_pairs) + طابع زمني
 strategy_pair_pools: Dict[str, List[Dict[str, Any]]] = {}
@@ -2875,6 +2915,166 @@ def score_strategy_pair_fit(ri: Optional[Dict[str, Any]], strategy_name: str) ->
     return round(min(100.0, score), 1)
 
 
+# --- [V9.24.0] كواشف التجهيز الشرطي لكل استراتيجية (Deterministic Setup Scanners) ---
+# الفلسفة الجديدة بطلب المستخدم: لا توصية بلا "تجهيز" حتمي مكتشف على الرمز نفسه —
+# مثال: استراتيجية الارتداد تُفحص فقط على عملات في قاع سعرها أعطت مؤشرات ارتداد فعلية.
+# الكاشف يجيب سؤال "هل ظروف هذه الاستراتيجية متجسدة في هذا الرمز الآن؟" بأرقام صريحة،
+# وتوثق الأدلة الرقمية في تفاصيل الإشارة (مسافة عن القاع، RSI، دوران الستوك، شمعة الارتداد).
+
+def _market_regime_is_downtrend(market_regime: str) -> bool:
+    return 'DOWNTREND' in str(market_regime or '').upper()
+
+
+def detect_bottom_bounce_setup(df: pd.DataFrame, market_regime: str = '') -> Tuple[bool, Dict[str, Any]]:
+    """[V9.24.0] كاشف القاع والارتداد الحتمي — قلب طلب المستخدم.
+    شروط صارمة قابلة للتوثيق:
+      (1) القاع: السعر ضمن bottom_dist×ATR من أدنى قاع آخر 96 شمعة (24 ساعة على 15م)
+      (2) لمس بولنجر السفلي بذيل أو جسم
+      (3) تشبع بيعي RSI: <35 عاديًا، <30 إلزاميًا في الهبوط الحاد (سكين أعمق)
+      (4) ستوكاستك RSI في القاع (K<40) بدوران صاعد (K فوق قيمته السابقة أو فوق D)
+      (5) شمعة ارتداد فعلية: خضراء أو ذيل سفلي ≥45% من مدى الشمعة
+    في الهبوط الحاد تُشترط (1)+(3)+(4)+(5) كلها بلا تنازل، وفي العادي (1)+(3)+(4)+(2 أو 5).
+    تعيد (قرار، أدلة رقمية للتوثيق في اللوحة)."""
+    ev: Dict[str, Any] = {'setup': 'bottom_bounce'}
+    if len(df) < max(110, BOTTOM_WINDOW_BARS + 10):
+        ev['reason'] = 'شموع غير كافية'
+        return False, ev
+    last, prev = df.iloc[-1], df.iloc[-2]
+    try:
+        atr = float(last['atr']) if pd.notna(last['atr']) else 0.0
+        close = float(last['close'])
+    except Exception:
+        return False, ev
+    if not (atr > 0 and close > 0):
+        ev['reason'] = 'ATR/سعر غير صالحين'
+        return False, ev
+    downtrend = _market_regime_is_downtrend(market_regime)
+    dist_cap = BOTTOM_DIST_LOW_ATR_DOWNTREND if downtrend else BOTTOM_DIST_LOW_ATR
+    rsi_cap = BOTTOM_RSI_MAX_DOWNTREND if downtrend else BOTTOM_RSI_MAX_RANGE
+    # (1) القاع
+    window = df.iloc[-BOTTOM_WINDOW_BARS:]
+    low_win = float(window['low'].min())
+    dist_low_atr = (close - low_win) / atr
+    at_bottom = dist_low_atr <= dist_cap
+    ev['dist_low_atr'] = round(dist_low_atr, 2)
+    ev['low_window'] = low_win
+    # (2) لمس بولنجر السفلي
+    bb_lower = float(last['bb_lower']) if ('bb_lower' in last and pd.notna(last['bb_lower'])) else None
+    touched_bb = bool(bb_lower is not None and float(last['low']) <= bb_lower * 1.002)
+    if bb_lower is not None:
+        ev['bb_lower'] = round(bb_lower, 6)
+    ev['touched_bb'] = touched_bb
+    # (3) تشبع بيعي
+    rsi = float(last['rsi']) if ('rsi' in last and pd.notna(last['rsi'])) else 50.0
+    oversold = rsi < rsi_cap
+    ev['rsi'] = round(rsi, 1)
+    # (4) ستوك في القاع بدوران صاعد
+    k = float(last['stoch_rsi_k']) if ('stoch_rsi_k' in last and pd.notna(last['stoch_rsi_k'])) else 100.0
+    d = float(last['stoch_rsi_d']) if ('stoch_rsi_d' in last and pd.notna(last['stoch_rsi_d'])) else 100.0
+    k_prev = float(prev['stoch_rsi_k']) if ('stoch_rsi_k' in prev and pd.notna(prev['stoch_rsi_k'])) else 100.0
+    stoch_low_turn = (k < BOTTOM_STOCH_MAX) and ((k > k_prev) or (k > d))
+    ev['stoch_k'] = round(k, 1)
+    ev['stoch_turn'] = stoch_low_turn
+    # (5) شمعة الارتداد
+    candle_range = max(float(last['high']) - float(last['low']), 1e-12)
+    lower_wick = (min(float(last['open']), close) - float(last['low'])) / candle_range
+    green = close > float(last['open'])
+    bounce_candle = green or (lower_wick >= BOTTOM_WICK_MIN_RATIO)
+    ev['bounce_candle'] = bool(bounce_candle)
+    ev['lower_wick_pct'] = round(lower_wick * 100.0, 1)
+    ev['downtrend_strict'] = downtrend
+    if downtrend:
+        ok = at_bottom and oversold and stoch_low_turn and bounce_candle
+    else:
+        ok = at_bottom and oversold and stoch_low_turn and (touched_bb or bounce_candle)
+    if not ok:
+        ev['reason'] = 'شروط القاع/الارتداد غير مكتملة'
+    return ok, ev
+
+
+def detect_squeeze_setup(df: pd.DataFrame, market_regime: str = '') -> Tuple[bool, Dict[str, Any]]:
+    """[V9.24.0] تجهيز الاختراقية: انضغاط فعلي + نقض هيكلي للهبوط.
+    (أ) الانضغاط: عرض بولنجر الحالي في أدنى SQUEEZE_BBWP_MAX من آخر 220 شمعة (مستبعدين آخر 20)
+    (ب) النقض الهيكلي: لا اختراق صاعد يُشترى ضد هيكل هابط (EMA21<EMA50 مع السعر تحت EMA50)
+        — هذا بالضبط نمط "ارتداد الموتى" الذي خسر به البوت 10 صفقات متتالية في الهبوط الحاد."""
+    ev: Dict[str, Any] = {'setup': 'squeeze'}
+    if len(df) < 240:
+        ev['reason'] = 'شموع غير كافية للانضغاط'
+        return False, ev
+    last = df.iloc[-1]
+    bbw_all = df['bb_width'].astype(float)
+    cur_bbw = float(bbw_all.iloc[-1]) if pd.notna(bbw_all.iloc[-1]) else None
+    if cur_bbw is None:
+        return False, ev
+    hist = bbw_all.iloc[-220:-20]
+    bbwp = float((hist <= cur_bbw).mean()) if len(hist) > 20 else 1.0
+    ev['bbwp'] = round(bbwp, 2)
+    squeezed = bbwp <= SQUEEZE_BBWP_MAX
+    ema50 = float(last['ema_50']) if pd.notna(last['ema_50']) else None
+    ema21 = float(last['ema_21']) if ('ema_21' in last and pd.notna(last['ema_21'])) else None
+    close = float(last['close'])
+    # [V9.24.0 +باك تيست] تشديد: الاختراق الصاعد استمرارية — يشترط هيكل صاعد كامل
+    # (EMA21 فوق EMA50 والسعر فوق EMA50). الإصدار الأول (نقض الهابط الصريح فقط)
+    # خسر -13% في السوق المنشاري: اختراقات زائفة في نطاق رملي بلا اتجاه حقيقي
+    bullish_struct = bool(ema50 is not None and ema21 is not None and ema21 > ema50 and close > ema50)
+    ev['bullish_structure'] = bullish_struct
+    # [V9.24.0+BT] قوة 24 ساعة: الرمز نفسه صاعد على نافذة القاع (96 شمعة) —
+    # اختراق انضغاط في رمز هابط يوميًا = سكين ملتفة لا استمرارية
+    mom_24h = None
+    if len(df) > BOTTOM_WINDOW_BARS:
+        ref_close = float(df['close'].iloc[-BOTTOM_WINDOW_BARS])
+        if ref_close > 0:
+            mom_24h = (close - ref_close) / ref_close * 100.0
+            ev['mom_24h_pct'] = round(mom_24h, 2)
+    rising_24h = bool(mom_24h is not None and mom_24h > 0.0)
+    ev['rising_24h'] = rising_24h
+    ok = squeezed and bullish_struct and rising_24h
+    if not ok:
+        ev['reason'] = ('انضغاط غير فعّال' if not squeezed
+                        else 'هيكل غير صاعد — الاختراق استمرارية لا انعكاس' if not bullish_struct
+                        else 'الرمز هابط على 24 ساعة — لا اختراق ضد الموجة اليومية')
+    return ok, ev
+
+
+def detect_trend_structure_setup(df: pd.DataFrame, market_regime: str = '') -> Tuple[bool, Dict[str, Any]]:
+    """[V9.24.0] تجهيز الاستراتيجيات الاتجاهية (تقاطعات/زخم/تراجع): هيكل صاعد سليم.
+    السعر فوق EMA50 + EMA21 فوق EMA50 (أو على الأقل السعر فوق الاثنتين مع ازدياد ADX).
+    هذا يمنع شراء التقاطعات داخل القنوات الهابطة مهما بدا التقاطع جميلًا."""
+    ev: Dict[str, Any] = {'setup': 'trend_structure'}
+    if len(df) < 60:
+        ev['reason'] = 'شموع غير كافية'
+        return False, ev
+    last = df.iloc[-1]
+    close = float(last['close'])
+    ema50 = float(last['ema_50']) if pd.notna(last['ema_50']) else None
+    ema21 = float(last['ema_21']) if ('ema_21' in last and pd.notna(last['ema_21'])) else None
+    adx = float(last['adx']) if ('adx' in last and pd.notna(last['adx'])) else 0.0
+    if ema50 is None:
+        return False, ev
+    above_ema50 = close > ema50
+    above_ema21 = (ema21 is not None and close > ema21)
+    struct_up = (ema21 is not None and ema21 > ema50)
+    ok = above_ema50 and (above_ema21 or struct_up) and adx >= 18.0
+    ev['above_ema50'] = above_ema50
+    ev['struct_up'] = struct_up
+    ev['adx'] = round(adx, 1)
+    if not ok:
+        ev['reason'] = 'هيكل صاعد غير سليم (تقاطعات في قناة هابطة مرفوضة)'
+    return ok, ev
+
+
+# خريطة الكواشف: مفتاح الاستراتيجية (كما في حلقة المسح) → دالة التجهيز الشرطي
+STRATEGY_SETUP_SCANNERS: Dict[str, Any] = {
+    'BB_STOCH': detect_bottom_bounce_setup,        # الارتداد: قاع + مؤشرات ارتداد (طلب المستخدم)
+    'BB_SQUEEZE': detect_squeeze_setup,            # الاختراقية: انضغاط + نقض الهيكل الهابط
+    'SR_BREAKOUT': None,                            # اختراق الدعوم: الفحص نفسه شرطي (كسر مقاومة محدد سلفًا)
+    'MACD_EMA': detect_trend_structure_setup,
+    'EMA_RSI': detect_trend_structure_setup,
+    'PULLBACK': detect_trend_structure_setup,
+    'BULLISH_MOMENTUM': detect_trend_structure_setup,
+}
+
+
 # --- [تحسين] دوال منطق الاستراتيجيات (تم تحسينها) ---
 def check_bb_stoch_strategy_enhanced(df: pd.DataFrame) -> bool:
     """استراتيجية BB+Stoch المحسنة مع فلاتر إضافية"""
@@ -2890,13 +3090,16 @@ def check_bb_stoch_strategy_enhanced(df: pd.DataFrame) -> bool:
     
     # فلاتر إضافية
     volume_spike = last['volume'] > last['volume_sma_20'] * 1.2
-    with market_state_lock:
-        trend_ok = "DOWNTREND" not in current_market_state.get("overall_regime", "UNCERTAIN")
+    # [V9.24.0] إلغاء النقض العالمي للهبوط هنا — منطق الريم انتقل إلى:
+    # كاشف القاع+الارتداد (detect_bottom_bounce_setup) الذي يشتد في الهبوط بدل أن يمنع،
+    # وخريطة السوق العام (MARKET_STATE_STRATEGY_ALLOW) التي تحسم الاستراتيجيات المسموحة.
+    # النتيجة الحية قبل الإلغاء: 820 فحصًا صفرًا إشارةً في STRONG_DOWNTREND — استراتيجية
+    # القاع الوحيدة كانت معطلة في السوق الوحيد الذي تكون فيه هي الفكرة الصحيحة.
     
-    # فلتر جديد: تجنب الإشارات في الأسواق الجانبية
-    bb_width_ok = last['bb_width'] > 0.02  # تجنب الأسواق ذات النطاق الضيق جدًا
+    # فلتر: تجنب الإشارات في النطاق الضيق جدًا
+    bb_width_ok = last['bb_width'] > 0.02
     
-    # فلتر جديد: التأكد من أن السعر ليس بعيدًا جدًا عن المتوسطات
+    # فلتر: السكين الساقطة العمياء (RSI<25 = غرق حقيقي غير قابل للاقتناص)
     price_not_oversold = last['rsi'] > 25
     
     conditions = {
@@ -2904,7 +3107,6 @@ def check_bb_stoch_strategy_enhanced(df: pd.DataFrame) -> bool:
         "stoch_cross_up": stoch_cross_up,
         "oversold_area": oversold_area,
         "volume_spike": volume_spike,
-        "trend_ok": trend_ok,
         "bb_width_ok": bb_width_ok,
         "price_not_oversold": price_not_oversold
     }
@@ -2972,6 +3174,15 @@ def check_bb_squeeze_strategy(df: pd.DataFrame) -> bool:
     
     breakout = last['close'] > last['bb_upper']
     volume_confirmed = last['relative_volume'] > 1.25
+    
+    # [V9.24.0] نقض هيكلي دائم: لا اختراق صاعد يُشترى ضد هيكل هابط
+    # (EMA21 تحت EMA50 والسعر تحت EMA50) — نمط "ارتداد الموتى" الذي
+    # خسر به V9.21→V9.23 كل صفقاته العشر في STRONG_DOWNTREND.
+    # كاشف التجهيز detect_squeeze_setup يفرض النقض ذاته في مسار التوصيات،
+    # وهذا هنا يحمي مسار المُطلِقات المباشرة أيضًا.
+    falling_structure = (last['ema_21'] < last['ema_50']) and (last['close'] < last['ema_50'])
+    if falling_structure:
+        return False
     
     if is_squeeze and breakout and volume_confirmed:
         logger.info(f"  -> [{df.name}] ✅ إشارة استراتيجية BB Squeeze Breakout.")
@@ -3663,9 +3874,34 @@ def determine_market_state_enhanced():
         with market_state_lock:
             current_market_state = {"overall_regime": overall_regime.upper().replace(" ", "_"), "trend_details_by_tf": trend_details, "last_updated": datetime.now(timezone.utc).isoformat()}
             last_market_state_check = time.time()
+        # [V9.24.0] تسجيل تاريخ الريم العام لحساب ثبات الاستمرارية في فلتر الثبات
+        try:
+            with market_state_lock:
+                MARKET_REGIME_HISTORY.append((time.time(), current_market_state.get('overall_regime', 'UNCERTAIN')))
+        except Exception:
+            pass
         logger.info(f"✅ [حالة السوق] الحالة العامة المحددة: {overall_regime}")
     except Exception as e:
         logger.error(f"❌ [حالة السوق] خطأ في التحديث: {e}", exc_info=True)
+
+
+def market_up_persistence_minutes() -> float:
+    """[V9.24.0] كم دقيقة الريم العام متصلًا في عائلة الصاعد (UPTREND/STRONG_UPTREND)؟
+    يُحسب من سجل MARKET_REGIME_HISTORY المملوء دوريًا. 0.0 = ليس صاعدًا الآن."""
+    try:
+        with market_state_lock:
+            hist = list(MARKET_REGIME_HISTORY)
+        if not hist:
+            return 0.0
+        last_ts, last_reg = hist[-1]
+        if 'UPTREND' not in str(last_reg).upper():
+            return 0.0
+        for ts, reg in reversed(hist):
+            if 'UPTREND' not in str(reg).upper():
+                return max(0.0, (last_ts - ts) / 60.0)
+        return max(0.0, (time.time() - hist[0][0]) / 60.0)
+    except Exception:
+        return 0.0
 
 # ---------------------- واجهة الويب (Flask) ----------------------
 app = Flask(__name__)
@@ -5176,6 +5412,9 @@ EVIDENCE_PAIR_STATS: Dict[Tuple[str, str], Dict[str, Any]] = {}
 EVIDENCE_STATS_LOCK = Lock()
 EVIDENCE_UPDATED_AT: Optional[str] = None
 EVIDENCE_SYMBOL_REGIME: Dict[str, str] = {}     # آخر ريم لكل رمز من حلقة المسح (للعرض)
+# [V9.24.0] كاش سلسلة الريم العام لمحرك الأدلة (من شموع BTC متعددة الفريمات)
+_evidence_regime_series_cache: Optional[pd.Series] = None
+_evidence_regime_series_at: float = 0.0
 EVIDENCE_REFRESH_LOCK = Lock()
 
 # سجل الاستراتيجيات المفعلة (نفس ترتيب الحلقة الرئيسية) — يُبنى مرة
@@ -5272,8 +5511,63 @@ def _evidence_simulate_exit(df: pd.DataFrame, sig_i: int, atr_sig: float, n: int
         return None
 
 
+def _evidence_global_regime_series() -> Optional[pd.Series]:
+    """[V9.24.0] سلسلة زمنية لحالة السوق العام (نفس منطق determine_market_state_enhanced)
+    لكل شمعة BTC 15م ضمن نافذة الدليل: EMA12/26 + ADX على فريمات 15م/1س/4س → تصويت الأغلبية.
+    تُخزَّن مؤقتًا بين تحديثات محرك الأدلة (تتغير الحالة ببطء) لتفادي جلب متكرر.
+    تُستخدم في _evidence_replay_symbol لفرض خريطة MARKET_STATE_STRATEGY_ALLOW تاريخيًا."""
+    global _evidence_regime_series_cache, _evidence_regime_series_at
+    try:
+        if (_evidence_regime_series_cache is not None and _evidence_regime_series_at
+                and (time.time() - _evidence_regime_series_at) < EVIDENCE_REFRESH_MIN * 60 * 0.9):
+            return _evidence_regime_series_cache
+
+        def _trend_labels(df: pd.DataFrame) -> Optional[pd.Series]:
+            if df is None or len(df) < 60:
+                return None
+            ema_fast = df['close'].ewm(span=12, adjust=False).mean()
+            ema_slow = df['close'].ewm(span=26, adjust=False).mean()
+            feat = calculate_all_features(df.copy(), None)
+            adx = feat['adx'] if not feat.empty else pd.Series(np.nan, index=df.index)
+            up = (ema_fast > ema_slow).reindex(df.index)
+            strong = (adx > 25).fillna(False).reindex(df.index)
+            labels = pd.Series('Ranging', index=df.index)
+            labels[up & strong] = 'Strong Uptrend'
+            labels[up & ~strong] = 'Uptrend'
+            labels[~up & strong] = 'Strong Downtrend'
+            labels[~up & ~strong] = 'Downtrend'
+            return labels
+
+        btc15 = fetch_historical_data(BTC_SYMBOL, '15m', SIGNAL_GENERATION_LOOKBACK_DAYS)
+        base = _trend_labels(btc15)
+        if base is None:
+            return None
+        parts = [base.rename('15m')]
+        for tf in ('1h', '4h'):
+            b = _trend_labels(fetch_historical_data(BTC_SYMBOL, tf, SIGNAL_GENERATION_LOOKBACK_DAYS))
+            if b is not None:
+                parts.append(b.reindex(base.index, method='ffill').rename(tf))
+        votes = pd.concat(parts, axis=1)
+        # تصويت الأغلبية لكل شمعة (نفس روح max(set(trends), key=count) الحية)
+        def _vote(row: pd.Series) -> str:
+            vals = [v for v in row.tolist() if isinstance(v, str) and v != 'Ranging']
+            if not vals:
+                return 'Uncertain'
+            return max(set(vals), key=vals.count)
+        series = votes.apply(_vote, axis=1)
+        with EVIDENCE_STATS_LOCK:
+            _evidence_regime_series_cache = series
+            _evidence_regime_series_at = time.time()
+        return series
+    except Exception as reg_err:
+        logger.warning(f"⚠️ [محرك الأدلة] فشل سلسلة الريم العام: {reg_err}")
+        return None
+
+
 def _evidence_replay_symbol(symbol: str, btc_df: Optional[pd.DataFrame]) -> List[Tuple[str, str, float]]:
-    """إعادة تشغيل منطق المنتج على نافذة الدليل لرمز واحد → قائمة (استراتيجية، ريم، صافي%)."""
+    """إعادة تشغيل منطق المنتج على نافذة الدليل لرمز واحد → قائمة (استراتيجية، ريم، صافي%).
+    [V9.24.0] تشمل إعادة التشغيل: خريطة السوق العام → الاستراتيجيات المسموحة +
+    كواشف التجهيز الشرطي — الأدلة تُحسب من نفس منطق الإنتاج الجديد لا من منطق قديم."""
     out: List[Tuple[str, str, float]] = []
     df = fetch_historical_data(symbol, SIGNAL_GENERATION_TIMEFRAME, SIGNAL_GENERATION_LOOKBACK_DAYS)
     if df is None or len(df) < 300:
@@ -5286,6 +5580,16 @@ def _evidence_replay_symbol(symbol: str, btc_df: Optional[pd.DataFrame]) -> List
     stop = n - 4
     table = _evidence_strategy_table()
     last_sig: Dict[str, int] = {name: -10 ** 9 for _, _, name in table}
+    # [V9.24.0] سلسلة حالة السوق العام (من BTC) محاذاة زمنيًا إلى شموع الرمز + ثبات الصاعد
+    regime_series = _evidence_global_regime_series()
+    up_persist = None
+    if regime_series is not None:
+        regime_series = regime_series.reindex(df_feat.index, method='ffill')
+        fam = regime_series.astype(str).str.upper().str.replace(' ', '_', regex=False).map(
+            lambda r: 'UP' if 'UPTREND' in r else ('DOWN' if 'DOWNTREND' in r else 'FLAT'))
+        # دقائق الثبات الصاعدي المتصل عند كل شمعة (15 دقيقة/شمعة)
+        grp = (fam != 'UP').cumsum()
+        up_persist = fam.eq('UP').groupby(grp).cumsum() * 15.0
     for i in range(start, stop, EVIDENCE_STRIDE):
         atr_i = float(df_feat['atr'].iloc[i]) if 'atr' in df_feat else 0.0
         if not (atr_i > 0):
@@ -5298,13 +5602,28 @@ def _evidence_replay_symbol(symbol: str, btc_df: Optional[pd.DataFrame]) -> List
         if not ri:
             continue
         regime = str(ri.get('regime'))
-        for _, fn, name in table:
+        # [V9.24.0] حالة السوق العامة عند هذه الشمعة (رسملة متوافقة مع الخريطة)
+        mkt = 'UNCERTAIN'
+        if regime_series is not None and i < len(regime_series):
+            mkt = str(regime_series.iloc[i]).upper().replace(' ', '_')
+        allowed_keys = MARKET_STATE_STRATEGY_ALLOW.get(mkt)
+        up_min = float(up_persist.iloc[i]) if up_persist is not None and i < len(up_persist) else 0.0
+        for key, fn, name in table:
             if i - last_sig[name] < EVIDENCE_ENTRY_SPACING:
+                continue
+            if allowed_keys is not None and key not in allowed_keys:
+                continue
+            # [V9.24.0] فلتر الثبات: الاستراتيجيات الاستمرارية بعد ثبات الصاعد فقط
+            if key in TREND_CONTINUATION_KEYS and up_min < MARKET_REGIME_PERSIST_MIN:
                 continue
             fit = score_strategy_pair_fit(ri, name)
             if fit is None or fit < PAIR_MATCH_MIN_SCORE:
                 continue
             if not passes_strategy_prefilters(win, name):
+                continue
+            # [V9.24.0] بوابة التجهيز الشرطي — نفس منطق حلقة المسح
+            scan_fn = STRATEGY_SETUP_SCANNERS.get(key)
+            if scan_fn is not None and not scan_fn(win, mkt):
                 continue
             if not fn(win):
                 continue
@@ -5358,7 +5677,10 @@ def _refresh_evidence_engine() -> Dict[str, Any]:
 
 def evidence_gate_pass(strategy_name: str, regime: Optional[str]) -> Tuple[bool, Dict[str, Any]]:
     """بوابة الدليل: (اجتياز؟، تفاصيل). تعطل المحرك = اجتياز دائم (سلوك قديم).
-    بلا دليل كافٍ أو توقع دون العتبة = رفض (fail-closed) — لا صفقات بلا برهان."""
+    بلا دليل كافٍ أو توقع دون العتبة = رفض (fail-closed) — لا صفقات بلا برهان.
+    [V9.24.0] تدرج العينات الصغيرة: الخلايا الحديثة (3-4 صفقات) لا تُحجب كليًا وإلا
+    بقيت الخلايا الجديدة (مثل قاع-صيد الارتداد) بلا فرصة إثبات حي — لكن تُشترط لها
+    عتبة أعلى صرامة (exp ≥ +0.30% و PF ≥ 1.40) عوضًا عن عتبات العينة الناضجة (n≥5)."""
     if not EVIDENCE_ENABLED:
         return True, {'engine': 'disabled'}
     if not regime:
@@ -5366,16 +5688,20 @@ def evidence_gate_pass(strategy_name: str, regime: Optional[str]) -> Tuple[bool,
     with EVIDENCE_STATS_LOCK:
         st = dict(EVIDENCE_REGIME_STATS.get((strategy_name, str(regime))) or {})
     n, exp_pct, pf = st.get('n', 0), st.get('exp_pct'), st.get('pf')
+    # [V9.24.0] عتبات متدرجة حسب حجم العينة — كلها أدنى من عتبة ن>=5 (أكثر صرامة)
+    small_sample = 3 <= n < EVIDENCE_MIN_TRADES
+    min_exp = EVIDENCE_MIN_EXP_PCT_SMALL if small_sample else EVIDENCE_MIN_EXP_PCT
+    min_pf = EVIDENCE_MIN_PF_SMALL if small_sample else EVIDENCE_MIN_PF
     info = {'strategy': strategy_name, 'regime': regime,
             'regime_ar': REGIME_AR.get(str(regime), str(regime)),
             'n': n, 'exp_pct': exp_pct, 'pf': pf,
-            'min_n': EVIDENCE_MIN_TRADES, 'min_exp_pct': EVIDENCE_MIN_EXP_PCT,
-            'min_pf': EVIDENCE_MIN_PF, 'updated_at': EVIDENCE_UPDATED_AT}
-    if n < EVIDENCE_MIN_TRADES:
-        info['reason_ar'] = f'أدلة غير كافية ({n} صفقة < {EVIDENCE_MIN_TRADES})'
+            'min_n': EVIDENCE_MIN_TRADES, 'min_exp_pct': min_exp,
+            'min_pf': min_pf, 'small_sample': small_sample, 'updated_at': EVIDENCE_UPDATED_AT}
+    if n < 3:
+        info['reason_ar'] = f'أدلة غير كافية ({n} صفقة < 3)'
         return False, info
-    if exp_pct is None or exp_pct < EVIDENCE_MIN_EXP_PCT or pf is None or pf < EVIDENCE_MIN_PF:
-        info['reason_ar'] = f'التوقع التاريخي سلبي أو دون العتبة ({(exp_pct or 0):+.2f}%/صفقة، PF {pf or 0:.2f})'
+    if exp_pct is None or exp_pct < min_exp or pf is None or pf < min_pf:
+        info['reason_ar'] = f'التوقع التاريخي سلبي أو دون العتبة ({(exp_pct or 0):+.2f}%/صفقة، PF {pf or 0:.2f}؛ العتبات: {min_exp:+.2f}% / {min_pf:.2f})'
         return False, info
     info['verdict_ar'] = f"مثبت ربحيًا: {exp_pct:+.2f}%/صفقة عبر {n} صفقة (PF {pf:.2f}) آخر 10 أيام"
     return True, info
@@ -5429,6 +5755,9 @@ def main_loop_enhanced():
 
             determine_market_state_enhanced()
             btc_data = get_btc_data_for_bot()
+            # [V9.24.0] حالة السوق العام لهذه الدورة — أساس خريطة الاستراتيجيات المسموحة
+            with market_state_lock:
+                overall_market_regime = str(current_market_state.get('overall_regime', 'UNCERTAIN'))
             symbols_to_process = random.sample(validated_symbols_to_scan, len(validated_symbols_to_scan))
             # [V9.17.0] ترشيحات هذه الدورة: الأزواج المطابقة لكل استراتيجية (تُنشر للوحة آخر الدورة)
             cycle_pair_scores: Dict[str, List[Dict[str, Any]]] = {}
@@ -5478,9 +5807,9 @@ def main_loop_enhanced():
                         signal_source, signal_fit_score = 'strategy_trigger', None
                         # [V9.23.0] تفاصيل دليل الإشارة المقبولة (تُوثّق في التفاصيل واللوحة)
                         signal_evidence_info: Optional[Dict[str, Any]] = None
-                        # [V9.18.0] الاستراتيجيات التي اجتاز هذا الزوج فلاترها كاملة
-                        # (مطابقة النمط + الفلاتر الخاصة) دون اكتمال مُطلِق الشمعة
-                        filter_passed_candidates: List[Tuple[str, float]] = []
+                        # [V9.24.0] الاستراتيجيات التي وجد كاشفها الشرطي تجهيزًا حتميًا
+                        # على هذا الرمز (قاع+ارتداد/انضغاط سليم/هيكل صاعد) دون اكتمال مُطلِق
+                        setup_candidates: List[Tuple[str, float, Dict[str, Any]]] = []
 
                         strategies_to_check = []
                         with macd_ema_strategy_lock:
@@ -5519,6 +5848,33 @@ def main_loop_enhanced():
                             # [V9.14.0] فلتر الاستراتيجية الخاص (ملف منطقي لكل نمط)
                             if not passes_strategy_prefilters(df_with_indicators, name):
                                 continue
+                            # [V9.24.0] خريطة السوق العام (حتمية): في الهبوط الحاد لا زخم ولا
+                            # اختراق صاعد ضد الاتجاه — فقط قاع-صيد الارتداد واختراق الدعوم.
+                            # مصدر خسائر V9.21→V9.23: 10 توصيات BB_Squeeze في STRONG_DOWNTREND كلها خاسرة.
+                            allowed_keys = MARKET_STATE_STRATEGY_ALLOW.get(overall_market_regime)
+                            if allowed_keys is not None and key not in allowed_keys:
+                                _count_strategy_filter_reject(name, f"ممنوعة في حالة السوق العامة ({overall_market_regime})")
+                                continue
+                            # [V9.24.0] فلتر الثبات: الاستراتيجيات الاستمرارية (زخم/تقاطعات/
+                            # انضغاط/تراجع) لا تشتري إلا بعد ثبات عائلة الصاعد 480 دقيقة —
+                            # 'Strong Uptrend' لأيام قليلة في سوق منشاري كان ارتداد دببة ثم انقلاب.
+                            if key in TREND_CONTINUATION_KEYS:
+                                up_min = market_up_persistence_minutes()
+                                if up_min < MARKET_REGIME_PERSIST_MIN:
+                                    _count_strategy_filter_reject(
+                                        name, f"ثبات الصاعد غير كافٍ ({up_min:.0f}د < {MARKET_REGIME_PERSIST_MIN}د)")
+                                    continue
+                            # [V9.24.0] كاشف التجهيز الشرطي لكل استراتيجية: لا فحص ولا توصية
+                            # إلا على رموز تجسدت ظروفها فيها بأرقام موثقة (قاع سعر+مؤشرات
+                            # ارتداد للارتدادية، انضغاط+هيكل سليم للاختراقية، هيكل صاعد للاتجاهية)
+                            scan_fn = STRATEGY_SETUP_SCANNERS.get(key)
+                            if scan_fn is not None:
+                                setup_ok, setup_ev = scan_fn(df_with_indicators, overall_market_regime)
+                                if not setup_ok:
+                                    _count_strategy_filter_reject(name, f"التجهيز الشرطي غير متحقق ({setup_ev.get('reason', '')})")
+                                    continue
+                            else:
+                                setup_ev = {}
                             if check_func(df_with_indicators):
                                 # [V9.23.0] بوابة الأدلة على المُطلِقات أيضًا — لا إشارة بلا برهان
                                 ok_ev, ev_info = evidence_gate_pass(name, (regime_info or {}).get('regime'))
@@ -5529,19 +5885,23 @@ def main_loop_enhanced():
                                 with _scan_stats_lock: _strategy_scan_stats[name]['passes'] += 1
                                 signal_found, strategy_used = True, name
                                 signal_fit_score = fit_score
-                                signal_evidence_info = ev_info
+                                # [V9.24.0] دليل الإشارة = أدلة التجهيز الشرطي + أدلة الخلية التاريخية
+                                signal_evidence_info = {**setup_ev, **ev_info}
                                 break
-                            # [V9.18.0] الفلاتر اجتازت كاملة (مطابقة + خاصة) دون مُطلِق
-                            # الشمعة → مرشّح توصية شراء (يُختار الأفضل درجةً بعد الحلقة)
-                            filter_passed_candidates.append((name, float(fit_score) if fit_score is not None else 50.0))
+                            # [V9.24.0] التجهيز الشرطي متحقق (مطابقة + فلاتر + كاشف) دون
+                            # اكتمال مُطلِق الشمعة → مرشّح توصية بأدلة رقمية موثقة
+                            setup_candidates.append((name, float(fit_score) if fit_score is not None else 50.0, dict(setup_ev)))
 
-                        # --- [V9.18.0] وضع التوصيات: أفضل اجتياز فلاتر يصبح توصية شراء مفتوحة ---
+                        # --- [V9.24.0] وضع التوصيات: أفضل تجهيز شرطي حتمي يصبح توصية موثقة ---
+                        # ليست مجرد تكهن: كل توصية = ظروف الاستراتيجية مكتشفة فعلاً على الرمز
+                        # (مثال: عملة في قاع سعرها أعطت مؤشرات ارتداد → استراتيجية الارتداد)
+                        # + بوابة الأدلة التاريخية للخلية (استراتيجية × نمط سوقي)
                         if (not signal_found and RECOMMENDATIONS_ENABLED and PAIR_MATCHING_ENABLED
-                                and filter_passed_candidates):
+                                and setup_candidates):
                             if recommendations_opened_this_cycle >= RECOMMENDATIONS_PER_CYCLE:
                                 pass  # نفد رصيد الدورة — تبقى الترشيحات معروضة في /api/strategy_pairs
                             else:
-                                rec_name, rec_score = max(filter_passed_candidates, key=lambda t: t[1])
+                                rec_name, rec_score, rec_setup_ev = max(setup_candidates, key=lambda t: t[1])
                                 if rec_score < RECOMMENDATION_MIN_FIT_SCORE:
                                     with _scan_stats_lock: _recommendation_stats['below_min_score'] += 1
                                 elif _symbol_recently_closed(symbol):
@@ -5556,13 +5916,14 @@ def main_loop_enhanced():
                                         continue
                                     signal_found, strategy_used = True, rec_name
                                     signal_source, signal_fit_score = 'filter_recommendation', rec_score
-                                    signal_evidence_info = rec_evidence_info
-                                    logger.info(f"  -> [{symbol}] 💡 اجتياز فلاتر {rec_name} (مطابقة {rec_score:.0f} + دليل: {rec_evidence_info.get('verdict_ar', '')}) → توصية شراء مفتوحة")
+                                    # [V9.24.0] توثيق كامل: أدلة التجهيز الشرطي + أدلة الخلية التاريخية
+                                    signal_evidence_info = {**rec_setup_ev, **rec_evidence_info}
+                                    logger.info(f"  -> [{symbol}] 💡 تجهيز شرطي لـ {rec_name} (مطابقة {rec_score:.0f} + دليل: {rec_evidence_info.get('verdict_ar', '')}) → توصية شراء موثقة")
                         
                         if not signal_found:
                             continue
 
-                        logger.info(f"  -> [{symbol}] {'💡 توصية فلاتر' if signal_source == 'filter_recommendation' else 'إشارة ناجحة'} من {strategy_used}. جاري التحقق النهائي...")
+                        logger.info(f"  -> [{symbol}] {'💡 توصية تجهيز شرطي' if signal_source == 'filter_recommendation' else 'إشارة ناجحة'} من {strategy_used}. جاري التحقق النهائي...")
 
                         # --- [تحسين V9.13.0] بوابة سلوك القائد: لا شراء تابع مقابل قائد هابط ---
                         # [V9.18.0] تُطبق على التوصيات والإشارات معًا — نقيض القائد نقض للاثنين
