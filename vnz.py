@@ -49,7 +49,7 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-APP_VERSION: str = 'V9.27.0'  # [V9.21.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
+APP_VERSION: str = 'V9.28.0'  # [V9.21.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
 logger = logging.getLogger(f'CryptoBot{APP_VERSION}')
 
 # زمن إقلاع العملية لحساب مدة التشغيل في لوحة التحكم
@@ -233,6 +233,20 @@ EVIDENCE_MIN_PF_SMALL: float = float(os.environ.get('EVIDENCE_MIN_PF_SMALL', '1.
 SMART_PICKS_TOP: int = int(os.environ.get('SMART_PICKS_TOP', '8'))                  # عرض اللوحة
 EVIDENCE_FEE_PCT: float = float(os.environ.get('EVIDENCE_FEE_PCT', '0.10'))         # رسوم/جانب
 EVIDENCE_SLIP_PCT: float = float(os.environ.get('EVIDENCE_SLIP_PCT', '0.03'))       # انزلاق/جانب
+
+# ------------------- [V9.28.0] حلقة بناء الدليل — علاج البدء البارد fail-closed -------------------
+# المشكلة الحية (لوحة V9.27.0): 18 رفض بوابة أدلة متتالية للخلية (اختراق المقاومات × نطاق)
+# لأن ن=0 — والبوابة المغلقة افتراضيًا تعني: لا دليل → لا صفقات → لا دليل أبدًا (حلقة مفرغة).
+# العلاج (بضوابط صارمة): خلايا بلا دليل تاريخي (ن<3) تُسمح لها صفقات "بناء دليل" ورقية
+# محدودة تُدار كأي صفقة، وإغلاقاتها تُغذي دليل الخلية حيًا. ثم حكم صارم:
+#   توقع سلبي بعد 3 بناءات → قفل الخلية (فشل مغلق موثق بالسبب)
+#   توقع موجب يبلغ عتبات العينة الصغيرة → تخرج الخلية من فترة الاختبار تلقائيًا (بوابة مدمجة)
+# الضوابط: درجة مطابقة أعلى (70 بدل 60) + سقف متزامن إجمالي (2) + سقف بناءات لكل خلية (3)
+# + كل البوابات الأخرى تبقى كما هي (سوق/قائد/دفتر/تجهيز شرطي/تهدئة) — البناء لا يتجاوزها.
+EVIDENCE_PROBATION_ENABLED: bool = os.environ.get('EVIDENCE_PROBATION_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+EVIDENCE_PROBATION_MIN_FIT: float = float(os.environ.get('EVIDENCE_PROBATION_MIN_FIT', '70.0'))
+EVIDENCE_PROBATION_MAX_OPEN: int = int(os.environ.get('EVIDENCE_PROBATION_MAX_OPEN', '2'))
+EVIDENCE_CELL_LOCK_AFTER_N: int = int(os.environ.get('EVIDENCE_CELL_LOCK_AFTER_N', '3'))
 
 REGIME_AR: Dict[str, str] = {
     'trend_up': 'اتجاه صاعد', 'trend_down': 'اتجاه هابط', 'range': 'نطاق مترنم',
@@ -528,7 +542,7 @@ _scan_stats_lock = Lock()
 # [V9.18.0] إحصاء التوصيات المفتوحة من اجتياز الفلاتر (لللوحة):
 # opened = فُتحت فعليًا | gate_rejected = رفضتها بوابات التأكيد النهائية
 # cooldown_skipped = الرمز ضمن تهدئة ما بعد الإغلاق | below_min_score = درجة المطابقة دون الحد
-_recommendation_stats: Counter = Counter({'opened': 0, 'gate_rejected': 0, 'cooldown_skipped': 0, 'below_min_score': 0, 'evidence_rejected': 0})
+_recommendation_stats: Counter = Counter({'opened': 0, 'gate_rejected': 0, 'cooldown_skipped': 0, 'below_min_score': 0, 'evidence_rejected': 0, 'probation_opened': 0})
 # [V9.23.0] علم إعادة تشغيل الدليل — يُصمت به سجل الرفضات والمحاسبة أثناء الباك تيست الداخلي
 _evidence_replaying: bool = False
 _recent_close_ts: Dict[str, float] = {}   # رمز -> طابع زمني إغلاقه الأخير (تهدئة سريعة الذاكرة)
@@ -4043,6 +4057,12 @@ def close_signal(signal_id: int, closing_price: float, reason: str) -> bool:
                 record_trade_close_for_protections(symbol_to_close, reason, profit_percentage)
             except Exception as prot_err:
                 logger.warning(f"⚠️ [حمايات] فشل تقييم الإغلاق: {prot_err}")
+            # [V9.28.0] تغذية حلقة بناء الدليل: إغلاق صفقة بناء يُقيِّم خليته حيًا
+            # (توقع موجب يتدرج للثقة / توقع سلبي بعد سقف البناءات = قفل الخلية)
+            try:
+                record_evidence_build_close(signal_to_close, profit_percentage)
+            except Exception as ev_err:
+                logger.warning(f"⚠️ [بناء الدليل] فشل تقييم الإغلاق: {ev_err}")
 
             reason_map = {
                 'take_profit': '🎯 أخذ الربح', 'stop_loss': '🛑 وقف الخسارة', 'manual': '🖐️ إغلاق يدوي',
@@ -5295,10 +5315,14 @@ def api_smart_picks():
         if not EVIDENCE_ENABLED:
             return jsonify({'enabled': False, 'reason_ar': 'محرك الأدلة معطل بالإعدادات (EVIDENCE_ENABLED=false)'})
         with EVIDENCE_STATS_LOCK:
-            cells = {f'{k[0]}||{k[1]}': dict(v) for k, v in EVIDENCE_REGIME_STATS.items()}
+            # [V9.28.0] الدليل المعروض مدمج: خام إعادة التشغيل + بناءات الدليل الحية
+            raw_map = {f'{k[0]}||{k[1]}': list(v) for k, v in EVIDENCE_REGIME_RAW.items()}
+            live_map = {f'{k[0]}||{k[1]}': list(v) for k, v in EVIDENCE_LIVE_STATS.items()}
             pairs = {f'{k[0]}||{k[1]}': dict(v) for k, v in EVIDENCE_PAIR_STATS.items()}
             sym_regime = dict(EVIDENCE_SYMBOL_REGIME)
             updated = EVIDENCE_UPDATED_AT
+        cells = {key: _evidence_summarize(raws + live_map.get(key, []))
+                 for key, raws in raw_map.items()}
         if not cells or not updated:
             return jsonify({'enabled': True, 'ready': False,
                             'reason_ar': 'أول تحديث للأدلة جارٍ (يستغرق دقائق بعد الإقلاع) — لا ترشيح بلا برهان',
@@ -5444,6 +5468,18 @@ def api_rejection_summary():
                 'min_fit_score': RECOMMENDATION_MIN_FIT_SCORE,
                 'cooldown_min': RECOMMENDATION_COOLDOWN_MIN,
                 **rec_stats,
+            },
+            # [V9.28.0] حلقة بناء الدليل — علاج البدء البارد: حالة الخلايا البانية والأقفال
+            'evidence_loop': {
+                'enabled': bool(EVIDENCE_ENABLED and EVIDENCE_PROBATION_ENABLED),
+                'max_open': EVIDENCE_PROBATION_MAX_OPEN,
+                'min_fit': EVIDENCE_PROBATION_MIN_FIT,
+                'lock_after_n': EVIDENCE_CELL_LOCK_AFTER_N,
+                'open_now': _evidence_probation_open_count(),
+                'cell_locks': {f'{k[0]}||{k[1]}': v for k, v in list(EVIDENCE_CELL_LOCKS.items())},
+                'live_cells': {f'{k[0]}||{k[1]}': {'n_live': len(v),
+                                                    'exp_pct': round(sum(v) / len(v), 4) if v else None}
+                               for k, v in list(EVIDENCE_LIVE_STATS.items()) if v},
             },
         })
     except Exception as e:
@@ -6057,6 +6093,12 @@ def trade_management_loop():
 
 EVIDENCE_REGIME_STATS: Dict[Tuple[str, str], Dict[str, Any]] = {}
 EVIDENCE_PAIR_STATS: Dict[Tuple[str, str], Dict[str, Any]] = {}
+# [V9.28.0] الصافي الخام لكل خلية من إعادة التشغيل (لدمج دقيق مع الأدلة الحية في البوابة)
+EVIDENCE_REGIME_RAW: Dict[Tuple[str, str], List[float]] = {}
+# [V9.28.0] الأدلة الحية: صافي صفقات "بناء الدليل" المغلقة لكل خلية — تُدمج مع إعادة التشغيل
+EVIDENCE_LIVE_STATS: Dict[Tuple[str, str], List[float]] = {}
+# [V9.28.0] خلايا أثبتت توقعًا سلبيًا حيًا بعد سقف البناءات — فشل مغلق موثق بالسبب
+EVIDENCE_CELL_LOCKS: Dict[Tuple[str, str], Dict[str, Any]] = {}
 EVIDENCE_STATS_LOCK = Lock()
 EVIDENCE_UPDATED_AT: Optional[str] = None
 EVIDENCE_SYMBOL_REGIME: Dict[str, str] = {}     # آخر ريم لكل رمز من حلقة المسح (للعرض)
@@ -6310,6 +6352,7 @@ def _refresh_evidence_engine() -> Dict[str, Any]:
             with EVIDENCE_STATS_LOCK:
                 EVIDENCE_REGIME_STATS = {k: _evidence_summarize(v) for k, v in cells.items()}
                 EVIDENCE_PAIR_STATS = {k: _evidence_summarize(v) for k, v in pairs.items()}
+                globals()['EVIDENCE_REGIME_RAW'] = {k: list(v) for k, v in cells.items()}  # [V9.28.0] خام للدمج الحي
                 globals()['EVIDENCE_UPDATED_AT'] = datetime.now(timezone.utc).isoformat()
             passing = [k for k, st in EVIDENCE_REGIME_STATS.items()
                        if st.get('n', 0) >= EVIDENCE_MIN_TRADES
@@ -6323,18 +6366,36 @@ def _refresh_evidence_engine() -> Dict[str, Any]:
             globals()['_evidence_replaying'] = False
 
 
+def _evidence_cell_combined(cell: Tuple[str, str]) -> Dict[str, Any]:
+    """[V9.28.0] ملخص الدليل المدمج للخلية: خام إعادة التشغيل + صفقات البناء الحية.
+    الدمج على مستوى الصافيات الخام (لا متوسطات) ثم تلخيص واحد — دقة كاملة للـ PF."""
+    with EVIDENCE_STATS_LOCK:
+        raw = list(EVIDENCE_REGIME_RAW.get(cell) or [])
+        live = list(EVIDENCE_LIVE_STATS.get(cell) or [])
+        locked = dict(EVIDENCE_CELL_LOCKS.get(cell) or {})
+    st = _evidence_summarize(raw + live)
+    st['n_live'] = len(live)
+    st['n_replay'] = len(raw)
+    st['locked'] = bool(locked)
+    if locked:
+        st['lock_info'] = locked
+    return st
+
+
 def evidence_gate_pass(strategy_name: str, regime: Optional[str]) -> Tuple[bool, Dict[str, Any]]:
     """بوابة الدليل: (اجتياز؟، تفاصيل). تعطل المحرك = اجتياز دائم (سلوك قديم).
     بلا دليل كافٍ أو توقع دون العتبة = رفض (fail-closed) — لا صفقات بلا برهان.
     [V9.24.0] تدرج العينات الصغيرة: الخلايا الحديثة (3-4 صفقات) لا تُحجب كليًا وإلا
     بقيت الخلايا الجديدة (مثل قاع-صيد الارتداد) بلا فرصة إثبات حي — لكن تُشترط لها
-    عتبة أعلى صرامة (exp ≥ +0.30% و PF ≥ 1.40) عوضًا عن عتبات العينة الناضجة (n≥5)."""
+    عتبة أعلى صرامة (exp ≥ +0.30% و PF ≥ 1.40) عوضًا عن عتبات العينة الناضجة (n≥5).
+    [V9.28.0] الدليل الآن مدمج: خام إعادة التشغيل + صفقات بناء الدليل الحية —
+    الخلية التي تبني دليلًا حيًا موجبًا تتخرج تلقائيًا بمجرد بلوغها العتبات."""
     if not EVIDENCE_ENABLED:
         return True, {'engine': 'disabled'}
     if not regime:
         return False, {'reason_ar': 'لا يوجد نمط سوقي محسوم — لا دليل', 'n': 0}
-    with EVIDENCE_STATS_LOCK:
-        st = dict(EVIDENCE_REGIME_STATS.get((strategy_name, str(regime))) or {})
+    cell = (strategy_name, str(regime))
+    st = _evidence_cell_combined(cell)
     n, exp_pct, pf = st.get('n', 0), st.get('exp_pct'), st.get('pf')
     # [V9.24.0] عتبات متدرجة حسب حجم العينة — كلها أدنى من عتبة ن>=5 (أكثر صرامة)
     small_sample = 3 <= n < EVIDENCE_MIN_TRADES
@@ -6343,16 +6404,121 @@ def evidence_gate_pass(strategy_name: str, regime: Optional[str]) -> Tuple[bool,
     info = {'strategy': strategy_name, 'regime': regime,
             'regime_ar': REGIME_AR.get(str(regime), str(regime)),
             'n': n, 'exp_pct': exp_pct, 'pf': pf,
+            'n_live': st.get('n_live', 0), 'n_replay': st.get('n_replay', 0),
             'min_n': EVIDENCE_MIN_TRADES, 'min_exp_pct': min_exp,
             'min_pf': min_pf, 'small_sample': small_sample, 'updated_at': EVIDENCE_UPDATED_AT}
+    if st.get('locked'):
+        li = st.get('lock_info') or {}
+        info['reason_ar'] = f"الخلية مقفولة بدليل حي سلبي: {li.get('reason_ar', '')}"
+        return False, info
     if n < 3:
         info['reason_ar'] = f'أدلة غير كافية ({n} صفقة < 3)'
         return False, info
     if exp_pct is None or exp_pct < min_exp or pf is None or pf < min_pf:
         info['reason_ar'] = f'التوقع التاريخي سلبي أو دون العتبة ({(exp_pct or 0):+.2f}%/صفقة، PF {pf or 0:.2f}؛ العتبات: {min_exp:+.2f}% / {min_pf:.2f})'
         return False, info
-    info['verdict_ar'] = f"مثبت ربحيًا: {exp_pct:+.2f}%/صفقة عبر {n} صفقة (PF {pf:.2f}) آخر 10 أيام"
+    src = f" (+{st.get('n_live', 0)} حية)" if st.get('n_live') else ''
+    info['verdict_ar'] = f"مثبت ربحيًا: {exp_pct:+.2f}%/صفقة عبر {n} صفقة (PF {pf:.2f}) آخر 10 أيام بعد الرسوم{src}"
     return True, info
+
+
+# ------------------- [V9.28.0] حلقة بناء الدليل (علاج البدء البارد) -------------------
+
+def _evidence_probation_open_count() -> int:
+    """عدد صفقات بناء الدليل المفتوحة الآن — من كاش الصفقات المفتوحة (يعيش عبر
+    إعادة التشغيل لأن العلم محفوظ داخل signal_details في قاعدة البيانات)."""
+    try:
+        with signal_cache_lock:
+            return sum(1 for s in open_signals_cache.values()
+                       if (s.get('signal_details') or {}).get('evidence_building'))
+    except Exception:
+        return EVIDENCE_PROBATION_MAX_OPEN  # عند الشك: لا تفتح المزيد (أمان)
+
+
+def evidence_probation_allow(strategy_name: str, regime: Optional[str],
+                             fit_score: Optional[float]) -> Tuple[bool, Dict[str, Any]]:
+    """بوابة حلقة بناء الدليل: تُستدعى فقط بعد رفض بوابة الأدلة. تسمح بصفقة ورقية
+    محدودة لبناء دليل حي للخلية (ن<3) بضوابط كلها إلزامية:
+      1) الخلية فعلًا بلا دليل (ن المدمج < 3) — لا تنطبق على خلية أثبتت سلبيتها تاريخيًا
+      2) الخلية غير مقفولة بدليل حي سلبي
+      3) درجة مطابقة أعلى من العادية (EVIDENCE_PROBATION_MIN_FIT ≥ 70)
+      4) سقف بناءات لكل خلية (EVIDENCE_CELL_LOCK_AFTER_N = 3) — بعدها الحكم
+      5) سقف متزامن إجمالي (EVIDENCE_PROBATION_MAX_OPEN = 2) عبر كل الخلايا
+    كل البوابات الأخرى (سوق/قائد/دفتر/تجهيز/تهدئة) تُقيَّم قبلها ولا تتجاوزها."""
+    info: Dict[str, Any] = {'probation': True,
+                            'max_open': EVIDENCE_PROBATION_MAX_OPEN,
+                            'min_fit': EVIDENCE_PROBATION_MIN_FIT,
+                            'lock_after_n': EVIDENCE_CELL_LOCK_AFTER_N}
+    if not (EVIDENCE_ENABLED and EVIDENCE_PROBATION_ENABLED):
+        info['reason_ar'] = 'حلقة بناء الدليل معطلة بالإعدادات'
+        return False, info
+    if not regime:
+        info['reason_ar'] = 'لا نمط سوقي — لا خلية لبنائها'
+        return False, info
+    cell = (strategy_name, str(regime))
+    st = _evidence_cell_combined(cell)
+    info.update({'n': st.get('n', 0), 'n_live': st.get('n_live', 0)})
+    if st.get('locked'):
+        info['reason_ar'] = f"الخلية مقفولة بدليل حي سلبي — لا بناء"
+        return False, info
+    if st.get('n', 0) >= 3:
+        # ليست بداية باردة: خلية لها دليل تاريخي/حي كافٍ رُفضت لدون العتبة — فشل مغلق يبقى
+        info['reason_ar'] = 'الخلية لها دليل كافٍ دون العتبة — البناء غير مسموح (فشل مغلق)'
+        return False, info
+    if st.get('n_live', 0) >= EVIDENCE_CELL_LOCK_AFTER_N:
+        info['reason_ar'] = f"استُهلك سقف بناءات الخلية ({EVIDENCE_CELL_LOCK_AFTER_N}) — بانتظار الحكم"
+        return False, info
+    if fit_score is None or float(fit_score) < EVIDENCE_PROBATION_MIN_FIT:
+        info['reason_ar'] = f"درجة المطابقة {0 if fit_score is None else float(fit_score):.0f} دون حد البناء {EVIDENCE_PROBATION_MIN_FIT:.0f}"
+        return False, info
+    open_now = _evidence_probation_open_count()
+    info['open_now'] = open_now
+    if open_now >= EVIDENCE_PROBATION_MAX_OPEN:
+        info['reason_ar'] = f"سقف بناءات الدليل المتزامنة مكتمل ({open_now}/{EVIDENCE_PROBATION_MAX_OPEN})"
+        return False, info
+    info['verdict_ar'] = (f"بناء دليل حي للخلية ({strategy_name}×{REGIME_AR.get(str(regime), regime)}): "
+                          f"بناء رقم {st.get('n_live', 0) + 1} من {EVIDENCE_CELL_LOCK_AFTER_N}")
+    return True, info
+
+
+def record_evidence_build_close(signal: Dict[str, Any], profit_percentage: float) -> Optional[Dict[str, Any]]:
+    """[V9.28.0] تُستدعى من close_signal لصفقات بناء الدليل: تُغذي دليل الخلية حيًا
+    وتحكم عليها — توقع سلبي بعد سقف البناءات = قفل الخلية (فشل مغلق موثق).
+    الصافي بنفس محاسبة إعادة التشغيل: الخشن − رسوم/انزلاق جانبين."""
+    try:
+        details = signal.get('signal_details') or {}
+        if not details.get('evidence_building'):
+            return None
+        sname = signal.get('strategy_name')
+        regime = details.get('regime')
+        if not sname or not regime:
+            return None
+        cell = (sname, str(regime))
+        net = float(profit_percentage) - 2.0 * (EVIDENCE_FEE_PCT + EVIDENCE_SLIP_PCT)
+        with EVIDENCE_STATS_LOCK:
+            EVIDENCE_LIVE_STATS.setdefault(cell, []).append(net)
+            live = list(EVIDENCE_LIVE_STATS[cell])
+            raw = list(EVIDENCE_REGIME_RAW.get(cell) or [])
+            comb = _evidence_summarize(raw + live)
+            verdict = None
+            if len(live) >= EVIDENCE_CELL_LOCK_AFTER_N and (comb.get('exp_pct') or 0.0) < 0.0:
+                EVIDENCE_CELL_LOCKS[cell] = {
+                    'reason_ar': f"توقع حي سلبي {comb.get('exp_pct', 0):+.2f}%/صفقة عبر {comb.get('n', 0)} صفقة",
+                    'locked_at': datetime.now(timezone.utc).isoformat(),
+                    'stats': dict(comb)}
+                verdict = 'locked'
+        comb_regime_ar = REGIME_AR.get(str(regime), str(regime))
+        if verdict == 'locked':
+            logger.warning(f"🔒 [بناء الدليل] قفل الخلية {sname}×{comb_regime_ar}: "
+                           f"توقع حي سلبي {comb.get('exp_pct', 0):+.2f}% بعد {len(live)} بناءات — فشل مغلق موثق")
+        else:
+            logger.info(f"🧪 [بناء الدليل] إغلاق {signal.get('symbol')} ({sname}×{comb_regime_ar}): "
+                        f"صافي {net:+.2f}% → الخلية الآن ن={comb.get('n', 0)} توقع {comb.get('exp_pct', 0):+.2f}% "
+                        f"(PF {comb.get('pf') or 0:.2f})")
+        return {'cell': f'{sname}||{regime}', 'net_pct': round(net, 4), 'stats': comb, 'verdict': verdict}
+    except Exception as ev_err:
+        logger.warning(f"⚠️ [بناء الدليل] فشل توثيق الإغلاق: {ev_err}")
+        return None
 
 
 def evidence_engine_loop():
@@ -6529,6 +6695,8 @@ def main_loop_enhanced():
                         signal_found, strategy_used = False, None
                         # [V9.18.0] مصدر الإشارة ودرجة المطابقة (للعرض والتوثيق)
                         signal_source, signal_fit_score = 'strategy_trigger', None
+                        # [V9.28.0] هل هذه صفقة بناء دليل (فترة اختبار الخلية الباردة)؟
+                        signal_is_probation: bool = False
                         # [V9.23.0] تفاصيل دليل الإشارة المقبولة (تُوثق في التفاصيل واللوحة)
                         signal_evidence_info: Optional[Dict[str, Any]] = None
                         with _scan_stats_lock: _strategy_scan_stats[name]['checks'] += 1
@@ -6563,14 +6731,24 @@ def main_loop_enhanced():
                             # [V9.23.0] بوابة الأدلة على المُطلقات أيضًا — لا إشارة بلا برهان
                             ok_ev, ev_info = evidence_gate_pass(name, (regime_info or {}).get('regime'))
                             if not ok_ev:
-                                with _scan_stats_lock: _recommendation_stats['evidence_rejected'] += 1
-                                log_rejection(symbol, "بوابة الأدلة رفضت إشارة استراتيجية", {'strategy': name, **ev_info})
-                                continue
-                            with _scan_stats_lock: _strategy_scan_stats[name]['passes'] += 1
-                            signal_found, strategy_used = True, name
-                            signal_fit_score = fit_score
-                            # [V9.24.0] دليل الإشارة = أدلة التجهيز الشرطي + أدلة الخلية التاريخية
-                            signal_evidence_info = {**setup_ev, **ev_info}
+                                # [V9.28.0] حلقة بناء الدليل: خلية باردة (ن<3) بدرجة مطابقة عالية
+                                # تحصل على صفقة ورقية محدودة تبني الدليل حيًا — بلاها حلقة مفرغة أبديًا
+                                ok_pb, pb_info = evidence_probation_allow(name, (regime_info or {}).get('regime'), fit_score)
+                                if not ok_pb:
+                                    with _scan_stats_lock: _recommendation_stats['evidence_rejected'] += 1
+                                    log_rejection(symbol, "بوابة الأدلة رفضت إشارة استراتيجية", {'strategy': name, **ev_info, 'probation': pb_info})
+                                    continue
+                                with _scan_stats_lock: _recommendation_stats['probation_opened'] += 1
+                                signal_found, strategy_used = True, name
+                                signal_fit_score = fit_score
+                                signal_is_probation = True
+                                signal_evidence_info = {**setup_ev, **ev_info, 'probation': pb_info}
+                            else:
+                                with _scan_stats_lock: _strategy_scan_stats[name]['passes'] += 1
+                                signal_found, strategy_used = True, name
+                                signal_fit_score = fit_score
+                                # [V9.24.0] دليل الإشارة = أدلة التجهيز الشرطي + أدلة الخلية التاريخية
+                                signal_evidence_info = {**setup_ev, **ev_info}
                         # [V9.24.0→V9.25.0] التجهيز الشرطي متحقق (مطابقة + فلاتر + كاشف) دون
                         # اكتمال مُطلق الشمعة → توصية موثقة بأدلة رقمية لهذه الاستراتيجية تحديدًا
                         if (not signal_found and setup_ok and RECOMMENDATIONS_ENABLED and PAIR_MATCHING_ENABLED):
@@ -6587,14 +6765,24 @@ def main_loop_enhanced():
                                     # [V9.23.0] بوابة الأدلة: لا توصية بلا برهان ربحي تاريخي للخلية
                                     ok_ev, rec_evidence_info = evidence_gate_pass(name, (regime_info or {}).get('regime'))
                                     if not ok_ev:
-                                        with _scan_stats_lock: _recommendation_stats['evidence_rejected'] += 1
-                                        log_rejection(symbol, "بوابة الأدلة رفضت التوصية", {'strategy': name, **rec_evidence_info})
-                                        continue
-                                    signal_found, strategy_used = True, name
-                                    signal_source, signal_fit_score = 'filter_recommendation', rec_score
-                                    # [V9.24.0] توثيق كامل: أدلة التجهيز الشرطي + أدلة الخلية التاريخية
-                                    signal_evidence_info = {**setup_ev, **rec_evidence_info}
-                                    logger.info(f"  -> [{symbol}] 💡 تجهيز شرطي لـ {name} (مطابقة {rec_score:.0f} + دليل: {rec_evidence_info.get('verdict_ar', '')}) → توصية شراء موثقة")
+                                        # [V9.28.0] حلقة بناء الدليل (علاج البدء البارد ن=0)
+                                        ok_pb, pb_info = evidence_probation_allow(name, (regime_info or {}).get('regime'), rec_score)
+                                        if not ok_pb:
+                                            with _scan_stats_lock: _recommendation_stats['evidence_rejected'] += 1
+                                            log_rejection(symbol, "بوابة الأدلة رفضت التوصية", {'strategy': name, **rec_evidence_info, 'probation': pb_info})
+                                            continue
+                                        with _scan_stats_lock: _recommendation_stats['probation_opened'] += 1
+                                        signal_found, strategy_used = True, name
+                                        signal_source, signal_fit_score = 'filter_recommendation', rec_score
+                                        signal_is_probation = True
+                                        signal_evidence_info = {**setup_ev, **rec_evidence_info, 'probation': pb_info}
+                                        logger.info(f"  -> [{symbol}] 🧪 تجهيز شرطي لـ {name} (مطابقة {rec_score:.0f}) → توصية بناء دليل: {pb_info.get('verdict_ar', '')}")
+                                    else:
+                                        signal_found, strategy_used = True, name
+                                        signal_source, signal_fit_score = 'filter_recommendation', rec_score
+                                        # [V9.24.0] توثيق كامل: أدلة التجهيز الشرطي + أدلة الخلية التاريخية
+                                        signal_evidence_info = {**setup_ev, **rec_evidence_info}
+                                        logger.info(f"  -> [{symbol}] 💡 تجهيز شرطي لـ {name} (مطابقة {rec_score:.0f} + دليل: {rec_evidence_info.get('verdict_ar', '')}) → توصية شراء موثقة")
 
                         if not signal_found:
                             continue
@@ -6660,6 +6848,8 @@ def main_loop_enhanced():
                         # [V9.23.0] توثيق دليل الادعاء الربحي مع الإشارة (لوحة/تليجرام/تحليل لاحق)
                         if signal_evidence_info is not None:
                             new_signal['signal_details']['evidence'] = signal_evidence_info
+                        # [V9.28.0] علم بناء الدليل — يُحفظ في قاعدة البيانات فيبقى عبر إعادة التشغيل
+                        new_signal['signal_details']['evidence_building'] = bool(signal_is_probation)
                         if regime_info:
                             new_signal['signal_details']['regime'] = regime_info.get('regime')
                             new_signal['signal_details']['regime_ar'] = REGIME_AR.get(regime_info.get('regime'), regime_info.get('regime'))
@@ -6697,7 +6887,10 @@ def main_loop_enhanced():
                                     _recommendation_stats['opened'] += 1
                                     _strategy_scan_stats[strategy_used]['recommendations'] += 1
                                 recommendations_opened_this_cycle += 1
-                            log_and_notify('info', f"إشارة: إشارة شراء جديدة لـ {symbol} من استراتيجية {strategy_used}", "NEW_SIGNAL")
+                            if signal_is_probation:
+                                log_and_notify('info', f"🧪 بناء دليل: توصية جديدة لـ {symbol} من {strategy_used} — صفقة ورقية محدودة تبني دليل خليتها حيًا", "NEW_SIGNAL")
+                            else:
+                                log_and_notify('info', f"إشارة: إشارة شراء جديدة لـ {symbol} من استراتيجية {strategy_used}", "NEW_SIGNAL")
 
                     except Exception as e:
                         logger.error(f"❌ [خطأ معالجة] للرمز {symbol}: {e}", exc_info=True)
