@@ -49,7 +49,7 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-APP_VERSION: str = 'V9.22.0'  # [V9.21.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
+APP_VERSION: str = 'V9.23.0'  # [V9.21.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
 logger = logging.getLogger(f'CryptoBot{APP_VERSION}')
 
 # زمن إقلاع العملية لحساب مدة التشغيل في لوحة التحكم
@@ -197,7 +197,27 @@ RECOMMENDATIONS_PER_CYCLE: int = config('RECOMMENDATIONS_PER_CYCLE', default=2, 
 # أدنى درجة مطابقة زوج (0-100) تؤهل الاجتياز للتحول إلى توصية — جودة قبل الكمية
 RECOMMENDATION_MIN_FIT_SCORE: float = config('RECOMMENDATION_MIN_FIT_SCORE', default=60.0, cast=float)
 # تهدئة بعد إغلاق أي صفقة لرمز معين: لا توصية جديدة لنفس الرمز خلالها (منع التأرجح)
-RECOMMENDATION_COOLDOWN_MIN: int = config('RECOMMENDATION_COOLDOWN_MIN', default=240, cast=int)
+# [V9.23.0] 480د (8 ساعات) مثبتة بالباك تيست: خفض التأرجح الربحي القصير ≤4 ساعات (خاسر -0.27%/صفقة)
+# وترفع الصافي مع بوابة الأدلة: -1.44U → +1.39U على 30 يومًا × 24 رمزًا (PF 0.93 → 1.16)
+RECOMMENDATION_COOLDOWN_MIN: int = config('RECOMMENDATION_COOLDOWN_MIN', default=480, cast=int)
+
+# ---------------------- [V9.23.0] محرك الأدلة — الترشيح بالبرهان لا بالتكهن ----------------------
+# يعيد تشغيل منطق المنتج نفسه (مطابقة + فلاتر + مُطلِقات + خروج V9.22.0) على شموع 15م
+# الأخيرة، ويقيس توقع كل خلية (استراتيجية × نمط سوقي) صافي الرسوم والانزلاق.
+# لا توصية/إشارة إلا إذا أثبتت الخلية توقعًا موجبًا حقيقيًا — مغلق أمام بلا دليل (fail-closed).
+EVIDENCE_ENABLED: bool = os.environ.get('EVIDENCE_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+EVIDENCE_WINDOW_BARS: int = int(os.environ.get('EVIDENCE_WINDOW_BARS', '960'))      # 10 أيام شموع 15م
+EVIDENCE_REFRESH_MIN: int = int(os.environ.get('EVIDENCE_REFRESH_MIN', '240'))      # تحديث كل 4 ساعات
+EVIDENCE_STRIDE: int = int(os.environ.get('EVIDENCE_STRIDE', '4'))                  # تقييم كل ساعة (خفة)
+EVIDENCE_ENTRY_SPACING: int = int(os.environ.get('EVIDENCE_ENTRY_SPACING', '4'))    # تباعد صفقات الدليل
+EVIDENCE_MAX_SYMBOLS: int = int(os.environ.get('EVIDENCE_MAX_SYMBOLS', '24'))       # سقف رموز التحديث
+# عتبات البوابة المثبتة بالباك تيست (V12): n≥5، توقع ≥ +0.12%/صفقة، PF ≥ 1.15
+EVIDENCE_MIN_TRADES: int = int(os.environ.get('EVIDENCE_MIN_TRADES', '5'))
+EVIDENCE_MIN_EXP_PCT: float = float(os.environ.get('EVIDENCE_MIN_EXP_PCT', '0.12'))
+EVIDENCE_MIN_PF: float = float(os.environ.get('EVIDENCE_MIN_PF', '1.15'))
+SMART_PICKS_TOP: int = int(os.environ.get('SMART_PICKS_TOP', '8'))                  # عرض اللوحة
+EVIDENCE_FEE_PCT: float = float(os.environ.get('EVIDENCE_FEE_PCT', '0.10'))         # رسوم/جانب
+EVIDENCE_SLIP_PCT: float = float(os.environ.get('EVIDENCE_SLIP_PCT', '0.03'))       # انزلاق/جانب
 
 REGIME_AR: Dict[str, str] = {
     'trend_up': 'اتجاه صاعد', 'trend_down': 'اتجاه هابط', 'range': 'نطاق مترنم',
@@ -404,7 +424,9 @@ _scan_stats_lock = Lock()
 # [V9.18.0] إحصاء التوصيات المفتوحة من اجتياز الفلاتر (لللوحة):
 # opened = فُتحت فعليًا | gate_rejected = رفضتها بوابات التأكيد النهائية
 # cooldown_skipped = الرمز ضمن تهدئة ما بعد الإغلاق | below_min_score = درجة المطابقة دون الحد
-_recommendation_stats: Counter = Counter({'opened': 0, 'gate_rejected': 0, 'cooldown_skipped': 0, 'below_min_score': 0})
+_recommendation_stats: Counter = Counter({'opened': 0, 'gate_rejected': 0, 'cooldown_skipped': 0, 'below_min_score': 0, 'evidence_rejected': 0})
+# [V9.23.0] علم إعادة تشغيل الدليل — يُصمت به سجل الرفضات والمحاسبة أثناء الباك تيست الداخلي
+_evidence_replaying: bool = False
 _recent_close_ts: Dict[str, float] = {}   # رمز -> طابع زمني إغلاقه الأخير (تهدئة سريعة الذاكرة)
 _last_cache_reconcile: float = 0.0        # [V9.19.1] آخر مصالحة كاش الصفقات الفارغ
 current_market_state: Dict[str, Any] = {"overall_regime": "INITIALIZING", "trend_details_by_tf": {}, "last_updated": None}
@@ -2116,6 +2138,8 @@ def log_and_notify(level: str, message: str, notification_type: str):
         if conn: conn.rollback()
 
 def log_rejection(symbol: str, reason_key: str, details: Optional[Dict] = None):
+    if _evidence_replaying:
+        return  # [V9.23.0] صمت أثناء إعادة تشغيل الدليل — لا ضجيج ولا منافسة على الكاشات
     reason_ar = REJECTION_REASONS_AR.get(reason_key, reason_key)
     log_message = f"🚫 [{symbol}] تم الرفض | السبب: {reason_ar} | تفاصيل: {details or {}}"
     logger.info(log_message)
@@ -2647,6 +2671,8 @@ def load_notifications_to_cache():
 # --- [إعادة تصميم V9.14.0] بوابة عقلانية عامة + فلتر خاص لكل استراتيجية ---
 def _count_strategy_filter_reject(strategy_name: str, filter_label: str):
     """محاسبة رفضات الفلتر الخاص بكل استراتيجية (لتحليل لوحة التحكم)."""
+    if _evidence_replaying:
+        return  # [V9.23.0] لا محاسبة أثناء إعادة تشغيل الدليل
     with _scan_stats_lock:
         _strategy_filter_stats[strategy_name][filter_label] += 1
 
@@ -3769,6 +3795,16 @@ def get_dashboard_html():
             <div class="card p-4"><h3 class="font-bold mb-3 text-lg text-text-secondary">الصفقات المفتوحة</h3><div id="open-trades-count" class="text-2xl font-bold text-center">...</div></div>
             <div class="card p-4 flex flex-col justify-center items-center"><h3 class="font-bold text-lg text-text-secondary mb-2">التداول الحقيقي</h3><div class="flex items-center space-x-3 space-x-reverse"><span id="trading-status-text" class="font-bold text-lg"></span><label class="flex items-center cursor-pointer"><div class="relative"><input type="checkbox" id="trading-toggle" class="sr-only" onchange="toggleTrading()"><div class="toggle-bg block bg-gray-600 w-12 h-7 rounded-full"></div></div></label></div><div class="mt-2 text-xs text-text-secondary">رصيد USDT: <span id="usdt-balance" class="font-mono">...</span></div></div>
         </section>
+        <!-- [V9.23.0] الترشيح الذكي — برهان لا تكهن -->
+        <section class="card p-4 mb-6">
+            <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
+                <h3 class="font-bold text-lg text-text-secondary">🎯 الترشيح الذكي — برهان باك تيست حي لا تكهن</h3>
+                <div class="text-xs text-text-secondary font-mono" id="smart-picks-updated" dir="ltr">--</div>
+            </div>
+            <div id="smart-picks-container" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+                <div class="text-text-secondary text-sm text-center py-4">جاري تحميل الأدلة...</div>
+            </div>
+        </section>
         <!-- [تحسين V9.11] بوصلة اتجاه BTC على الفريمات الثلاث (API مجاني) -->
         <section class="card p-4 mb-6">
             <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
@@ -4368,8 +4404,34 @@ const updateDataFeed = () => {
     }).catch(() => {});
 };
 
+function updateSmartPicks() {
+    fetchData('/api/smart_picks').then(data => {
+        if (!data) return;
+        document.getElementById('smart-picks-updated').textContent = data.updated_at ? new Date(data.updated_at).toLocaleTimeString('ar-EG') : '--';
+        const c = document.getElementById('smart-picks-container');
+        if (!c) return;
+        if (!data.enabled || !data.ready) { c.innerHTML = `<div class="text-text-secondary text-sm text-center py-4">${data.reason_ar || 'المحرك يجهز أدلته...'}</div>`; return; }
+        if (!data.picks || !data.picks.length) { c.innerHTML = `<div class="text-accent-yellow text-sm text-center py-4">${data.reason_ar || 'لا خلية مثبتة الربحية الآن — الانتظار أفضل من التكهن'}</div>`; return; }
+        c.innerHTML = data.picks.map((p, idx) => {
+            const syms = (p.symbols || []).map(s => `<span class="text-xs px-2 py-0.5 rounded border ${idx === 0 ? 'border-accent-green/60 text-accent-green' : 'border-border-color text-text-secondary'}" style="border-style:solid">${s.symbol}</span>`).join(' ');
+            const ev = p.evidence || {};
+            return `<div class="rounded-lg border ${idx === 0 ? 'border-accent-green/60 bg-accent-green/5' : 'border-border-color bg-black/30'} p-3">
+                <div class="flex items-center justify-between mb-1">
+                    <span class="font-bold ${idx === 0 ? 'text-accent-green' : 'text-text-primary'}">${idx === 0 ? '★ ' : ''}${p.strategy.replace(/_/g, ' ')}</span>
+                    <span class="text-[10px] px-1.5 py-0.5 rounded border border-border-color text-text-secondary">${p.regime_ar}</span>
+                </div>
+                <div class="text-xs text-text-secondary mb-2">${p.why_ar}</div>
+                <div class="flex items-center justify-between flex-wrap gap-1">
+                    <div class="flex gap-1 flex-wrap">${syms}</div>
+                    <span class="text-[10px] font-mono text-text-secondary" dir="ltr">n=${ev.n} · PF=${ev.pf} · WR=${ev.wr}%</span>
+                </div>
+            </div>`;
+        }).join('');
+    });
+}
+
 document.addEventListener('DOMContentLoaded', () => {
-    ['MarketStatus', 'Signals', 'Stats', 'Notifications', 'Rejections', 'SystemStatus', 'BtcTrend', 'LeaderMap'].forEach(f => window[`update${f}`]());
+    ['MarketStatus', 'Signals', 'Stats', 'Notifications', 'Rejections', 'SystemStatus', 'BtcTrend', 'LeaderMap', 'SmartPicks'].forEach(f => window[`update${f}`]());
     updateDataFeed();  // [V9.20.0] شارة مصدر البيانات
     // [تحسين V9.11.0] إيقاف الاستطلاع عند إخفاء التبويب — يمنع تراكم الطلبات
     // من التبويبات الخلفية ويخفف الضغط على خيوط الخادم (waitress queue)
@@ -4379,6 +4441,7 @@ document.addEventListener('DOMContentLoaded', () => {
     whenVisible(updateBtcTrend, 30000);  // [تحسين V9.11] البوصلة تُحدّث كل 30 ثانية
     whenVisible(updateLeaderMap, 60000); // [تحسين V9.13.0] خريطة القيادة تُحدّث كل دقيقة (التصنيف بطيء التغير)
     whenVisible(updateDataFeed, 60000);  // [V9.20.0] شارة مصدر البيانات كل دقيقة
+    whenVisible(updateSmartPicks, 120000); // [V9.23.0] الترشيح الذكي — الأدلة تتجدد كل 4 ساعات
 });
 </script>
 </body></html>
@@ -4584,6 +4647,64 @@ def api_strategy_pairs():
                         'min_score': PAIR_MATCH_MIN_SCORE, 'enabled': PAIR_MATCHING_ENABLED})
     except Exception as api_err:
         logger.error(f"❌ [API أزواج الاستراتيجيات] خطأ: {api_err}", exc_info=True)
+        return jsonify({'error': str(api_err)}), 500
+
+@app.route('/api/smart_picks')
+def api_smart_picks():
+    """[V9.23.0] الترشيح الذكي بالأدلة: العملة المناسبة والاستراتيجية المناسبة الآن —
+    برهان باك تيست حي (توقع صافي بعد الرسوم لكل خلية استراتيجية×ريم) لا تكهن.
+    best = أقوى خلية مجتازة مع أفضل رموزها الحالية في نفس الريم."""
+    try:
+        if not EVIDENCE_ENABLED:
+            return jsonify({'enabled': False, 'reason_ar': 'محرك الأدلة معطل بالإعدادات (EVIDENCE_ENABLED=false)'})
+        with EVIDENCE_STATS_LOCK:
+            cells = {f'{k[0]}||{k[1]}': dict(v) for k, v in EVIDENCE_REGIME_STATS.items()}
+            pairs = {f'{k[0]}||{k[1]}': dict(v) for k, v in EVIDENCE_PAIR_STATS.items()}
+            sym_regime = dict(EVIDENCE_SYMBOL_REGIME)
+            updated = EVIDENCE_UPDATED_AT
+        if not cells or not updated:
+            return jsonify({'enabled': True, 'ready': False,
+                            'reason_ar': 'أول تحديث للأدلة جارٍ (يستغرق دقائق بعد الإقلاع) — لا ترشيح بلا برهان',
+                            'updated_at': None})
+        with signal_cache_lock:
+            open_syms = set(open_signals_cache.keys())
+        picks = []
+        for key, st in cells.items():
+            sname, regime = key.split('||')
+            if st.get('n', 0) < EVIDENCE_MIN_TRADES:
+                continue
+            exp_pct, pf = st.get('exp_pct'), st.get('pf')
+            if exp_pct is None or exp_pct < EVIDENCE_MIN_EXP_PCT or pf is None or pf < EVIDENCE_MIN_PF:
+                continue
+            syms_now = [s for s, r in sym_regime.items() if r == regime and s not in open_syms]
+            ranked = []
+            for s in syms_now:
+                pst = pairs.get(f'{sname}||{s}') or {}
+                score = (pst.get('exp_pct') or -9.0) * min(pst.get('n', 0), 50)
+                ranked.append({'symbol': s, 'pair_n': pst.get('n', 0),
+                               'pair_exp_pct': pst.get('exp_pct'), 'pair_pf': pst.get('pf'),
+                               '_score': score})
+            ranked.sort(key=lambda x: x['_score'], reverse=True)
+            for r in ranked[:3]:
+                r.pop('_score')
+            picks.append({
+                'strategy': sname, 'regime': regime,
+                'regime_ar': REGIME_AR.get(regime, regime),
+                'evidence': st,
+                'why_ar': f"الخلية حققت {exp_pct:+.2f}%/صفقة عبر {st['n']} صفقة (PF {pf:.2f}، فوز {st.get('wr', 0):.0f}%) آخر 10 أيام بعد الرسوم",
+                'symbols': ranked,
+            })
+        picks.sort(key=lambda p: -(p['evidence']['exp_pct'] * max(1.0, p['evidence']['pf'])))
+        result = {'enabled': True, 'ready': True, 'updated_at': updated,
+                  'thresholds': {'min_trades': EVIDENCE_MIN_TRADES,
+                                 'min_exp_pct': EVIDENCE_MIN_EXP_PCT, 'min_pf': EVIDENCE_MIN_PF},
+                  'picks': picks[:SMART_PICKS_TOP],
+                  'best': picks[0] if picks else None}
+        if not picks:
+            result['reason_ar'] = 'لا خلية (استراتيجية×ريم) مثبتة الربحية الآن — الانتظار أفضل من التكهن'
+        return jsonify(result)
+    except Exception as api_err:
+        logger.error(f"❌ [API الترشيح الذكي] خطأ: {api_err}", exc_info=True)
         return jsonify({'error': str(api_err)}), 500
 
 @app.route('/api/rejection_logs')
@@ -5041,6 +5162,236 @@ def trade_management_loop():
             time.sleep(10)
 
 
+# ===================== [V9.23.0] محرك الأدلة — الترشيح بالبرهان لا بالتكهن =====================
+# الفلسفة: درجة المطابقة النمطية (V9.17.0) تقيس "هل البيئة تناسب شخصية الاستراتيجية"
+# ولا تقيس "هل هذا المزيج يربح فعلًا بعد التكاليف" — الباك تيست (30 يومًا × 24 رمزًا ×
+# 53 ألف حدث بمنطق المنتج حرفيًا) أثبت أن أولها يخسر -1.44U والثاني هو الفارق.
+# الحل: إعادة تشغيل دورية (كل EVIDENCE_REFRESH_MIN) لمنطق المنتج كاملًا على شموع
+# 15م الأخيرة لكل رمز: مطابقة الريم + الفلاتر الخاصة + المُطلِقات + محرك خروج
+# V9.22.0 (جزئية + تمديد + تريلينغ) — ثم تجميع توقع كل خلية (استراتيجية × ريم)
+# صافي الرسوم والانزلاق. البوابة: n ≥ 5، توقع ≥ +0.12%/صفقة، PF ≥ 1.15 (مثبت V12).
+
+EVIDENCE_REGIME_STATS: Dict[Tuple[str, str], Dict[str, Any]] = {}
+EVIDENCE_PAIR_STATS: Dict[Tuple[str, str], Dict[str, Any]] = {}
+EVIDENCE_STATS_LOCK = Lock()
+EVIDENCE_UPDATED_AT: Optional[str] = None
+EVIDENCE_SYMBOL_REGIME: Dict[str, str] = {}     # آخر ريم لكل رمز من حلقة المسح (للعرض)
+EVIDENCE_REFRESH_LOCK = Lock()
+
+# سجل الاستراتيجيات المفعلة (نفس ترتيب الحلقة الرئيسية) — يُبنى مرة
+def _evidence_strategy_table() -> List[Tuple[str, Any, str]]:
+    return [
+        ('MACD_EMA', check_macd_ema_strategy, 'MACD_EMA_Crossover'),
+        ('BB_STOCH', check_bb_stoch_strategy_enhanced, 'BB_Stoch_Reversal_Enhanced'),
+        ('EMA_RSI', check_ema_rsi_strategy, 'EMA_RSI_Cross'),
+        ('PULLBACK', check_pullback_strategy, 'Pullback_MACD'),
+        ('BB_SQUEEZE', check_bb_squeeze_strategy, 'BB_Squeeze_Breakout'),
+        ('BULLISH_MOMENTUM', check_bullish_momentum_strategy, 'Bullish_Momentum'),
+        ('SR_BREAKOUT', check_support_resistance_strategy_enhanced, 'SR_Breakout_Enhanced'),
+    ]
+
+
+def _evidence_summarize(nets: List[float]) -> Dict[str, Any]:
+    if not nets:
+        return {'n': 0, 'exp_pct': None, 'pf': None, 'wr': None}
+    wins = [x for x in nets if x > 0]
+    losses = [x for x in nets if x < 0]
+    pf = (sum(wins) / abs(sum(losses))) if losses else (99.0 if wins else 0.0)
+    return {'n': len(nets), 'exp_pct': round(sum(nets) / len(nets), 4),
+            'pf': round(min(pf, 99.0), 3), 'wr': round(100.0 * len(wins) / len(nets), 1)}
+
+
+def _evidence_simulate_exit(df: pd.DataFrame, sig_i: int, atr_sig: float, n: int) -> Optional[float]:
+    """محاكاة خروج وفية لمحرك V9.22.0 (نفسها الباك تيست الخارجي):
+    SL=2.5×ATR (×1.2 تقلب عالٍ / ×0.8 هادئ)، TP=4×ATR بنفس التعديل، جزئية 40%
+    (60% إذا RR≥2) عند الهدف مع نقل الوقف إليه، تمديد +1.25×ATR، تريلينغ ببوابة
+    +1.5% ومضاعف 2.8 من القمة. الدخول عند open الشمعة التالية (واقعي).
+    تبسيطان موثّقان: الهدف الممتد = TP+1.25×ATR بلا مسح مقاومات، وأقصى احتفاظ 48 ساعة.
+    يعيد الصافي % بعد رسوم جانبين + انزلاق، أو None إن تعذر."""
+    try:
+        e_i = sig_i + 1
+        if e_i >= n:
+            return None
+        entry = float(df['open'].iloc[e_i])
+        atr = float(atr_sig)
+        if not (entry > 0 and atr > 0):
+            return None
+        atr_pct = (atr / entry) * 100.0
+        slm, tpm = 2.5, 4.0
+        if atr_pct > 3.0:
+            slm *= 1.2
+            tpm *= 1.2
+        elif atr_pct < 1.0:
+            slm *= 0.8
+            tpm *= 0.8
+        sl_d, tp_d = atr * slm, atr * tpm
+        sl, tp = entry - sl_d, entry + tp_d
+        rr = tp_d / sl_d if sl_d > 0 else 0.0
+        frac = 0.6 if rr >= 2.0 else 0.4
+        tp2 = entry + tp_d + 1.25 * atr
+        peak, sl_act, partial_done = entry, sl, False
+        fills: List[Tuple[float, float]] = []
+        end_j = min(n, e_i + 192)
+        if end_j <= e_i:
+            return None
+        for j in range(e_i, end_j):
+            lo = float(df['low'].iloc[j])
+            hi = float(df['high'].iloc[j])
+            if lo <= sl_act:
+                fills.append((sl_act, 1.0 - sum(f for _, f in fills)))
+                break
+            if not partial_done and hi >= tp:
+                fills.append((tp, frac))
+                partial_done = True
+                sl_act = max(sl_act, tp)
+                if hi >= tp2:
+                    fills.append((tp2, 1.0 - sum(f for _, f in fills)))
+                    break
+                if lo <= sl_act:
+                    fills.append((sl_act, 1.0 - sum(f for _, f in fills)))
+                    break
+            elif partial_done and hi >= tp2:
+                fills.append((tp2, 1.0 - sum(f for _, f in fills)))
+                break
+            if hi > peak:
+                peak = hi
+            if (ATR_TRAIL_ACTIVATE_PROFIT_PCT <= 0) or (peak >= entry * (1.0 + ATR_TRAIL_ACTIVATE_PROFIT_PCT / 100.0)):
+                a = float(df['atr'].iloc[j])
+                if a and a > 0:
+                    cand = peak - a * ATR_TS_MULTIPLIER
+                    if cand > sl_act:
+                        sl_act = cand
+        else:
+            px = float(df['close'].iloc[end_j - 1])
+            fills.append((px, 1.0 - sum(f for _, f in fills)))
+        if not fills:
+            return None
+        gross = sum(p * f for p, f in fills) / entry - 1.0
+        return gross * 100.0 - 2.0 * (EVIDENCE_FEE_PCT + EVIDENCE_SLIP_PCT)
+    except Exception:
+        return None
+
+
+def _evidence_replay_symbol(symbol: str, btc_df: Optional[pd.DataFrame]) -> List[Tuple[str, str, float]]:
+    """إعادة تشغيل منطق المنتج على نافذة الدليل لرمز واحد → قائمة (استراتيجية، ريم، صافي%)."""
+    out: List[Tuple[str, str, float]] = []
+    df = fetch_historical_data(symbol, SIGNAL_GENERATION_TIMEFRAME, SIGNAL_GENERATION_LOOKBACK_DAYS)
+    if df is None or len(df) < 300:
+        return out
+    df_feat = calculate_all_features(df, btc_df)
+    if df_feat.empty:
+        return out
+    n = len(df_feat)
+    start = max(230, n - EVIDENCE_WINDOW_BARS)
+    stop = n - 4
+    table = _evidence_strategy_table()
+    last_sig: Dict[str, int] = {name: -10 ** 9 for _, _, name in table}
+    for i in range(start, stop, EVIDENCE_STRIDE):
+        atr_i = float(df_feat['atr'].iloc[i]) if 'atr' in df_feat else 0.0
+        if not (atr_i > 0):
+            continue
+        win = df_feat.iloc[max(0, i - 400 + 1): i + 1]
+        win.name = symbol
+        if len(win) < 60 or not passes_market_sanity_filter(win):
+            continue
+        ri = compute_symbol_regime(win)
+        if not ri:
+            continue
+        regime = str(ri.get('regime'))
+        for _, fn, name in table:
+            if i - last_sig[name] < EVIDENCE_ENTRY_SPACING:
+                continue
+            fit = score_strategy_pair_fit(ri, name)
+            if fit is None or fit < PAIR_MATCH_MIN_SCORE:
+                continue
+            if not passes_strategy_prefilters(win, name):
+                continue
+            if not fn(win):
+                continue
+            net = _evidence_simulate_exit(df_feat, i, atr_i, n)
+            if net is not None:
+                out.append((name, regime, float(net)))
+                last_sig[name] = i + EVIDENCE_ENTRY_SPACING
+    return out
+
+
+def _refresh_evidence_engine() -> Dict[str, Any]:
+    """تحديث كامل لأدلة الخلايا والأزواج — يعيد ملخصًا للتشخيص واللوحة."""
+    global EVIDENCE_REGIME_STATS, EVIDENCE_PAIR_STATS, EVIDENCE_UPDATED_AT
+    with EVIDENCE_REFRESH_LOCK:
+        if _evidence_replaying:
+            return {'skipped': 'already_running'}
+        globals()['_evidence_replaying'] = True
+        t0 = time.time()
+        try:
+            syms = list(validated_symbols_to_scan)[:EVIDENCE_MAX_SYMBOLS]
+            if not syms:
+                return {'skipped': 'empty_universe'}
+            btc_df = get_btc_data_for_bot()
+            cells: Dict[Tuple[str, str], List[float]] = {}
+            pairs: Dict[Tuple[str, str], List[float]] = {}
+            done = 0
+            for sym in syms:
+                try:
+                    trades = _evidence_replay_symbol(sym, btc_df)
+                    for (sname, regime, net) in trades:
+                        cells.setdefault((sname, regime), []).append(net)
+                        pairs.setdefault((sname, sym), []).append(net)
+                    done += 1
+                except Exception as sym_err:
+                    logger.warning(f"🧪 [محرك الأدلة] تخطي {sym}: {sym_err}")
+            with EVIDENCE_STATS_LOCK:
+                EVIDENCE_REGIME_STATS = {k: _evidence_summarize(v) for k, v in cells.items()}
+                EVIDENCE_PAIR_STATS = {k: _evidence_summarize(v) for k, v in pairs.items()}
+                globals()['EVIDENCE_UPDATED_AT'] = datetime.now(timezone.utc).isoformat()
+            passing = [k for k, st in EVIDENCE_REGIME_STATS.items()
+                       if st.get('n', 0) >= EVIDENCE_MIN_TRADES
+                       and (st.get('exp_pct') or -9) >= EVIDENCE_MIN_EXP_PCT
+                       and (st.get('pf') or 0) >= EVIDENCE_MIN_PF]
+            summary = {'symbols': done, 'cells': len(EVIDENCE_REGIME_STATS),
+                       'passing_cells': len(passing), 'sec': round(time.time() - t0, 1)}
+            logger.info(f"🧪 [محرك الأدلة] تحديث: {summary}")
+            return summary
+        finally:
+            globals()['_evidence_replaying'] = False
+
+
+def evidence_gate_pass(strategy_name: str, regime: Optional[str]) -> Tuple[bool, Dict[str, Any]]:
+    """بوابة الدليل: (اجتياز؟، تفاصيل). تعطل المحرك = اجتياز دائم (سلوك قديم).
+    بلا دليل كافٍ أو توقع دون العتبة = رفض (fail-closed) — لا صفقات بلا برهان."""
+    if not EVIDENCE_ENABLED:
+        return True, {'engine': 'disabled'}
+    if not regime:
+        return False, {'reason_ar': 'لا يوجد نمط سوقي محسوم — لا دليل', 'n': 0}
+    with EVIDENCE_STATS_LOCK:
+        st = dict(EVIDENCE_REGIME_STATS.get((strategy_name, str(regime))) or {})
+    n, exp_pct, pf = st.get('n', 0), st.get('exp_pct'), st.get('pf')
+    info = {'strategy': strategy_name, 'regime': regime,
+            'regime_ar': REGIME_AR.get(str(regime), str(regime)),
+            'n': n, 'exp_pct': exp_pct, 'pf': pf,
+            'min_n': EVIDENCE_MIN_TRADES, 'min_exp_pct': EVIDENCE_MIN_EXP_PCT,
+            'min_pf': EVIDENCE_MIN_PF, 'updated_at': EVIDENCE_UPDATED_AT}
+    if n < EVIDENCE_MIN_TRADES:
+        info['reason_ar'] = f'أدلة غير كافية ({n} صفقة < {EVIDENCE_MIN_TRADES})'
+        return False, info
+    if exp_pct is None or exp_pct < EVIDENCE_MIN_EXP_PCT or pf is None or pf < EVIDENCE_MIN_PF:
+        info['reason_ar'] = f'التوقع التاريخي سلبي أو دون العتبة ({(exp_pct or 0):+.2f}%/صفقة، PF {pf or 0:.2f})'
+        return False, info
+    info['verdict_ar'] = f"مثبت ربحيًا: {exp_pct:+.2f}%/صفقة عبر {n} صفقة (PF {pf:.2f}) آخر 10 أيام"
+    return True, info
+
+
+def evidence_engine_loop():
+    """خيط خلفي: تحديث أولي بعد تدفئة WS ثم دوري كل EVIDENCE_REFRESH_MIN."""
+    time.sleep(150)  # مهلة تدفئة مركز WS وتحميل الكون الديناميكي
+    while True:
+        try:
+            _refresh_evidence_engine()
+        except Exception as ev_err:
+            logger.error(f"❌ [محرك الأدلة] فشل التحديث: {ev_err}", exc_info=True)
+        time.sleep(max(900, EVIDENCE_REFRESH_MIN * 60))
+
+
 def main_loop_enhanced():
     global strategy_pair_pools, pair_pools_updated_at
     logger.info("[الحلقة الرئيسية] انتظار اكتمال التهيئة...")
@@ -5118,10 +5469,15 @@ def main_loop_enhanced():
 
                         # [V9.17.0] نمط الزوج السوقي (اتجاه/نطاق/انضغاط) — من نفس الشموع بلا وزن شبكي
                         regime_info = compute_symbol_regime(df_with_indicators)
+                        # [V9.23.0] سجل ريم الرمز الحالي — يغذي /api/smart_picks
+                        if regime_info:
+                            EVIDENCE_SYMBOL_REGIME[symbol] = str(regime_info.get('regime'))
 
                         signal_found, strategy_used = False, None
                         # [V9.18.0] مصدر الإشارة ودرجة المطابقة (للعرض والتوثيق)
                         signal_source, signal_fit_score = 'strategy_trigger', None
+                        # [V9.23.0] تفاصيل دليل الإشارة المقبولة (تُوثّق في التفاصيل واللوحة)
+                        signal_evidence_info: Optional[Dict[str, Any]] = None
                         # [V9.18.0] الاستراتيجيات التي اجتاز هذا الزوج فلاترها كاملة
                         # (مطابقة النمط + الفلاتر الخاصة) دون اكتمال مُطلِق الشمعة
                         filter_passed_candidates: List[Tuple[str, float]] = []
@@ -5164,9 +5520,16 @@ def main_loop_enhanced():
                             if not passes_strategy_prefilters(df_with_indicators, name):
                                 continue
                             if check_func(df_with_indicators):
+                                # [V9.23.0] بوابة الأدلة على المُطلِقات أيضًا — لا إشارة بلا برهان
+                                ok_ev, ev_info = evidence_gate_pass(name, (regime_info or {}).get('regime'))
+                                if not ok_ev:
+                                    with _scan_stats_lock: _recommendation_stats['evidence_rejected'] += 1
+                                    log_rejection(symbol, "بوابة الأدلة رفضت إشارة استراتيجية", {'strategy': name, **ev_info})
+                                    continue
                                 with _scan_stats_lock: _strategy_scan_stats[name]['passes'] += 1
                                 signal_found, strategy_used = True, name
                                 signal_fit_score = fit_score
+                                signal_evidence_info = ev_info
                                 break
                             # [V9.18.0] الفلاتر اجتازت كاملة (مطابقة + خاصة) دون مُطلِق
                             # الشمعة → مرشّح توصية شراء (يُختار الأفضل درجةً بعد الحلقة)
@@ -5185,9 +5548,16 @@ def main_loop_enhanced():
                                     with _scan_stats_lock: _recommendation_stats['cooldown_skipped'] += 1
                                     logger.info(f"⏳ [{symbol}] ضمن تهدئة ما بعد الإغلاق — لا توصية جديدة الآن")
                                 else:
+                                    # [V9.23.0] بوابة الأدلة: لا توصية بلا برهان ربحي تاريخي للخلية
+                                    ok_ev, rec_evidence_info = evidence_gate_pass(rec_name, (regime_info or {}).get('regime'))
+                                    if not ok_ev:
+                                        with _scan_stats_lock: _recommendation_stats['evidence_rejected'] += 1
+                                        log_rejection(symbol, "بوابة الأدلة رفضت التوصية", {'strategy': rec_name, **rec_evidence_info})
+                                        continue
                                     signal_found, strategy_used = True, rec_name
                                     signal_source, signal_fit_score = 'filter_recommendation', rec_score
-                                    logger.info(f"  -> [{symbol}] 💡 اجتياز فلاتر {rec_name} (مطابقة {rec_score:.0f}) → توصية شراء مفتوحة")
+                                    signal_evidence_info = rec_evidence_info
+                                    logger.info(f"  -> [{symbol}] 💡 اجتياز فلاتر {rec_name} (مطابقة {rec_score:.0f} + دليل: {rec_evidence_info.get('verdict_ar', '')}) → توصية شراء مفتوحة")
                         
                         if not signal_found:
                             continue
@@ -5250,6 +5620,9 @@ def main_loop_enhanced():
                         new_signal['signal_details']['source'] = signal_source
                         if signal_fit_score is not None:
                             new_signal['signal_details']['fit_score'] = round(float(signal_fit_score), 1)
+                        # [V9.23.0] توثيق دليل الادعاء الربحي مع الإشارة (لوحة/تليجرام/تحليل لاحق)
+                        if signal_evidence_info is not None:
+                            new_signal['signal_details']['evidence'] = signal_evidence_info
                         if regime_info:
                             new_signal['signal_details']['regime'] = regime_info.get('regime')
                             new_signal['signal_details']['regime_ar'] = REGIME_AR.get(regime_info.get('regime'), regime_info.get('regime'))
@@ -5434,6 +5807,7 @@ def initialize_bot_services():
     Thread(target=balance_refresh_loop, daemon=True).start()  # [تحسين V9.11.0] كاش رصيد اللوحة
     Thread(target=btc_trend_loop, daemon=True).start()        # [تحسين V9.11] بوصلة اتجاه BTC
     Thread(target=leader_data_loop, daemon=True).start()      # [تحسين V9.13.0] بيانات قادة خريطة القيادة
+    Thread(target=evidence_engine_loop, daemon=True).start()  # [V9.23.0] محرك الأدلة — ترشيح بالبرهان
     logger.info("✅ [خدمات البوت] تم بدء جميع الخدمات الخلفية بنجاح.")
     hub_line = ''
     if stream_hub is not None:

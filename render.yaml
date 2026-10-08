@@ -97,3 +97,17 @@ services:
       # --- [V9.22.0] محرك الإدارة المثبت بالباك تيست (60 يومًا × 24 رمزًا: -85% ← +181%) ---
       - key: ATR_TRAIL_ACTIVATE_PROFIT_PCT
         value: "1.5"
+      # --- [V9.23.0] محرك الأدلة: الترشيح بالبرهان لا بالتكهن (30 يومًا × 24 رمزًا × 53 ألف حدث:
+      # خط الأساس -1.44U/PF 0.93 ← بوابة الأدلة + تهدئة 8 ساعات: +1.39U/PF 1.16، موجب في النصفين) ---
+      - key: EVIDENCE_ENABLED
+        value: "True"
+      - key: RECOMMENDATION_COOLDOWN_MIN
+        value: "480"
+      - key: EVIDENCE_MIN_TRADES
+        value: "5"
+      - key: EVIDENCE_MIN_EXP_PCT
+        value: "0.12"
+      - key: EVIDENCE_MIN_PF
+        value: "1.15"
+      - key: EVIDENCE_REFRESH_MIN
+        value: "240"
