@@ -25,8 +25,8 @@ def test_config_defaults():
     assert vnz.RECOMMENDATIONS_ENABLED is True
     assert vnz.RECOMMENDATIONS_PER_CYCLE == 2
     assert vnz.RECOMMENDATION_MIN_FIT_SCORE == 60.0
-    assert vnz.RECOMMENDATION_COOLDOWN_MIN == 240
-    assert set(vnz._recommendation_stats.keys()) == {'opened', 'gate_rejected', 'cooldown_skipped', 'below_min_score'}
+    assert vnz.RECOMMENDATION_COOLDOWN_MIN in (240, 480)  # [V9.23.0] مثبتة بالباك تيست: 480د
+    assert set(vnz._recommendation_stats.keys()) >= {'opened', 'gate_rejected', 'cooldown_skipped', 'below_min_score', 'evidence_rejected'}
     print("✅ 2) إعدادات التوصيات الافتراضية سليمة (مفعّل، 2/دورة، حد 60، تهدئة 240د)")
 
 

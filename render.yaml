@@ -67,6 +67,12 @@ services:
         value: "10000000"
       - key: DYNAMIC_UNIVERSE_MIN_RANGE_PCT
         value: "1.5"
+      # --- [V9.25.0] دائرة الترشيح الموسعة: كون واسع 120 عملة + 10 عملات للفحص × كل استراتيجية
+      # (العدد الكلي للفحص = 10 × عدد الاستراتيجيات — طلب المستخدم الصريح) ---
+      - key: WIDE_UNIVERSE_SIZE
+        value: "120"
+      - key: NOMINEES_PER_STRATEGY
+        value: "10"
       # --- [V9.10.1] منع اختناق خيوط الويب: كاش رصيد اللوحة بدل النداء المباشر ---
       - key: DASHBOARD_BALANCE_REFRESH_SEC
         value: "45"

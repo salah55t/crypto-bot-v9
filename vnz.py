@@ -49,7 +49,7 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-APP_VERSION: str = 'V9.24.0'  # [V9.21.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
+APP_VERSION: str = 'V9.25.0'  # [V9.21.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
 logger = logging.getLogger(f'CryptoBot{APP_VERSION}')
 
 # زمن إقلاع العملية لحساب مدة التشغيل في لوحة التحكم
@@ -353,6 +353,19 @@ DYNAMIC_UNIVERSE_MIN_QUOTE_VOLUME: float = config('DYNAMIC_UNIVERSE_MIN_QUOTE_VO
 # حد أدنى للتقلب: المدى اليومي % (يقصّ العملات الميتة ويستهدف الانفجارات السعرية)
 DYNAMIC_UNIVERSE_MIN_RANGE_PCT: float = config('DYNAMIC_UNIVERSE_MIN_RANGE_PCT', default=1.5, cast=float)
 
+# --- [V9.25.0] دائرة الترشيح الموسعة: 10 عملات للفحص × كل استراتيجية (طلب المستخدم الصريح) ---
+# "قم بتوسيع دائرة العملات التي تفحص بحيث ترشح 10 عملات للفحص مناسبة لكل استراتيجية
+#  اي العدد الكلي 10×عدد الاستراتيجيات"
+# الكون الواسع: يُبنى من نفس طلب التكه المجاني الواحد (صفر وزن إضافي) — دائرة الرصد
+# تتوسع من حجم القائمة العميقة (~20) إلى WIDE_UNIVERSE_SIZE ليتوفر لكل استراتيجية
+# مخزون كافٍ يرشح منه عملاتها العشر الأقرب لظروفها.
+WIDE_UNIVERSE_SIZE: int = config('WIDE_UNIVERSE_SIZE', default=120, cast=int)
+# عدد العملات المرشحة للفحص لكل استراتيجية في الدورة — العدد الكلي = 10 × عدد الاستراتيجيات
+NOMINEES_PER_STRATEGY: int = config('NOMINEES_PER_STRATEGY', default=10, cast=int)
+# [V9.25.0] أرضية سيولة الدائرة الواسعة — أخف من أرضية القائمة العميقة حتى لا يفرغ
+# التوسع في سوق خامل (حياً: 10M أهلّت 20 عملة فقط على Bybit — 3M تفتح الدائرة دون قمامة)
+WIDE_UNIVERSE_MIN_QUOTE_VOLUME: float = config('WIDE_UNIVERSE_MIN_QUOTE_VOLUME', default=3000000.0, cast=float)
+
 # --- [تحسين V9.13.0] خريطة القيادة: أي قائد سيادي تتبعه كل عملة (BTC/ETH/SOL)؟ ---
 # الأصل: العملات الأصغر تتحرك تحت مظلة قادة السوق. نحسب ارتباط عوائد كل عملة مع كل
 # قائد من شموع 15م (المجلوبة أصلًا للمسح مقابل كاش القادة — صفر نداء إضافي للمسح)
@@ -442,6 +455,17 @@ universe_lock = Lock()
 universe_last_refresh: float = 0.0
 universe_source: str = 'static'  # dynamic / static_fallback / static
 universe_meta: Dict[str, Any] = {}
+# [V9.25.0] الكون الواسع (دائرة الرصد الموسعة) + مرشحو كل استراتيجية للفحص
+# wide_universe_rows: مقاييس التكه المجانية لكل رمز في الدائرة الواسعة (120) —
+# مصدر الترشيح الحتمي لكل استراتيجية. STRATEGY_NOMINEES: أفضل 10 لكل استراتيجية.
+wide_universe_rows: Dict[str, Dict[str, float]] = {}
+nominees_lock = Lock()
+STRATEGY_NOMINEES: Dict[str, List[Dict[str, Any]]] = {}
+# [V9.25.0] مخزون الترتيب الكامل لكل استراتيجية (قبل قصّ العشرة) — يسمح باستبعاد
+# الصفقات المفتوحة مع التزويد التلقائي من بقية الترتيب لتبقى القائمة عشرة كلما أمكن
+_NOMINEE_RANKED_POOL: Dict[str, List[Dict[str, Any]]] = {}
+strategy_nominees_built_at: float = 0.0
+strategy_nominees_updated_at: Optional[str] = None
 _static_fallback_symbols: List[str] = []
 open_signals_cache: Dict[str, Dict] = {}
 signal_cache_lock = Lock()
@@ -2316,37 +2340,67 @@ def compute_dynamic_universe(size: Optional[int] = None) -> Tuple[List[str], Dic
             high = float(t.get('highPrice') or 0)
             low = float(t.get('lowPrice') or 0)
             qvol = float(t.get('quoteVolume') or 0)
-            chg = abs(float(t.get('priceChangePercent') or 0))
+            # [V9.25.0] التغير المُوقّع يُحفظ أيضًا — الترشيح لكل استراتيجية يحتاج اتجاه
+            # الحركة (هابط للارتداد / صاعد للاختراق) لا مقدارها المطلق فقط
+            chg_signed = float(t.get('priceChangePercent') or 0)
+            chg = abs(chg_signed)
         except (TypeError, ValueError):
             continue
         if last <= 0 or high <= 0 or low <= 0 or high < low:
             continue
-        if qvol < DYNAMIC_UNIVERSE_MIN_QUOTE_VOLUME:
+        # [V9.25.0] أرضية الدائرة الواسعة أخف من العميقة — القائمة العميقة تُقتطع لاحقًا
+        # بأرضية السيولة الكاملة، والدائرة الواسعة تحتفظ بمخزون أوسع للترشيح
+        if qvol < min(DYNAMIC_UNIVERSE_MIN_QUOTE_VOLUME, WIDE_UNIVERSE_MIN_QUOTE_VOLUME):
             continue
         range_pct = (high - low) / low * 100.0
         if range_pct < DYNAMIC_UNIVERSE_MIN_RANGE_PCT:
             continue
-        rows.append({'symbol': sym, 'qvol': qvol, 'range_pct': range_pct, 'chg': chg})
+        # [V9.25.0] موقع السعر داخل مدى 24 ساعة: 0 = عند القاع تمامًا، 1 = عند القمة
+        pos_24h = (last - low) / (high - low)
+        rows.append({'symbol': sym, 'qvol': qvol, 'range_pct': range_pct, 'chg': chg,
+                     'chg_signed': chg_signed, 'pos_24h': pos_24h,
+                     'last': last, 'high': high, 'low': low})
     if not rows:
         return [], {'reason': 'لا مرشحين بعد الفلترة (سيولة/تقلب)'}
     def _ranks(key: str) -> Dict[int, float]:
         order = sorted(rows, key=lambda r: r[key], reverse=True)
         n = max(1, len(order) - 1)
         return {id(r): (n - i) / n for i, r in enumerate(order)}
+
+    def _ranks_on(pool: List[Dict[str, Any]], key: str) -> Dict[int, float]:
+        """[V9.25.0] رتب مئوية داخل مجموعة فرعية (الدائرة الواسعة) بدل الكون الكامل."""
+        order = sorted(pool, key=lambda r: r[key], reverse=True)
+        n = max(1, len(order) - 1)
+        return {id(r): (n - i) / n for i, r in enumerate(order)}
     vol_r, rng_r, chg_r = _ranks('qvol'), _ranks('range_pct'), _ranks('chg')
     for r in rows:
         r['score'] = round(100 * (0.45 * vol_r[id(r)] + 0.35 * rng_r[id(r)] + 0.20 * chg_r[id(r)]), 2)
     rows.sort(key=lambda r: r['score'], reverse=True)
-    top = rows[:size]
+    # [V9.25.0] القائمة العميقة بأرضية السيولة الكاملة (سلوك V9.10 الأصلي محفوظ حرفيًا)
+    # والدائرة الواسعة تضم ما تبقى بأرضيتها الأخف — التوسع بلا تضحية بجودة العمق
+    deep_rows = [r for r in rows if r['qvol'] >= DYNAMIC_UNIVERSE_MIN_QUOTE_VOLUME]
+    top = deep_rows[:size]
     picked = [r['symbol'] for r in top]
+    # [V9.25.0] الدائرة الواسعة: نفس الترتيب الحيوي حتى WIDE_UNIVERSE_SIZE — مخزون
+    # الترشيح لكل استراتيجية (رتبة السيولة تُحسب داخل الدائرة الواسعة نفسها لعدل المقارنة)
+    wide = rows[:max(size, WIDE_UNIVERSE_SIZE)]
+    _wide_vol_r = _ranks_on(wide, 'qvol')
+    wide_rows: Dict[str, Dict[str, float]] = {}
+    for r in wide:
+        wide_rows[r['symbol']] = {'last': r['last'], 'high': r['high'], 'low': r['low'],
+                                  'chg_signed': r['chg_signed'], 'range_pct': r['range_pct'],
+                                  'qvol': r['qvol'], 'pos_24h': r['pos_24h'],
+                                  'qvol_rank': round(_wide_vol_r[id(r)] * 100.0, 1)}
     meta = {
         'candidates': len(rows),
+        'wide_size': len(wide_rows),
+        'wide_rows': wide_rows,
         'top_preview': [{'symbol': r['symbol'], 'score': r['score'],
                          'qvol_musd': round(r['qvol'] / 1e6, 1),
                          'range_pct': round(r['range_pct'], 2),
                          'chg24h': round(r['chg'], 2)} for r in top[:8]],
     }
-    logger.info(f"⚡ [القائمة الديناميكية] رُشِّح {len(rows)} عملة حيوية — اختيار أفضل {len(picked)}: {picked}")
+    logger.info(f"⚡ [القائمة الديناميكية] رُشِّح {len(rows)} عملة حيوية — عميق {len(picked)} + دائرة واسعة {len(wide_rows)} (V9.25.0): {picked}")
     try:
         logger.info("⚡ [الأعلى حيوية] " + " | ".join(
             f"{p['symbol']} (نقاط {p['score']}, سيولة {p['qvol_musd']}M, مدى {p['range_pct']}%, تغير {p['chg24h']}%)"
@@ -2357,8 +2411,11 @@ def compute_dynamic_universe(size: Optional[int] = None) -> Tuple[List[str], Dic
 
 def refresh_universe_if_needed(force: bool = False) -> None:
     """يحدّث قائمة المسح للعملات الأكثر حيوية كل DYNAMIC_UNIVERSE_REFRESH_MIN دقيقة.
-    عند أي فشل: تبقى القائمة الحالية كما هي، وإن لم توجد أصلًا يُستخدم البديل الثابت."""
+    عند أي فشل: تبقى القائمة الحالية كما هي، وإن لم توجد أصلًا يُستخدم البديل الثابت.
+    [V9.25.0] يخزّن أيضًا الدائرة الواسعة (WIDE_UNIVERSE_SIZE) ويعيد بناء ترشيح
+    كل استراتيجية (10 عملات × عدد الاستراتيجيات) من نفس التكه المجاني."""
     global validated_symbols_to_scan, universe_last_refresh, universe_source, universe_meta
+    global wide_universe_rows
     if not USE_DYNAMIC_UNIVERSE:
         return
     with universe_lock:
@@ -2368,17 +2425,28 @@ def refresh_universe_if_needed(force: bool = False) -> None:
     try:
         picked, meta = compute_dynamic_universe()
         if picked:
+            wide_rows = meta.pop('wide_rows', {}) or {}
             with universe_lock:
                 validated_symbols_to_scan = picked
                 universe_last_refresh = time.time()
                 universe_source = 'dynamic'
                 universe_meta = meta
-            # [V9.16.0] مزامنة اشتراكات WebSocket مع القائمة الجديدة
+                wide_universe_rows = wide_rows
+            # [V9.25.0] إعادة بناء ترشيح الاستراتيجيات من الدائرة الواسعة الجديدة
+            try:
+                nominate_strategy_candidates(force=True)
+            except Exception as nom_err:
+                logger.warning(f"⚠️ [دائرة الترشيح] فشل إعادة البناء: {nom_err}")
+            # [V9.16.0 + V9.25.0] مزامنة اشتراكات WebSocket مع اتحاد (العميق + المرشحين)
             if stream_hub is not None:
-                try: stream_hub.set_universe(picked)
-                except Exception: pass
+                try:
+                    with nominees_lock:
+                        union = list(validated_symbols_to_scan) + [n['symbol'] for lst in STRATEGY_NOMINEES.values() for n in lst]
+                    stream_hub.set_universe(sorted(set(union)))
+                except Exception:
+                    pass
             return
-        reason = meta.get('reason', 'غير معروف')
+        reason = meta.get('reason', 'غير معروف') if isinstance(meta, dict) else str(meta)
     except Exception as e:
         reason = str(e)[:120]
         logger.warning(f"⚠️ [القائمة الديناميكية] فشل الجلب: {reason}")
@@ -2398,6 +2466,134 @@ def refresh_universe_if_needed(force: bool = False) -> None:
                 stream_hub.set_universe(list(validated_symbols_to_scan))
         except Exception:
             pass
+
+
+# ============================================================
+# [V9.25.0] الترشيح الحتمي لكل استراتيجية: 10 عملات للفحص × عدد الاستراتيجيات
+# طلب المستخدم الحرفي: "قم بتوسيع دائرة العملات التي تفحص بحيث ترشح 10 عملات
+# للفحص مناسبة لكل استراتيجية اي العدد الكلي 10×عدد الاستراتيجيات"
+# المنهج (حتمي لا تكهن): لكل استراتيجية بصمة ظروف رقمية من مقاييس التكه المجاني
+# (موقع السعر في مدى 24س + اتجاه الحركة + ضيق المدى + رتبة السيولة داخل الدائرة)،
+# بها تُرتب كل عملات الدائرة الواسعة (120) وتُختار الأعلى عشر لتفحصها هي فقط:
+#   BB_STOCH (الارتداد):     عند القاع + هابط اليوم (بلا سكين متطرفة) + مدى يسمح بالارتداد
+#   BB_SQUEEZE (الانضغاط):   مدى 24س ضيق + سعر في منتصف النطاق (زنبرك ملفوف)
+#   SR_BREAKOUT:             عند القمة + صاعد اليوم (يختبر مقاومة محددة)
+#   MACD_EMA / EMA_RSI:      صاعدة اليوم + في النصف العلوي من النطاق (هيكل صاعد)
+#   BULLISH_MOMENTUM:        زخم صاعد قوي + قرب القمة (استمرارية)
+#   PULLBACK (التراجع):      صاعدة على 24س + تراجعت لمنتصف النطاق (شراء الغور في الصاعد)
+# ============================================================
+
+def _clamp_0_100(v: float, lo: float, hi: float) -> float:
+    """تحويل v من المدى [lo, hi] إلى نسبة 0-100 مقيدة (أداة البصمة الرقمية)."""
+    if hi <= lo:
+        return 0.0
+    return max(0.0, min(100.0, (float(v) - lo) / (hi - lo) * 100.0))
+
+
+def _nominee_score_for(key: str, m: Dict[str, float]) -> Tuple[float, str]:
+    """درجة قرب الرمز (0-100) من ظروف الاستراتيجية + سبب عربي موثق.
+    المقاييس كلها من تكه 24 ساعة المجاني — نفس الأرقام تعطي نفس الترشيح (حتمية)."""
+    pos = float(m.get('pos_24h', 0.5))
+    chg = float(m.get('chg_signed', 0.0))
+    rng = float(m.get('range_pct', 0.0))
+    liq = float(m.get('qvol_rank', 50.0))
+    if key == 'BB_STOCH':
+        bottom = (1.0 - pos) * 100.0
+        fell = _clamp_0_100(-chg, 0.0, 15.0)      # هبوط اليوم = وقود الارتداد (سقف 15% لاستبعاد السكاكين)
+        room = _clamp_0_100(rng, 0.0, 10.0)        # مدى كافٍ للارتداد داخل اليوم
+        score = 0.40 * bottom + 0.25 * fell + 0.20 * liq + 0.15 * room
+        why = f"قرب قاع 24س ({bottom:.0f}% من المسافة إليه) بتغير {chg:+.1f}% — قاع صيد الارتداد"
+    elif key == 'BB_SQUEEZE':
+        tight = 100.0 - _clamp_0_100(rng, 0.0, 8.0)
+        mid = max(0.0, (1.0 - abs(pos - 0.5) * 2.0)) * 100.0
+        score = 0.45 * tight + 0.30 * mid + 0.25 * liq
+        # [V9.25.0] صك حي: يوم متحرك بالفعل (±10%) ليس انضغاطًا — الانضغاط حبس قبل الانفجار
+        if abs(chg) > 10.0:
+            score -= 15.0
+        why = f"مدى 24س {rng:.1f}% (انضغاط) والسعر في منتصف النطاق — زنبرك ملفوف"
+    elif key == 'SR_BREAKOUT':
+        near_high = pos * 100.0
+        rising = _clamp_0_100(chg, 0.0, 10.0)
+        # [V9.25.0] صك حي: اختبار المقاومة = السعر مضغوط على القمة — الموقع يتقدم على الزخم
+        # (درس حي: عملة +30% في منتصف النطاق ليست مرشح اختراق مقاومة)
+        score = 0.55 * near_high + 0.20 * rising + 0.25 * liq
+        why = f"عند {near_high:.0f}% من قمة 24س بتغير {chg:+.1f}% — يختبر مقاومة"
+    elif key in ('MACD_EMA', 'EMA_RSI'):
+        rising = _clamp_0_100(chg, 0.0, 10.0)
+        upper = pos * 100.0
+        score = 0.40 * rising + 0.35 * upper + 0.25 * liq
+        why = f"صاعدة {chg:+.1f}% على 24س عند {upper:.0f}% من النطاق — هيكل صاعد"
+    elif key == 'BULLISH_MOMENTUM':
+        rising = _clamp_0_100(chg, 0.0, 12.0)
+        upper = pos * 100.0
+        score = 0.50 * rising + 0.25 * upper + 0.25 * liq
+        why = f"زخم صاعد {chg:+.1f}% على 24س عند {upper:.0f}% من النطاق — استمرارية"
+    elif key == 'PULLBACK':
+        rising = _clamp_0_100(chg, 0.0, 8.0)
+        retr = max(0.0, (1.0 - abs(pos - 0.45) / 0.55)) * 100.0
+        score = 0.35 * rising + 0.40 * retr + 0.25 * liq
+        why = f"صاعدة على 24س ({chg:+.1f}%) مع تراجع لمنتصف النطاق — شراء التراجع في الصاعد"
+    else:
+        # استراتيجية مستقبلية بلا بصمة خاصة: حيوية عامة + سيولة
+        score = 0.50 * liq + 0.30 * _clamp_0_100(abs(chg), 0.0, 10.0) + 0.20 * _clamp_0_100(rng, 1.5, 12.0)
+        why = 'ترشيح عام (بلا بصمة خاصة لهذه الاستراتيجية بعد)'
+    return round(float(score), 2), why
+
+
+def nominate_strategy_candidates(force: bool = False) -> Dict[str, List[Dict[str, Any]]]:
+    """يبني ترشيح الفحص لكل استراتيجية: أفضل NOMINEES_PER_STRATEGY (10) عملة من
+    الدائرة الواسعة — حتمي (نفس المقاييس ⇒ نفس الترشيح) ويستبعد الصفقات المفتوحة
+    مع التزويد تلقائيًا من بقية الترتيب لتبقى القائمة 10 كلما أمكن.
+    يعاد البناء عند كل تحديث للقائمة الديناميكية (كل 30د) أو قسرًا؛ بينهما تُستخدم
+    القائمة نفسها وتُحدّث استثناءاتها فقط — فتظل دائرة الفحص مستقرة داخل النافذة."""
+    global STRATEGY_NOMINEES, _NOMINEE_RANKED_POOL
+    global strategy_nominees_built_at, strategy_nominees_updated_at
+    with universe_lock:
+        rows_snapshot = dict(wide_universe_rows)
+        built_marker = universe_last_refresh
+    if not rows_snapshot:
+        try:
+            refresh_universe_if_needed(force=True)
+            with universe_lock:
+                rows_snapshot = dict(wide_universe_rows)
+                built_marker = universe_last_refresh
+        except Exception as uni_err:
+            logger.warning(f"⚠️ [دائرة الترشيح] تعذر بناء الدائرة الواسعة: {uni_err}")
+    if not rows_snapshot:
+        return {}
+    with nominees_lock:
+        if (not force and _NOMINEE_RANKED_POOL and strategy_nominees_built_at == built_marker):
+            pass  # الدائرة لم تتغير — القوائم المبنية تصلح
+        else:
+            ranked: Dict[str, List[Dict[str, Any]]] = {}
+            for sym, m in rows_snapshot.items():
+                for key in STRATEGY_SETUP_SCANNERS:
+                    sc, why = _nominee_score_for(key, m)
+                    ranked.setdefault(key, []).append({
+                        'symbol': sym, 'score': sc, 'why_ar': why,
+                        'pos_24h': round(float(m.get('pos_24h', 0.0)), 3),
+                        'chg_signed': round(float(m.get('chg_signed', 0.0)), 2),
+                        'range_pct': round(float(m.get('range_pct', 0.0)), 2),
+                        'qvol_rank': round(float(m.get('qvol_rank', 50.0)), 1)})
+            for key, lst in ranked.items():
+                # حتمية كاملة: الدرجة تنازليًا ثم الرمز أبجديًا (كسر تعادل مستقر)
+                lst.sort(key=lambda x: (-x['score'], x['symbol']))
+            _NOMINEE_RANKED_POOL = ranked
+            strategy_nominees_built_at = built_marker
+            strategy_nominees_updated_at = datetime.now(timezone.utc).isoformat()
+            logger.info(f"🎯 [دائرة الترشيح] بُني ترتيب الترشيح لـ {len(ranked)} استراتيجية من {len(rows_snapshot)} عملة (10 لكل استراتيجية = 10×{len(ranked)})")
+    try:
+        with signal_cache_lock:
+            open_syms = {str(s).upper() for s in open_signals_cache.keys()}
+    except Exception:
+        open_syms = set()
+    final: Dict[str, List[Dict[str, Any]]] = {}
+    with nominees_lock:
+        for key, pool in _NOMINEE_RANKED_POOL.items():
+            final[key] = [dict(n) for n in pool
+                          if str(n['symbol']).upper() not in open_syms][:NOMINEES_PER_STRATEGY]
+        STRATEGY_NOMINEES = final
+        return {k: list(v) for k, v in STRATEGY_NOMINEES.items()}
 
 
 # --- دوال جلب البيانات وحساب المؤشرات ---
@@ -4041,6 +4237,17 @@ def get_dashboard_html():
                 <div class="text-text-secondary text-sm text-center py-4">جاري تحميل الأدلة...</div>
             </div>
         </section>
+        <!-- [V9.25.0] دائرة الفحص الموسعة — 10 عملات × كل استراتيجية (ترشيح حتمي لا تكهن) -->
+        <section class="card p-4 mb-6">
+            <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
+                <h3 class="font-bold text-lg text-text-secondary">🔍 دائرة الفحص الموسعة — 10 عملات × كل استراتيجية</h3>
+                <div class="text-xs text-text-secondary font-mono" id="candidates-meta" dir="ltr">--</div>
+            </div>
+            <div id="strategy-candidates-container" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+                <div class="text-text-secondary text-sm text-center py-4">بناء الدائرة الواسعة جارٍ...</div>
+            </div>
+            <div class="text-[11px] text-text-secondary mt-2">كل استراتيجية تفحص فقط عملاتها العشر الأقرب لظروفها الحتمية (موقع السعر في مدى 24س + اتجاه الحركة + ضيق المدى + السيولة) — مرّر على العملة لترى سبب ترشيحها. الباهتة = ممنوعة حاليًا بخريطة حالة السوق.</div>
+        </section>
         <!-- [تحسين V9.11] بوصلة اتجاه BTC على الفريمات الثلاث (API مجاني) -->
         <section class="card p-4 mb-6">
             <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
@@ -4666,6 +4873,37 @@ function updateSmartPicks() {
     });
 }
 
+// [V9.25.0] دائرة الفحص الموسعة — 10 عملات × كل استراتيجية (ترشيح حتمي لا تكهن)
+function updateStrategyCandidates() {
+    fetchData('/api/strategy_candidates').then(data => {
+        if (!data) return;
+        const metaEl = document.getElementById('candidates-meta');
+        const c = document.getElementById('strategy-candidates-container');
+        if (!c) return;
+        if (metaEl) metaEl.textContent = `دائرة ${data.wide_universe || 0} عملة · فحص ${data.total || 0} (${data.per_strategy}/استراتيجية) · ${data.market_state || '--'}`;
+        if (!data.candidates || !Object.keys(data.candidates).length) {
+            c.innerHTML = '<div class="text-text-secondary text-sm text-center py-4">بناء الدائرة الواسعة جارٍ (بعد الإقلاع)...</div>';
+            return;
+        }
+        const names = {MACD_EMA: 'تقاطعات MACD+EMA', BB_STOCH: 'الارتداد من القاع', EMA_RSI: 'تقاطع EMA+RSI', PULLBACK: 'شراء التراجع', BB_SQUEEZE: 'انفجار الانضغاط', BULLISH_MOMENTUM: 'زخم صاعد', SR_BREAKOUT: 'اختراق المقاومات'};
+        c.innerHTML = Object.entries(data.candidates).map(([key, list]) => {
+            const chips = (list || []).map(n => {
+                const dim = n.examinable === false;
+                const why = String(n.why_ar || '').replace(/"/g, '&quot;');
+                return `<span class="text-xs px-2 py-0.5 rounded border ${dim ? 'border-border-color/40 text-text-secondary/50' : 'border-accent-green/50 text-accent-green'}" style="border-style:solid" title="${why}">${n.symbol} <span class="opacity-60 font-mono" dir="ltr">${Number(n.score).toFixed(0)}</span></span>`;
+            }).join(' ');
+            const examinable = (list || []).some(n => n.examinable !== false);
+            return `<div class="rounded-lg border ${examinable ? 'border-border-color bg-black/30' : 'border-border-color/40 bg-black/20 opacity-70'} p-3">
+                <div class="flex items-center justify-between mb-2">
+                    <span class="font-bold text-sm text-text-primary">${names[key] || key}</span>
+                    <span class="text-[10px] px-1.5 py-0.5 rounded border border-border-color text-text-secondary" dir="ltr">${(list || []).length}/10</span>
+                </div>
+                <div class="flex gap-1 flex-wrap">${chips}</div>
+            </div>`;
+        }).join('');
+    });
+}
+
 document.addEventListener('DOMContentLoaded', () => {
     ['MarketStatus', 'Signals', 'Stats', 'Notifications', 'Rejections', 'SystemStatus', 'BtcTrend', 'LeaderMap', 'SmartPicks'].forEach(f => window[`update${f}`]());
     updateDataFeed();  // [V9.20.0] شارة مصدر البيانات
@@ -4678,6 +4916,7 @@ document.addEventListener('DOMContentLoaded', () => {
     whenVisible(updateLeaderMap, 60000); // [تحسين V9.13.0] خريطة القيادة تُحدّث كل دقيقة (التصنيف بطيء التغير)
     whenVisible(updateDataFeed, 60000);  // [V9.20.0] شارة مصدر البيانات كل دقيقة
     whenVisible(updateSmartPicks, 120000); // [V9.23.0] الترشيح الذكي — الأدلة تتجدد كل 4 ساعات
+    whenVisible(updateStrategyCandidates, 60000); // [V9.25.0] دائرة الفحص الموسعة — الترشيح يتجدد مع كل تحديث للقائمة (كل 30د)
 });
 </script>
 </body></html>
@@ -4941,6 +5180,53 @@ def api_smart_picks():
         return jsonify(result)
     except Exception as api_err:
         logger.error(f"❌ [API الترشيح الذكي] خطأ: {api_err}", exc_info=True)
+        return jsonify({'error': str(api_err)}), 500
+
+@app.route('/api/strategy_candidates')
+def api_strategy_candidates():
+    """[V9.25.0] دائرة الفحص الموسعة: العملات العشر المرشحة لكل استراتيجية (10×عدد
+    الاستراتيجيات) — ترشيح حتمي من بصمة ظروف كل استراتيجية على الدائرة الواسعة،
+    مع سبب عربي موثق لكل ترشيح وحالة استحقاق الفحص حسب خريطة حالة السوق."""
+    try:
+        with nominees_lock:
+            cand = {k: [dict(n) for n in v] for k, v in STRATEGY_NOMINEES.items()}
+            updated = strategy_nominees_updated_at
+        with universe_lock:
+            wide_n = len(wide_universe_rows)
+            deep_n = len(validated_symbols_to_scan)
+        with market_state_lock:
+            mkt = str(current_market_state.get('overall_regime', 'UNCERTAIN'))
+        allowed = MARKET_STATE_STRATEGY_ALLOW.get(mkt)
+        display_names = {}
+        try:
+            with macd_ema_strategy_lock:
+                if USE_MACD_EMA_STRATEGY: display_names['MACD_EMA'] = "MACD_EMA_Crossover"
+            with bb_stoch_strategy_lock:
+                if USE_BB_STOCH_STRATEGY: display_names['BB_STOCH'] = "BB_Stoch_Reversal_Enhanced"
+            with ema_rsi_strategy_lock:
+                if USE_EMA_RSI_STRATEGY: display_names['EMA_RSI'] = "EMA_RSI_Cross"
+            with pullback_strategy_lock:
+                if USE_PULLBACK_STRATEGY: display_names['PULLBACK'] = "Pullback_MACD"
+            with bb_squeeze_strategy_lock:
+                if USE_BB_SQUEEZE_STRATEGY: display_names['BB_SQUEEZE'] = "BB_Squeeze_Breakout"
+            with bullish_momentum_strategy_lock:
+                if USE_BULLISH_MOMENTUM_STRATEGY: display_names['BULLISH_MOMENTUM'] = "Bullish_Momentum"
+            with sr_breakout_strategy_lock:
+                if USE_SR_BREAKOUT_STRATEGY: display_names['SR_BREAKOUT'] = "SR_Breakout_Enhanced"
+        except Exception:
+            display_names = {}
+        out = {}
+        for k, lst in cand.items():
+            out[k] = [{**n, 'strategy_name': display_names.get(k, k),
+                       'examinable': (allowed is None or k in allowed)}
+                      for n in lst]
+        return jsonify({'per_strategy': NOMINEES_PER_STRATEGY,
+                        'total': NOMINEES_PER_STRATEGY * len(display_names),
+                        'wide_universe': wide_n, 'deep_universe': deep_n,
+                        'market_state': mkt, 'updated_at': updated,
+                        'candidates': out})
+    except Exception as api_err:
+        logger.error(f"❌ [API دائرة الترشيح] خطأ: {api_err}", exc_info=True)
         return jsonify({'error': str(api_err)}), 500
 
 @app.route('/api/rejection_logs')
@@ -5758,45 +6044,94 @@ def main_loop_enhanced():
             # [V9.24.0] حالة السوق العام لهذه الدورة — أساس خريطة الاستراتيجيات المسموحة
             with market_state_lock:
                 overall_market_regime = str(current_market_state.get('overall_regime', 'UNCERTAIN'))
-            symbols_to_process = random.sample(validated_symbols_to_scan, len(validated_symbols_to_scan))
+            # [V9.25.0] دائرة الترشيح الموسعة — طلب المستخدم: "ترشح 10 عملات للفحص مناسبة
+            # لكل استراتيجية اي العدد الكلي 10×عدد الاستراتيجيات". الفحص أصبح استراتيجيًا:
+            # كل استراتيجية تفحص عملاتها العشر المرشحة حصرًا — المُرشَّحون هم الأعلى
+            # تطابقًا لبصمة ظروفها الرقمية (تكه 24س المجاني على الدائرة الواسعة 120)
+            # بدل فحص كل عملة مع كل استراتيجية (2044 فحصًا بصفر اجتياز في السجل الحي).
+            strategy_nominees_map = nominate_strategy_candidates()
+            try:
+                if stream_hub is not None:
+                    _union_syms = list(validated_symbols_to_scan) + [
+                        n['symbol'] for _lst in strategy_nominees_map.values() for n in _lst]
+                    stream_hub.set_universe(sorted(set(_union_syms)))
+            except Exception:
+                pass
             # [V9.17.0] ترشيحات هذه الدورة: الأزواج المطابقة لكل استراتيجية (تُنشر للوحة آخر الدورة)
             cycle_pair_scores: Dict[str, List[Dict[str, Any]]] = {}
             # [V9.18.0] رصيد توصيات الفلاتر لهذه الدورة
             recommendations_opened_this_cycle = 0
-            total_batches = (len(symbols_to_process) + SYMBOL_PROCESSING_BATCH_SIZE - 1) // SYMBOL_PROCESSING_BATCH_SIZE
+            # [V9.25.0] كاش شموع الدورة: رمز قد يرشحه أكثر من باب استراتيجي — الشموع تُجلب مرة واحدة
+            df_cycle_cache: Dict[str, Optional[pd.DataFrame]] = {}
+            examinations_total = 0
 
-            for i in range(0, len(symbols_to_process), SYMBOL_PROCESSING_BATCH_SIZE):
-                batch = symbols_to_process[i:i + SYMBOL_PROCESSING_BATCH_SIZE]
-                logger.info(f"🔄 جاري معالجة الدفعة {i // SYMBOL_PROCESSING_BATCH_SIZE + 1}/{total_batches}...")
+            strategies_to_check = []
+            with macd_ema_strategy_lock:
+                if USE_MACD_EMA_STRATEGY: strategies_to_check.append(('MACD_EMA', check_macd_ema_strategy, "MACD_EMA_Crossover"))
+            with bb_stoch_strategy_lock:
+                if USE_BB_STOCH_STRATEGY: strategies_to_check.append(('BB_STOCH', check_bb_stoch_strategy_enhanced, "BB_Stoch_Reversal_Enhanced"))
+            with ema_rsi_strategy_lock:
+                if USE_EMA_RSI_STRATEGY: strategies_to_check.append(('EMA_RSI', check_ema_rsi_strategy, "EMA_RSI_Cross"))
+            with pullback_strategy_lock:
+                if USE_PULLBACK_STRATEGY: strategies_to_check.append(('PULLBACK', check_pullback_strategy, "Pullback_MACD"))
+            with bb_squeeze_strategy_lock:
+                if USE_BB_SQUEEZE_STRATEGY: strategies_to_check.append(('BB_SQUEEZE', check_bb_squeeze_strategy, "BB_Squeeze_Breakout"))
+            with bullish_momentum_strategy_lock:
+                if USE_BULLISH_MOMENTUM_STRATEGY: strategies_to_check.append(('BULLISH_MOMENTUM', check_bullish_momentum_strategy, "Bullish_Momentum"))
+            with sr_breakout_strategy_lock:
+                if USE_SR_BREAKOUT_STRATEGY: strategies_to_check.append(('SR_BREAKOUT', check_support_resistance_strategy_enhanced, "SR_Breakout_Enhanced"))
 
-                for symbol in batch:
+            # [V9.25.0] الحلقة استراتيجيةً: كل استراتيجية تفحص مرشحيها العشرة حصرًا.
+            # بوابات مستوى الاستراتيجية (حالة السوق + ثبات الصاعد) قبل جلب أي شموع.
+            for key, check_func, name in strategies_to_check:
+                # [V9.24.0] خريطة السوق العام (حتمية): في الهبوط الحاد لا زخم ولا اختراق
+                # صاعد ضد الاتجاه — فقط قاع-صيد الارتداد واختراق الدعوم.
+                allowed_keys = MARKET_STATE_STRATEGY_ALLOW.get(overall_market_regime)
+                if allowed_keys is not None and key not in allowed_keys:
+                    _count_strategy_filter_reject(name, f"ممنوعة في حالة السوق العامة ({overall_market_regime})")
+                    continue
+                # [V9.24.0] فلتر الثبات: الاستراتيجيات الاستمرارية لا تشتري إلا بعد
+                # ثبات عائلة الصاعد MARKET_REGIME_PERSIST_MIN دقيقة.
+                if key in TREND_CONTINUATION_KEYS:
+                    up_min = market_up_persistence_minutes()
+                    if up_min < MARKET_REGIME_PERSIST_MIN:
+                        _count_strategy_filter_reject(
+                            name, f"ثبات الصاعد غير كافٍ ({up_min:.0f}د < {MARKET_REGIME_PERSIST_MIN}د)")
+                        continue
+                # [V9.25.0] عملات هذه الاستراتيجية العشر المرشحة حصرًا — دائرة الفحص الموسعة
+                with nominees_lock:
+                    nominees = [dict(n) for n in (strategy_nominees_map.get(key) or [])][:NOMINEES_PER_STRATEGY]
+                with _scan_stats_lock: _strategy_scan_stats[name]['nominated'] = len(nominees)
+                if not nominees:
+                    continue
+                examinations_total += len(nominees)
+                logger.info(f"🎯 [{name}] فحص {len(nominees)} عملة مرشحة حصرًا: {[n['symbol'] for n in nominees]}")
+
+                for nom in nominees:
+                    symbol = nom['symbol']
                     try:
                         with signal_cache_lock:
                             if symbol in open_signals_cache or len(open_signals_cache) >= MAX_OPEN_TRADES:
                                 continue
-                        
-                        df_15m = fetch_historical_data(symbol, SIGNAL_GENERATION_TIMEFRAME, SIGNAL_GENERATION_LOOKBACK_DAYS)
-                        
+                        # شموع الرمز — كاش الدورة (أبواب متعددة قد ترشح نفس الرمز: جلب واحد)
+                        if symbol in df_cycle_cache:
+                            df_15m = df_cycle_cache[symbol]
+                        else:
+                            df_15m = fetch_historical_data(symbol, SIGNAL_GENERATION_TIMEFRAME, SIGNAL_GENERATION_LOOKBACK_DAYS)
+                            df_cycle_cache[symbol] = df_15m
                         if df_15m is None or len(df_15m) < 100:
                             continue
-                        
-                        # [تحسين V9.13.0] تصنيف القائد (BTC/ETH/SOL) لكل عملة عند كل دورة
-                        # بلا أي نداء شبكي — من شموع 15م المجلوبة أصلًا مقابل كاش القادة
+                        # [تحسين V9.13.0] تصنيف القائد (BTC/ETH/SOL) بلا أي نداء شبكي
                         update_leader_classification(symbol, df_15m['close'].tolist())
-                        
                         df_with_indicators = calculate_all_features(df_15m, btc_data)
                         df_with_indicators.name = symbol
                         if df_with_indicators.empty:
                             continue
-                        
                         # --- [V9.14.0] بوابة العقلانية العامة فقط (واسعة جدًا) ---
-                        # لم تعد تمنع أي نمط سوق مشروع: فقط الميت القصوى (ATR%<0.1) والفوضى (>8)
-                        # كل الفلترة المنطقية صارت ملفًا خاصًا بكل استراتيجية داخل الحلقة أدناه
                         if not passes_market_sanity_filter(df_with_indicators):
                             with _scan_stats_lock: _filter_reject_stats['بوابة العقلانية العامة'] += 1
                             continue
-
-                        # [V9.17.0] نمط الزوج السوقي (اتجاه/نطاق/انضغاط) — من نفس الشموع بلا وزن شبكي
+                        # [V9.17.0] نمط الزوج السوقي — من نفس الشموع بلا وزن شبكي
                         regime_info = compute_symbol_regime(df_with_indicators)
                         # [V9.23.0] سجل ريم الرمز الحالي — يغذي /api/smart_picks
                         if regime_info:
@@ -5805,103 +6140,55 @@ def main_loop_enhanced():
                         signal_found, strategy_used = False, None
                         # [V9.18.0] مصدر الإشارة ودرجة المطابقة (للعرض والتوثيق)
                         signal_source, signal_fit_score = 'strategy_trigger', None
-                        # [V9.23.0] تفاصيل دليل الإشارة المقبولة (تُوثّق في التفاصيل واللوحة)
+                        # [V9.23.0] تفاصيل دليل الإشارة المقبولة (تُوثق في التفاصيل واللوحة)
                         signal_evidence_info: Optional[Dict[str, Any]] = None
-                        # [V9.24.0] الاستراتيجيات التي وجد كاشفها الشرطي تجهيزًا حتميًا
-                        # على هذا الرمز (قاع+ارتداد/انضغاط سليم/هيكل صاعد) دون اكتمال مُطلِق
-                        setup_candidates: List[Tuple[str, float, Dict[str, Any]]] = []
+                        with _scan_stats_lock: _strategy_scan_stats[name]['checks'] += 1
 
-                        strategies_to_check = []
-                        with macd_ema_strategy_lock:
-                            if USE_MACD_EMA_STRATEGY: strategies_to_check.append(('MACD_EMA', check_macd_ema_strategy, "MACD_EMA_Crossover"))
-                        with bb_stoch_strategy_lock:
-                            if USE_BB_STOCH_STRATEGY: strategies_to_check.append(('BB_STOCH', check_bb_stoch_strategy_enhanced, "BB_Stoch_Reversal_Enhanced"))
-                        with ema_rsi_strategy_lock:
-                            if USE_EMA_RSI_STRATEGY: strategies_to_check.append(('EMA_RSI', check_ema_rsi_strategy, "EMA_RSI_Cross"))
-                        with pullback_strategy_lock:
-                            if USE_PULLBACK_STRATEGY: strategies_to_check.append(('PULLBACK', check_pullback_strategy, "Pullback_MACD"))
-                        with bb_squeeze_strategy_lock:
-                            if USE_BB_SQUEEZE_STRATEGY: strategies_to_check.append(('BB_SQUEEZE', check_bb_squeeze_strategy, "BB_Squeeze_Breakout"))
-                        with bullish_momentum_strategy_lock:
-                            if USE_BULLISH_MOMENTUM_STRATEGY: strategies_to_check.append(('BULLISH_MOMENTUM', check_bullish_momentum_strategy, "Bullish_Momentum"))
-                        with sr_breakout_strategy_lock:
-                            if USE_SR_BREAKOUT_STRATEGY: strategies_to_check.append(('SR_BREAKOUT', check_support_resistance_strategy_enhanced, "SR_Breakout_Enhanced"))
-
-                        # [تحسين V9.12.0 + V9.14.0] حصر فحوصات ونجاحات كل استراتيجية
-                        # مع فلتر خاص بكل استراتيجية حسب ملفها المنطقي بدل الفلاتر الشاملة
-                        for key, check_func, name in strategies_to_check:
-                            with _scan_stats_lock: _strategy_scan_stats[name]['checks'] += 1
-                            # [V9.17.0] بوابة مطابقة الزوج: لا فحص لاستراتيجية على زوج
-                            # لا ينطبق نمطه السوقي على شخصيتها — ترشيح مخصص لكل استراتيجية
-                            fit_score: Optional[float] = None
-                            if PAIR_MATCHING_ENABLED:
-                                fit_score = score_strategy_pair_fit(regime_info, name)
-                                if fit_score is None or fit_score < PAIR_MATCH_MIN_SCORE:
-                                    _count_strategy_filter_reject(
-                                        name,
-                                        f"الزوج خارج نمط الاستراتيجية ({REGIME_AR.get(regime_info['regime'], 'غير محسوم')})" if regime_info else 'الزوج خارج نمط الاستراتيجية (نمط غير محسوم)')
-                                    continue
-                                cycle_pair_scores.setdefault(name, []).append(
-                                    {'symbol': symbol, 'score': fit_score,
-                                     'regime': regime_info['regime'],
-                                     'regime_ar': REGIME_AR.get(regime_info['regime'], regime_info['regime'])})
-                            # [V9.14.0] فلتر الاستراتيجية الخاص (ملف منطقي لكل نمط)
-                            if not passes_strategy_prefilters(df_with_indicators, name):
+                        # [V9.17.0] بوابة مطابقة الزوج: نمط السوقي يطابق شخصية الاستراتيجية
+                        fit_score: Optional[float] = None
+                        if PAIR_MATCHING_ENABLED:
+                            fit_score = score_strategy_pair_fit(regime_info, name)
+                            if fit_score is None or fit_score < PAIR_MATCH_MIN_SCORE:
+                                _count_strategy_filter_reject(
+                                    name,
+                                    f"الزوج خارج نمط الاستراتيجية ({REGIME_AR.get(regime_info['regime'], 'غير محسوم')})" if regime_info else 'الزوج خارج نمط الاستراتيجية (نمط غير محسوم)')
                                 continue
-                            # [V9.24.0] خريطة السوق العام (حتمية): في الهبوط الحاد لا زخم ولا
-                            # اختراق صاعد ضد الاتجاه — فقط قاع-صيد الارتداد واختراق الدعوم.
-                            # مصدر خسائر V9.21→V9.23: 10 توصيات BB_Squeeze في STRONG_DOWNTREND كلها خاسرة.
-                            allowed_keys = MARKET_STATE_STRATEGY_ALLOW.get(overall_market_regime)
-                            if allowed_keys is not None and key not in allowed_keys:
-                                _count_strategy_filter_reject(name, f"ممنوعة في حالة السوق العامة ({overall_market_regime})")
+                            cycle_pair_scores.setdefault(name, []).append(
+                                {'symbol': symbol, 'score': fit_score,
+                                 'regime': regime_info['regime'],
+                                 'regime_ar': REGIME_AR.get(regime_info['regime'], regime_info['regime'])})
+                        # [V9.14.0] فلتر الاستراتيجية الخاص (ملف منطقي لكل نمط)
+                        if not passes_strategy_prefilters(df_with_indicators, name):
+                            continue
+                        # [V9.24.0] كاشف التجهيز الشرطي لكل استراتيجية: لا فحص ولا توصية
+                        # إلا على رموز تجسدت ظروفها فيها بأرقام موثقة
+                        scan_fn = STRATEGY_SETUP_SCANNERS.get(key)
+                        if scan_fn is not None:
+                            setup_ok, setup_ev = scan_fn(df_with_indicators, overall_market_regime)
+                            if not setup_ok:
+                                _count_strategy_filter_reject(name, f"التجهيز الشرطي غير متحقق ({setup_ev.get('reason', '')})")
                                 continue
-                            # [V9.24.0] فلتر الثبات: الاستراتيجيات الاستمرارية (زخم/تقاطعات/
-                            # انضغاط/تراجع) لا تشتري إلا بعد ثبات عائلة الصاعد 480 دقيقة —
-                            # 'Strong Uptrend' لأيام قليلة في سوق منشاري كان ارتداد دببة ثم انقلاب.
-                            if key in TREND_CONTINUATION_KEYS:
-                                up_min = market_up_persistence_minutes()
-                                if up_min < MARKET_REGIME_PERSIST_MIN:
-                                    _count_strategy_filter_reject(
-                                        name, f"ثبات الصاعد غير كافٍ ({up_min:.0f}د < {MARKET_REGIME_PERSIST_MIN}د)")
-                                    continue
-                            # [V9.24.0] كاشف التجهيز الشرطي لكل استراتيجية: لا فحص ولا توصية
-                            # إلا على رموز تجسدت ظروفها فيها بأرقام موثقة (قاع سعر+مؤشرات
-                            # ارتداد للارتدادية، انضغاط+هيكل سليم للاختراقية، هيكل صاعد للاتجاهية)
-                            scan_fn = STRATEGY_SETUP_SCANNERS.get(key)
-                            if scan_fn is not None:
-                                setup_ok, setup_ev = scan_fn(df_with_indicators, overall_market_regime)
-                                if not setup_ok:
-                                    _count_strategy_filter_reject(name, f"التجهيز الشرطي غير متحقق ({setup_ev.get('reason', '')})")
-                                    continue
-                            else:
-                                setup_ev = {}
-                            if check_func(df_with_indicators):
-                                # [V9.23.0] بوابة الأدلة على المُطلِقات أيضًا — لا إشارة بلا برهان
-                                ok_ev, ev_info = evidence_gate_pass(name, (regime_info or {}).get('regime'))
-                                if not ok_ev:
-                                    with _scan_stats_lock: _recommendation_stats['evidence_rejected'] += 1
-                                    log_rejection(symbol, "بوابة الأدلة رفضت إشارة استراتيجية", {'strategy': name, **ev_info})
-                                    continue
-                                with _scan_stats_lock: _strategy_scan_stats[name]['passes'] += 1
-                                signal_found, strategy_used = True, name
-                                signal_fit_score = fit_score
-                                # [V9.24.0] دليل الإشارة = أدلة التجهيز الشرطي + أدلة الخلية التاريخية
-                                signal_evidence_info = {**setup_ev, **ev_info}
-                                break
-                            # [V9.24.0] التجهيز الشرطي متحقق (مطابقة + فلاتر + كاشف) دون
-                            # اكتمال مُطلِق الشمعة → مرشّح توصية بأدلة رقمية موثقة
-                            setup_candidates.append((name, float(fit_score) if fit_score is not None else 50.0, dict(setup_ev)))
-
-                        # --- [V9.24.0] وضع التوصيات: أفضل تجهيز شرطي حتمي يصبح توصية موثقة ---
-                        # ليست مجرد تكهن: كل توصية = ظروف الاستراتيجية مكتشفة فعلاً على الرمز
-                        # (مثال: عملة في قاع سعرها أعطت مؤشرات ارتداد → استراتيجية الارتداد)
-                        # + بوابة الأدلة التاريخية للخلية (استراتيجية × نمط سوقي)
-                        if (not signal_found and RECOMMENDATIONS_ENABLED and PAIR_MATCHING_ENABLED
-                                and setup_candidates):
+                        else:
+                            setup_ok, setup_ev = True, {}
+                        if check_func(df_with_indicators):
+                            # [V9.23.0] بوابة الأدلة على المُطلقات أيضًا — لا إشارة بلا برهان
+                            ok_ev, ev_info = evidence_gate_pass(name, (regime_info or {}).get('regime'))
+                            if not ok_ev:
+                                with _scan_stats_lock: _recommendation_stats['evidence_rejected'] += 1
+                                log_rejection(symbol, "بوابة الأدلة رفضت إشارة استراتيجية", {'strategy': name, **ev_info})
+                                continue
+                            with _scan_stats_lock: _strategy_scan_stats[name]['passes'] += 1
+                            signal_found, strategy_used = True, name
+                            signal_fit_score = fit_score
+                            # [V9.24.0] دليل الإشارة = أدلة التجهيز الشرطي + أدلة الخلية التاريخية
+                            signal_evidence_info = {**setup_ev, **ev_info}
+                        # [V9.24.0→V9.25.0] التجهيز الشرطي متحقق (مطابقة + فلاتر + كاشف) دون
+                        # اكتمال مُطلق الشمعة → توصية موثقة بأدلة رقمية لهذه الاستراتيجية تحديدًا
+                        if (not signal_found and setup_ok and RECOMMENDATIONS_ENABLED and PAIR_MATCHING_ENABLED):
                             if recommendations_opened_this_cycle >= RECOMMENDATIONS_PER_CYCLE:
                                 pass  # نفد رصيد الدورة — تبقى الترشيحات معروضة في /api/strategy_pairs
                             else:
-                                rec_name, rec_score, rec_setup_ev = max(setup_candidates, key=lambda t: t[1])
+                                rec_score = float(fit_score) if fit_score is not None else 50.0
                                 if rec_score < RECOMMENDATION_MIN_FIT_SCORE:
                                     with _scan_stats_lock: _recommendation_stats['below_min_score'] += 1
                                 elif _symbol_recently_closed(symbol):
@@ -5909,17 +6196,17 @@ def main_loop_enhanced():
                                     logger.info(f"⏳ [{symbol}] ضمن تهدئة ما بعد الإغلاق — لا توصية جديدة الآن")
                                 else:
                                     # [V9.23.0] بوابة الأدلة: لا توصية بلا برهان ربحي تاريخي للخلية
-                                    ok_ev, rec_evidence_info = evidence_gate_pass(rec_name, (regime_info or {}).get('regime'))
+                                    ok_ev, rec_evidence_info = evidence_gate_pass(name, (regime_info or {}).get('regime'))
                                     if not ok_ev:
                                         with _scan_stats_lock: _recommendation_stats['evidence_rejected'] += 1
-                                        log_rejection(symbol, "بوابة الأدلة رفضت التوصية", {'strategy': rec_name, **rec_evidence_info})
+                                        log_rejection(symbol, "بوابة الأدلة رفضت التوصية", {'strategy': name, **rec_evidence_info})
                                         continue
-                                    signal_found, strategy_used = True, rec_name
+                                    signal_found, strategy_used = True, name
                                     signal_source, signal_fit_score = 'filter_recommendation', rec_score
                                     # [V9.24.0] توثيق كامل: أدلة التجهيز الشرطي + أدلة الخلية التاريخية
-                                    signal_evidence_info = {**rec_setup_ev, **rec_evidence_info}
-                                    logger.info(f"  -> [{symbol}] 💡 تجهيز شرطي لـ {rec_name} (مطابقة {rec_score:.0f} + دليل: {rec_evidence_info.get('verdict_ar', '')}) → توصية شراء موثقة")
-                        
+                                    signal_evidence_info = {**setup_ev, **rec_evidence_info}
+                                    logger.info(f"  -> [{symbol}] 💡 تجهيز شرطي لـ {name} (مطابقة {rec_score:.0f} + دليل: {rec_evidence_info.get('verdict_ar', '')}) → توصية شراء موثقة")
+
                         if not signal_found:
                             continue
 
@@ -6027,8 +6314,10 @@ def main_loop_enhanced():
                         logger.error(f"❌ [خطأ معالجة] للرمز {symbol}: {e}", exc_info=True)
                     finally:
                         time.sleep(0.2)
-                
-                gc.collect()
+
+            # [V9.25.0] تحرير كاش شموع الدورة بعد اكتمال فحص كل المرشحين
+            gc.collect()
+            df_cycle_cache.clear()
 
             # [V9.17.0] نشر ترشيحات هذه الدورة للوحة: أفضل الأزواج المطابقة لكل استراتيجية
             try:

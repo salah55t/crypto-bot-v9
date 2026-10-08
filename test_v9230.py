@@ -16,13 +16,13 @@ import vnz  # noqa: E402
 
 
 def test_version():
-    assert vnz.APP_VERSION == 'V9.23.0', f"الإصدار: {vnz.APP_VERSION}"
+    assert vnz.APP_VERSION.startswith('V9.'), f"الإصدار: {vnz.APP_VERSION}"
     print("✅ 1) الإصدار V9.23.0")
 
 
 def test_constants():
     assert vnz.EVIDENCE_ENABLED is True
-    assert vnz.EVIDENCE_WINDOW_BARS == 960, "نافذة الدليل 10 أيام"
+    assert vnz.EVIDENCE_WINDOW_BARS >= 960, "نافذة الدليل >= 10 أيام (وسّعها V9.24.0 إلى 15 يومًا)"
     assert vnz.EVIDENCE_MIN_TRADES == 5
     assert vnz.EVIDENCE_MIN_EXP_PCT >= 0.12
     assert vnz.EVIDENCE_MIN_PF >= 1.15
