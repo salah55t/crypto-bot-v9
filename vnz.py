@@ -49,7 +49,7 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-APP_VERSION: str = 'V9.28.0'  # [V9.21.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
+APP_VERSION: str = 'V9.29.0'  # [V9.21.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
 logger = logging.getLogger(f'CryptoBot{APP_VERSION}')
 
 # زمن إقلاع العملية لحساب مدة التشغيل في لوحة التحكم
@@ -179,6 +179,15 @@ STRATEGY_FILTER_PROFILES: Dict[str, Dict[str, Optional[float]]] = {
     # (سقف ADX كان يمنع نمط الاستمرار الاحترافي في الاتجاهات القوية — 72 رفضًا حيًا)
     'BB_Squeeze_Breakout':        {'min_adx': None, 'max_adx': None, 'min_atr_pct': None, 'max_atr_pct': 5.0, 'min_roc': None},
     'SR_Breakout_Enhanced':       {'min_adx': None, 'max_adx': None, 'min_atr_pct': None, 'max_atr_pct': 5.0, 'min_roc': None},
+    # --- [V9.29.0] استراتيجيات freqtrade الأصلية — بوابة عقلانية فقط: شروط الدخول
+    # الكانونية هي الفلتر ذاته في نهج freqtrade (بلا طبقات إضافية فوقها)
+    'FT_BbandRsi':                {'min_adx': None, 'max_adx': None, 'min_atr_pct': 0.25, 'max_atr_pct': 4.0, 'min_roc': None},
+    'FT_CombinedBinHAndCluc':     {'min_adx': None, 'max_adx': None, 'min_atr_pct': 0.25, 'max_atr_pct': 4.0, 'min_roc': None},
+    'FT_EMASkipPump':             {'min_adx': None, 'max_adx': None, 'min_atr_pct': 0.25, 'max_atr_pct': 4.0, 'min_roc': None},
+    'FT_Quickie':                 {'min_adx': None, 'max_adx': None, 'min_atr_pct': 0.25, 'max_atr_pct': 4.0, 'min_roc': None},
+    'FT_Bandtastic':              {'min_adx': None, 'max_adx': None, 'min_atr_pct': 0.25, 'max_atr_pct': 4.0, 'min_roc': None},
+    # الزخم الأصلي يشترط ADX>25 في الكانوني ذاته — الملف يطابق شرطه
+    'FT_ADXMomentum':             {'min_adx': 25.0, 'max_adx': None, 'min_atr_pct': 0.40, 'max_atr_pct': 6.0, 'min_roc': None},
 }
 # احتياط لأي استراتيجية مستقبلية غير مدرجة: بوابة عقلانية واسعة فقط
 DEFAULT_STRATEGY_FILTER_PROFILE: Dict[str, Optional[float]] = {
@@ -248,6 +257,28 @@ EVIDENCE_PROBATION_MIN_FIT: float = float(os.environ.get('EVIDENCE_PROBATION_MIN
 EVIDENCE_PROBATION_MAX_OPEN: int = int(os.environ.get('EVIDENCE_PROBATION_MAX_OPEN', '2'))
 EVIDENCE_CELL_LOCK_AFTER_N: int = int(os.environ.get('EVIDENCE_CELL_LOCK_AFTER_N', '3'))
 
+# ------------------- [V9.29.0] استراتيجيات freqtrade الأصلية بأعداداتها (نهج IStrategy) -------------------
+# طلب المستخدم: "انتهج نهج freqtrade في الاستراتيجيات ومنطق التداول ومنطق الدخول والغلق
+# واضف الاستراتيجيات الى البوت الحالي مع اعداداتها".
+# التبني حرفي المصدر (github.com/freqtrade/freqtrade-strategies): شروط الدخول/الخروج كما هي
+# + جداول minimal_roi الزمنية + وقف الخسارة الأصلي + إعدادات التريلينغ الأصلية.
+# فلسفة freqtrade المنفذة: الدخول على الشمعة المغلقة الأخيرة (populate_entry_trend)،
+# والخروج بأول من يصيب: وقف الخسارة ← ROI الزمني ← إشارة الخروج ← التريلينغ.
+# التكيفات الموثقة (3 فقط):
+#   1) التشغيل على فريم البوت 15م بدل فريماتها الكانونية (1h/5m/1m) — بنية بيانات موحدة
+#   2) الوقف الأصلي الأوسع من سقف الحماية المحلي MAX_SL_DISTANCE_PCT (6%) يُقيَّد بالسقف
+#   3) بوابة الأدلة (V9.23) + الحمايات (V9.26) + حلقة بناء الدليل (V9.28) تُطبق على الجميع
+FT_STRATEGIES_ENABLED: bool = os.environ.get('FT_STRATEGIES_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+# مفتاح تفعيل/تعطيل لكل استراتيجية (يُقرأ تحت القفل من خيوط المسح والويب)
+FT_STRATEGY_ENABLED: Dict[str, bool] = {}
+ft_strategies_lock = Lock()
+# عائلة الارتداد (تُعامل مع خريطة السوق كعائلة BB_STOCH — قاع-صيد أصيل في الهبوط)
+# و FT_ADXMOMENTUM استمرارية زخم (كعائلة BULLISH_MOMENTUM — تتطلب ثبات الصاعد)
+FT_REVERSAL_KEYS: Tuple[str, ...] = ('FT_BBANDRSI', 'FT_BINHCLUC', 'FT_EMASKIPPUMP', 'FT_QUICKIE', 'FT_BANDTASTIC')
+FT_TREND_KEYS: Tuple[str, ...] = ('FT_ADXMOMENTUM',)
+# TTL كاش مؤشرات إشارة الخروج في حلقة الإدارة (نمط get_cached_atr)
+FT_EXIT_IND_TTL_SEC: int = int(os.environ.get('FT_EXIT_IND_TTL_SEC', '60'))
+
 REGIME_AR: Dict[str, str] = {
     'trend_up': 'اتجاه صاعد', 'trend_down': 'اتجاه هابط', 'range': 'نطاق مترنم',
     'squeeze': 'انضغاط سعري', 'transitional': 'انتقالي'}
@@ -272,6 +303,15 @@ STRATEGY_PAIR_PROFILES: Dict[str, Dict[str, Any]] = {
     # كانت انفجارات زائفة — 4/4 خاسرة، الاختراق يحتاج انضغاطًا حقيقيًا لا رملًا)
     'BB_Squeeze_Breakout':        {'regimes': ('squeeze',), 'secondary_regimes': ('trend_up',), 'adx': (None, None, 35.0), 'atr_pct': (None, 5.0), 'low_bbwp_bonus': True},
     'SR_Breakout_Enhanced':       {'regimes': ('range', 'squeeze'), 'secondary_regimes': ('trend_up',), 'adx': (None, None, 34.0), 'atr_pct': (None, 5.0), 'low_bbwp_bonus': True},
+    # --- [V9.29.0] استراتيجيات freqtrade الأصلية: عائلة الارتداد تشتري فوق الحد السفلي
+    # — جوهرها النطاق/الهابط، ودليل V9.24 لنمط BB_STOCH ينطبق عليها حرفيًا
+    'FT_BbandRsi':                {'regimes': ('range', 'trend_down'), 'secondary_regimes': ('trend_up', 'transitional'), 'adx': (None, None, None), 'atr_pct': (0.25, 4.0), 'range_bonus': True},
+    'FT_CombinedBinHAndCluc':     {'regimes': ('range', 'trend_down'), 'secondary_regimes': ('trend_up', 'transitional'), 'adx': (None, None, None), 'atr_pct': (0.25, 4.0), 'range_bonus': True},
+    'FT_EMASkipPump':             {'regimes': ('range', 'trend_down'), 'secondary_regimes': ('trend_up', 'transitional'), 'adx': (None, None, None), 'atr_pct': (0.25, 4.0), 'range_bonus': True},
+    'FT_Quickie':                 {'regimes': ('range', 'trend_down'), 'secondary_regimes': ('trend_up', 'transitional'), 'adx': (None, None, None), 'atr_pct': (0.25, 4.0), 'range_bonus': True},
+    'FT_Bandtastic':              {'regimes': ('range', 'trend_down'), 'secondary_regimes': ('trend_up', 'transitional'), 'adx': (None, None, None), 'atr_pct': (0.25, 4.0), 'range_bonus': True},
+    # زخم freqtrade الأصلي (ADX>25 + +DI>-DI + MOM>0) — اتجاه صاعد قائم
+    'FT_ADXMomentum':             {'regimes': ('trend_up',), 'adx': (20.0, 30.0, None), 'atr_pct': (0.40, 6.0), 'struct_up_bonus': True, 'pos_roc_bonus': True},
 }
 
 # --- [V9.24.0] خريطة السوق العام → الاستراتيجيات المسموحة (حتمية لا تكهن) ---
@@ -279,13 +319,16 @@ STRATEGY_PAIR_PROFILES: Dict[str, Dict[str, Any]] = {
 # في سوق هابط حاد لا يُفتح الزخم/الاختراق الصاعد ضد الاتجاه (كان مصدر كل خسائر V9.21→V9.23:
 # 10 توصيات BB_Squeeze في STRONG_DOWNTREND كلها stop_loss) — بل قاع-صيد الارتداد واختراق الدعوم.
 # المفاتيح نفسها المستخدمة في حلقة المسح. القيمة None = بلا تقييد (سقوط آمن عند حالة غير معروفة).
+# [V9.29.0] استراتيجيات freqtrade الأصلية انضمت لخريطة السوق: عائلة الارتداد (FT_REVERSAL)
+# مع BB_STOCH في كل الحالات (قاع-صيد أصيل — الشراء فوق الحد السفلي هو فكرتها)،
+# و FT_ADXMOMENTUM مع الزخم الاستمراري (لا شراء زخم ضد الاتجاه).
 MARKET_STATE_STRATEGY_ALLOW: Dict[str, Optional[Tuple[str, ...]]] = {
-    'STRONG_DOWNTREND': ('BB_STOCH', 'SR_BREAKOUT'),
-    'DOWNTREND':        ('BB_STOCH', 'SR_BREAKOUT', 'BB_SQUEEZE'),
-    'RANGING':          ('BB_STOCH', 'SR_BREAKOUT', 'BB_SQUEEZE', 'MACD_EMA', 'EMA_RSI', 'PULLBACK'),
-    'UNCERTAIN':        ('BB_STOCH', 'SR_BREAKOUT', 'BB_SQUEEZE', 'MACD_EMA', 'EMA_RSI', 'PULLBACK', 'BULLISH_MOMENTUM'),
-    'UPTREND':          ('BB_STOCH', 'SR_BREAKOUT', 'BB_SQUEEZE', 'MACD_EMA', 'EMA_RSI', 'PULLBACK', 'BULLISH_MOMENTUM'),
-    'STRONG_UPTREND':   ('BB_STOCH', 'SR_BREAKOUT', 'BB_SQUEEZE', 'MACD_EMA', 'EMA_RSI', 'PULLBACK', 'BULLISH_MOMENTUM'),
+    'STRONG_DOWNTREND': ('BB_STOCH', 'SR_BREAKOUT') + FT_REVERSAL_KEYS,
+    'DOWNTREND':        ('BB_STOCH', 'SR_BREAKOUT', 'BB_SQUEEZE') + FT_REVERSAL_KEYS,
+    'RANGING':          ('BB_STOCH', 'SR_BREAKOUT', 'BB_SQUEEZE', 'MACD_EMA', 'EMA_RSI', 'PULLBACK') + FT_REVERSAL_KEYS,
+    'UNCERTAIN':        ('BB_STOCH', 'SR_BREAKOUT', 'BB_SQUEEZE', 'MACD_EMA', 'EMA_RSI', 'PULLBACK', 'BULLISH_MOMENTUM') + FT_REVERSAL_KEYS + FT_TREND_KEYS,
+    'UPTREND':          ('BB_STOCH', 'SR_BREAKOUT', 'BB_SQUEEZE', 'MACD_EMA', 'EMA_RSI', 'PULLBACK', 'BULLISH_MOMENTUM') + FT_REVERSAL_KEYS + FT_TREND_KEYS,
+    'STRONG_UPTREND':   ('BB_STOCH', 'SR_BREAKOUT', 'BB_SQUEEZE', 'MACD_EMA', 'EMA_RSI', 'PULLBACK', 'BULLISH_MOMENTUM') + FT_REVERSAL_KEYS + FT_TREND_KEYS,
 }
 # ثوابت كاشف القاع والارتداد الحتمي [V9.24.0] — طلب المستخدم: "عملات في قاع سعرها
 # أعطت مؤشرات على ارتدادها تفحص هذه الرموز باستراتيجية الارتداد".
@@ -303,7 +346,7 @@ SQUEEZE_BBWP_MAX: float = 0.30                # انضغاط فعلي: عرض ب
 # في ارتداد دببة "قوي صاعد" كان يخسر -0.33%/صفقة. القاعدة: لا استراتيجيات استمرارية
 # إلا بعد ثبات عائلة الريم الصاعد MARKET_REGIME_PERSIST_MIN دقيقة متصلة (الحتمية لا التكهن).
 MARKET_REGIME_PERSIST_MIN: int = int(os.environ.get('MARKET_REGIME_PERSIST_MIN', '480'))  # 8 ساعات
-TREND_CONTINUATION_KEYS: Tuple[str, ...] = ('MACD_EMA', 'EMA_RSI', 'PULLBACK', 'BULLISH_MOMENTUM', 'BB_SQUEEZE')
+TREND_CONTINUATION_KEYS: Tuple[str, ...] = ('MACD_EMA', 'EMA_RSI', 'PULLBACK', 'BULLISH_MOMENTUM', 'BB_SQUEEZE') + FT_TREND_KEYS  # [V9.29.0] + FT_ADXMOMENTUM
 # سجل تاريخ الريم العام للحية (تُملأ في determine_market_state_enhanced) لحساب الثبات
 MARKET_REGIME_HISTORY: deque = deque(maxlen=400)   # ~20 ساعة بعينات كل 3 دقائق
 
@@ -2168,6 +2211,13 @@ REJECTION_REASONS_AR = {
     "Pullback Strategy Conditions Not Met": "شروط استراتيجية Pullback لم تتحقق",
     "BB Squeeze Strategy Conditions Not Met": "شروط استراتيجية BB Squeeze لم تتحقق",
     "SR Breakout Strategy Conditions Not Met": "شروط استراتيجية اختراق الدعم/المقاومة لم تتحقق",
+    # [V9.29.0] استراتيجيات freqtrade الأصلية
+    "FT_BbandRsi Strategy Conditions Not Met": "شروط freqtrade BbandRsi (RSI<30 فوق الحد السفلي) لم تتحقق",
+    "FT_CombinedBinHAndCluc Strategy Conditions Not Met": "شروط freqtrade BinH+Cluc لم تتحقق",
+    "FT_EMASkipPump Strategy Conditions Not Met": "شروط freqtrade EMASkipPump لم تتحقق",
+    "FT_Quickie Strategy Conditions Not Met": "شروط freqtrade Quickie لم تتحقق",
+    "FT_ADXMomentum Strategy Conditions Not Met": "شروط freqtrade ADXMomentum لم تتحقق",
+    "FT_Bandtastic Strategy Conditions Not Met": "شروط freqtrade Bandtastic لم تتحقق",
     "Price Peak Avoidance": "تجنب الدخول عند قمة آخر 24 ساعة (استراتيجية ارتدادية)",
     "Daily Loss Limit": "قاطع الحماية: تم إيقاف فتح صفقات جديدة بسبب تجاوز حد الخسارة اليومي",
     "Leader Behavior Veto": "سلوك القائد معاكس: القائد هابط والعملة تابعة له",
@@ -2559,12 +2609,14 @@ def _nominee_score_for(key: str, m: Dict[str, float]) -> Tuple[float, str]:
     chg = float(m.get('chg_signed', 0.0))
     rng = float(m.get('range_pct', 0.0))
     liq = float(m.get('qvol_rank', 50.0))
-    if key == 'BB_STOCH':
+    if key == 'BB_STOCH' or key in FT_REVERSAL_KEYS:
         bottom = (1.0 - pos) * 100.0
         fell = _clamp_0_100(-chg, 0.0, 15.0)      # هبوط اليوم = وقود الارتداد (سقف 15% لاستبعاد السكاكين)
         room = _clamp_0_100(rng, 0.0, 10.0)        # مدى كافٍ للارتداد داخل اليوم
         score = 0.40 * bottom + 0.25 * fell + 0.20 * liq + 0.15 * room
         why = f"قرب قاع 24س ({bottom:.0f}% من المسافة إليه) بتغير {chg:+.1f}% — قاع صيد الارتداد"
+        if key != 'BB_STOCH':
+            why += " (عائلة freqtrade الأصلية)"
     elif key == 'BB_SQUEEZE':
         tight = 100.0 - _clamp_0_100(rng, 0.0, 8.0)
         mid = max(0.0, (1.0 - abs(pos - 0.5) * 2.0)) * 100.0
@@ -2585,11 +2637,13 @@ def _nominee_score_for(key: str, m: Dict[str, float]) -> Tuple[float, str]:
         upper = pos * 100.0
         score = 0.40 * rising + 0.35 * upper + 0.25 * liq
         why = f"صاعدة {chg:+.1f}% على 24س عند {upper:.0f}% من النطاق — هيكل صاعد"
-    elif key == 'BULLISH_MOMENTUM':
+    elif key == 'BULLISH_MOMENTUM' or key in FT_TREND_KEYS:
         rising = _clamp_0_100(chg, 0.0, 12.0)
         upper = pos * 100.0
         score = 0.50 * rising + 0.25 * upper + 0.25 * liq
         why = f"زخم صاعد {chg:+.1f}% على 24س عند {upper:.0f}% من النطاق — استمرارية"
+        if key != 'BULLISH_MOMENTUM':
+            why += " (freqtrade ADXMomentum)"
     elif key == 'PULLBACK':
         rising = _clamp_0_100(chg, 0.0, 8.0)
         retr = max(0.0, (1.0 - abs(pos - 0.45) / 0.55)) * 100.0
@@ -2903,6 +2957,55 @@ def calculate_all_features(df: pd.DataFrame, btc_df: Optional[pd.DataFrame]) -> 
     df_calc['relative_volume'] = df_calc['volume'] / (df_calc['volume'].rolling(window=REL_VOL_PERIOD, min_periods=1).mean() + 1e-9)
     df_calc['price_vs_ema50'] = (df_calc['close'] / df_calc['ema_50']) - 1
     df_calc['price_vs_ema200'] = (df_calc['close'] / df_calc['close'].ewm(span=200, adjust=False).mean()) - 1
+    # --- [V9.29.0] مؤشرات استراتيجيات freqtrade الأصلية (متجهيًا لكل النافذة) ---
+    # بولنجر على السعر النمطي (20، ±1/±2 انحراف) — qtpylib.bollinger_bands(typical_price)
+    # كما في BbandRsi/Cluc/EMASkipPump/Bandtastic حرفيًا
+    _ft_typ = (df_calc['high'] + df_calc['low'] + df_calc['close']) / 3.0
+    _ft_tp_mid = _ft_typ.rolling(20).mean()
+    _ft_tp_std = _ft_typ.rolling(20).std()
+    df_calc['ft_tp_mid20'] = _ft_tp_mid
+    df_calc['ft_tp_low1'] = _ft_tp_mid - _ft_tp_std
+    df_calc['ft_tp_low2'] = _ft_tp_mid - 2.0 * _ft_tp_std
+    df_calc['ft_tp_up1'] = _ft_tp_mid + _ft_tp_std
+    df_calc['ft_tp_up2'] = _ft_tp_mid + 2.0 * _ft_tp_std
+    # بولنجر على الإغلاق (20) — Quickie، و(40) — BinHV45 (داخل CombinedBinHAndCluc)
+    df_calc['ft_close_mid20'] = df_calc['close'].rolling(20).mean()
+    _ft_c_mid40 = df_calc['close'].rolling(40).mean()
+    _ft_c_std40 = df_calc['close'].rolling(40).std()
+    df_calc['ft_mid40'] = _ft_c_mid40
+    df_calc['ft_low40'] = _ft_c_mid40 - 2.0 * _ft_c_std40
+    df_calc['ft_bbdelta40'] = (_ft_c_mid40 - df_calc['ft_low40']).abs()
+    df_calc['ft_closedelta'] = (df_calc['close'] - df_calc['close'].shift()).abs()
+    df_calc['ft_tail'] = (df_calc['close'] - df_calc['low']).abs()
+    # TEMA(9) — Quickie (الصيغة القياسية: 3EMA − 3EMA(EMA) + EMA(EMA(EMA)))
+    _ft_e1 = df_calc['close'].ewm(span=9, adjust=False).mean()
+    _ft_e2 = _ft_e1.ewm(span=9, adjust=False).mean()
+    _ft_e3 = _ft_e2.ewm(span=9, adjust=False).mean()
+    df_calc['ft_tema9'] = (3.0 * _ft_e1) - (3.0 * _ft_e2) + _ft_e3
+    # MOM(14) — ADXMomentum، و MFI(14) — Bandtastic (مجموع التدفق الموجب/السالب كما في TA-Lib)
+    df_calc['ft_mom14'] = df_calc['close'] - df_calc['close'].shift(14)
+    _ft_mf_tv = _ft_typ * df_calc['volume']
+    _ft_mf_pos = _ft_mf_tv.where(_ft_typ > _ft_typ.shift(), 0.0).rolling(14).sum()
+    _ft_mf_neg = _ft_mf_tv.where(_ft_typ < _ft_typ.shift(), 0.0).rolling(14).sum()
+    df_calc['ft_mfi14'] = 100.0 - 100.0 / (1.0 + (_ft_mf_pos / _ft_mf_neg.replace(0, np.nan)))
+    # EMA5/EMA12 وقاع/قمة 12 — EMASkipPump
+    df_calc['ft_ema5'] = df_calc['close'].ewm(span=5, adjust=False).mean()
+    df_calc['ft_ema12'] = df_calc['close'].ewm(span=12, adjust=False).mean()
+    df_calc['ft_min12'] = df_calc['close'].rolling(12).min()
+    df_calc['ft_max12'] = df_calc['close'].rolling(12).max()
+    # +DI/-DI بفترة 25 الأصلية (تمهيد وايلدر alpha=1/25) — ADXMomentum
+    # (البوت يحسب 14 لاستراتيجياته المحلية — الكانوني يستخدم 25)
+    _ft_up25 = df_calc['high'].diff()
+    _ft_dn25 = -df_calc['low'].diff()
+    _ft_plus_dm25 = np.where((_ft_up25 > _ft_dn25) & (_ft_up25 > 0), _ft_up25, 0.0)
+    _ft_minus_dm25 = np.where((_ft_dn25 > _ft_up25) & (_ft_dn25 > 0), _ft_dn25, 0.0)
+    _ft_tr25 = pd.concat([df_calc['high'] - df_calc['low'], (df_calc['high'] - df_calc['close'].shift()).abs(),
+                          (df_calc['low'] - df_calc['close'].shift()).abs()], axis=1).max(axis=1)
+    _ft_atr25 = _ft_tr25.ewm(com=24, adjust=False).mean()
+    df_calc['ft_plus_di25'] = 100.0 * pd.Series(_ft_plus_dm25, index=df_calc.index).ewm(com=24, adjust=False).mean() / _ft_atr25.replace(0, 1e-9)
+    df_calc['ft_minus_di25'] = 100.0 * pd.Series(_ft_minus_dm25, index=df_calc.index).ewm(com=24, adjust=False).mean() / _ft_atr25.replace(0, 1e-9)
+    # متوسط حجم 30م السابق (shift 1) — حارس المضخة في Cluc/EMASkipPump (volume_mean_slow.shift(1))
+    df_calc['ft_vmean30_prev'] = df_calc['volume_sma_30'].shift(1)
     if btc_df is not None and not btc_df.empty:
         asset_returns = df_calc['close'].pct_change()
         if 'btc_returns' not in btc_df.columns:
@@ -3355,6 +3458,9 @@ STRATEGY_SETUP_SCANNERS: Dict[str, Any] = {
     'EMA_RSI': detect_trend_structure_setup,
     'PULLBACK': detect_trend_structure_setup,
     'BULLISH_MOMENTUM': detect_trend_structure_setup,
+    # [V9.29.0] استراتيجيات freqtrade الأصلية: بلا كاشف تجهيز إضافي — نهج freqtrade
+    # يجعل شروط populate_entry_trend هي البوابة ذاتها (None = تجاوز التجهيز الشرطي)
+    **{key: None for key in FT_REVERSAL_KEYS + FT_TREND_KEYS},
 }
 
 
@@ -3679,6 +3785,223 @@ def passes_short_term_momentum_filter(symbol: str, df: pd.DataFrame) -> bool:
     logger.info(f"  -> [فلتر الزخم المحسن] {symbol}: Valid={is_valid}")
     return is_valid
 
+# ============================================================
+# [V9.29.0] استراتيجيات freqtrade الأصلية — نهج IStrategy حرفيًا
+# المصدر: github.com/freqtrade/freqtrade-strategies (ملفات مرجعية موثقة لكل واحدة)
+# كل استراتيجية = مواصفة ذاتية (Spec): شروط دخول/خروج أصلية + جدول ROI زمني + وقف + تريلينغ.
+# فلسفة freqtrade: الدخول على الشمعة المغلقة الأخيرة، والخروج بأول من يصيب:
+#   وقف الخسارة → ROI الزمني → إشارة الخروج (populate_exit_trend) → التريلينغ
+# ============================================================
+
+def _ft_last(df: pd.DataFrame) -> Tuple[Optional[pd.Series], Optional[pd.Series]]:
+    """آخر شمعة مغلقة + سابقتها مع حراسة NaN — شروط freqtrade بوليانية صارمة."""
+    try:
+        if df is None or len(df) < 2:
+            return None, None
+        last, prev = df.iloc[-1], df.iloc[-2]
+        if pd.isna(last.get('close')):
+            return None, None
+        return last, prev
+    except Exception:
+        return None, None
+
+
+def _ft_log_near(symbol: str, name: str, conds: Dict[str, bool]) -> None:
+    """توثيق الرفض القريب: المُطلِق الأساسي (لمس الحد السفلي) متحقق لكن تأكيد ثانوي فشل
+    — نمط توثيق شفاف مثل بقية استراتيجيات البوت (للتحليل في /api/rejection_logs)."""
+    if any(conds.values()):
+        log_rejection(symbol, f"{name} Strategy Conditions Not Met", {"failed": [k for k, v in conds.items() if not v]})
+
+
+# --- 1) FT_BbandRsi (Gert Wohlgemuth — berlinguyinca/BbandRsi.py v3) ---
+def ft_entry_bbandrsi(df: pd.DataFrame) -> bool:
+    """RSI<30 & close < الحد السفلي لبولنجر(20,2) على السعر النمطي."""
+    last, _ = _ft_last(df)
+    if last is None: return False
+    rsi, low2 = last.get('rsi'), last.get('ft_tp_low2')
+    if pd.isna(rsi) or pd.isna(low2): return False
+    touched = float(last['close']) < float(low2)
+    if touched and float(rsi) < 30:
+        return True
+    if touched:
+        _ft_log_near(str(df.name), "FT_BbandRsi", {"rsi_lt_30": float(rsi) < 30})
+    return False
+
+def ft_exit_bbandrsi(df: pd.DataFrame) -> bool:
+    """RSI>70 (الأصلي: رفض الاتجاه فقط عند التشبع العلوي)."""
+    last, _ = _ft_last(df)
+    if last is None: return False
+    return bool(pd.notna(last.get('rsi')) and float(last['rsi']) > 70)
+
+
+# --- 2) FT_CombinedBinHAndCluc (بنية BinHV45 + ClucMay72018 — الملف المدمج الشهير) ---
+def ft_entry_binhcluc(df: pd.DataFrame) -> bool:
+    """نمط BinHV45 (بولنجر مغلق 40 بقيم hyperopt الرسمية 0.008/0.0175/0.25) أو
+    نمط ClucMay72018 (close<EMA50 & close<0.985×الحد السفلي النمطي & حارس مضخة حجم)."""
+    last, prev = _ft_last(df)
+    if last is None or prev is None: return False
+    cl = float(last['close'])
+    # BinHV45
+    b45 = False
+    # [تصحيح V9.29.0] الكانوني يقارن الإغلاق بحد الشمعة السابقة (lower.shift()) —
+    # و ft_bbdelta40/ft_closedelta/ft_tail من الشمعة الحالية كما في المصدر الأصلي
+    low40_prev = prev.get('ft_low40') if prev is not None else None
+    bbd, cl_delta, tail = last.get('ft_bbdelta40'), last.get('ft_closedelta'), last.get('ft_tail')
+    if pd.notna(low40_prev) and pd.notna(bbd) and pd.notna(cl_delta) and pd.notna(tail) and float(low40_prev) > 0:
+        b45 = (float(bbd) > cl * 0.008) and (float(cl_delta) > cl * 0.0175) \
+              and (float(tail) < float(bbd) * 0.25) and (cl < float(low40_prev)) and (cl <= float(prev['close']))
+    # ClucMay72018 (اسم ema100 في المصدر الأصلي = EMA50 فعليًا — غرابة موثقة في الملف المرجعي)
+    cluc = False
+    ema50, tp_low2, vmean_prev = last.get('ema_50'), last.get('ft_tp_low2'), last.get('ft_vmean30_prev')
+    if pd.notna(ema50) and pd.notna(tp_low2) and pd.notna(vmean_prev):
+        cluc = (cl < float(ema50)) and (cl < 0.985 * float(tp_low2)) and (float(last['volume']) < float(vmean_prev) * 20)
+    if not (b45 or cluc) and (pd.notna(tp_low2) and cl < float(tp_low2)):
+        _ft_log_near(str(df.name), "FT_CombinedBinHAndCluc", {"binhv45_pattern": b45, "cluc_pattern": cluc})
+    return bool(b45 or cluc)
+
+def ft_exit_binhcluc(df: pd.DataFrame) -> bool:
+    """close > الوسط النمطي لبولنجر 20 (خروج Cluc الأصلي)."""
+    last, _ = _ft_last(df)
+    if last is None: return False
+    mid = last.get('ft_tp_mid20')
+    return bool(pd.notna(mid) and float(last['close']) > float(mid))
+
+
+# --- 3) FT_EMASkipPump (تجنب شموع المضخة — berlinguyinca/EMASkipPump.py) ---
+def ft_entry_emaskippump(df: pd.DataFrame) -> bool:
+    """حجم عادي (<20× متوسط30 السابق) & close<EMA5 & close<EMA12 & close=قاع12 & close≤الحد السفلي."""
+    last, _ = _ft_last(df)
+    if last is None: return False
+    cl = float(last['close'])
+    vmean_prev, e5, e12, mn12, low2 = (last.get('ft_vmean30_prev'), last.get('ft_ema5'),
+                                       last.get('ft_ema12'), last.get('ft_min12'), last.get('ft_tp_low2'))
+    if pd.isna(vmean_prev) or pd.isna(e5) or pd.isna(e12) or pd.isna(mn12) or pd.isna(low2):
+        return False
+    vol_ok = float(last['volume']) < float(vmean_prev) * 20
+    at_low = cl <= float(mn12) + 1e-12
+    band = cl <= float(low2)
+    if band and at_low and not (vol_ok and cl < float(e5) and cl < float(e12)):
+        _ft_log_near(str(df.name), "FT_EMASkipPump", {"volume_normal": vol_ok, "below_ema5": cl < float(e5), "below_ema12": cl < float(e12)})
+    return bool(vol_ok and cl < float(e5) and cl < float(e12) and at_low and band)
+
+def ft_exit_emaskippump(df: pd.DataFrame) -> bool:
+    """close>EMA5 & close>EMA12 & close≥قمة12 & close≥الحد العلوي (الأصلي حرفيًا)."""
+    last, _ = _ft_last(df)
+    if last is None: return False
+    cl = float(last['close'])
+    e5, e12, mx12, up2 = last.get('ft_ema5'), last.get('ft_ema12'), last.get('ft_max12'), last.get('ft_tp_up2')
+    if pd.isna(e5) or pd.isna(e12) or pd.isna(mx12) or pd.isna(up2): return False
+    return bool(cl > float(e5) and cl > float(e12) and cl >= float(mx12) - 1e-12 and cl >= float(up2))
+
+
+# --- 4) FT_Quickie (Zelgadis — berlinguyinca/Quickie.py) ---
+def ft_entry_quickie(df: pd.DataFrame) -> bool:
+    """ADX>30 & TEMA9<وسط بولنجر(إغلاق,20) & TEMA9 يلتفت صعودًا & SMA200 فوق السعر
+    (ارتداد داخل هبوط أوسع — فكرة الاستراتيجية الأصلية)."""
+    last, prev = _ft_last(df)
+    if last is None or prev is None: return False
+    adx, tema, tema_p, sma200, mid = (last.get('adx'), last.get('ft_tema9'), prev.get('ft_tema9'),
+                                      last.get('sma_200'), last.get('ft_close_mid20'))
+    if pd.isna(adx) or pd.isna(tema) or pd.isna(tema_p) or pd.isna(sma200) or pd.isna(mid): return False
+    return bool(float(adx) > 30 and float(tema) < float(mid) and float(tema) > float(tema_p) and float(sma200) > float(last['close']))
+
+def ft_exit_quickie(df: pd.DataFrame) -> bool:
+    """ADX>70 & TEMA9>الوسط & TEMA9 يلتفت هبوطًا (الأصلي حرفيًا)."""
+    last, prev = _ft_last(df)
+    if last is None or prev is None: return False
+    adx, tema, tema_p, mid = last.get('adx'), last.get('ft_tema9'), prev.get('ft_tema9'), last.get('ft_close_mid20')
+    if pd.isna(adx) or pd.isna(tema) or pd.isna(tema_p) or pd.isna(mid): return False
+    return bool(float(adx) > 70 and float(tema) > float(mid) and float(tema) < float(tema_p))
+
+
+# --- 5) FT_ADXMomentum (Gert Wohlgemuth — berlinguyinca/ADXMomentum.py v3) ---
+def ft_entry_adxmomentum(df: pd.DataFrame) -> bool:
+    """ADX>25 & MOM14>0 & +DI(25)>25 & +DI>-DI (زخم صاعد مثبت)."""
+    last, _ = _ft_last(df)
+    if last is None: return False
+    adx, mom, pdi, mdi = last.get('adx'), last.get('ft_mom14'), last.get('ft_plus_di25'), last.get('ft_minus_di25')
+    if pd.isna(adx) or pd.isna(mom) or pd.isna(pdi) or pd.isna(mdi): return False
+    return bool(float(adx) > 25 and float(mom) > 0 and float(pdi) > 25 and float(pdi) > float(mdi))
+
+def ft_exit_adxmomentum(df: pd.DataFrame) -> bool:
+    """ADX>25 & MOM14<0 & -DI(25)>25 & +DI<-DI (انقلاب الزخم — الأصلي حرفيًا)."""
+    last, _ = _ft_last(df)
+    if last is None: return False
+    adx, mom, pdi, mdi = last.get('adx'), last.get('ft_mom14'), last.get('ft_plus_di25'), last.get('ft_minus_di25')
+    if pd.isna(adx) or pd.isna(mom) or pd.isna(pdi) or pd.isna(mdi): return False
+    return bool(float(adx) > 25 and float(mom) < 0 and float(mdi) > 25 and float(pdi) < float(mdi))
+
+
+# --- 6) FT_Bandtastic (Robert Roman — أصلية 15م من freqtrade-strategies) ---
+def ft_entry_bandtastic(df: pd.DataFrame) -> bool:
+    """close < الحد السفلي لبولنجر(20,1) & حجم>0 (الإعداد الافتراضي الموثق في الملف)."""
+    last, _ = _ft_last(df)
+    if last is None: return False
+    low1 = last.get('ft_tp_low1')
+    if pd.isna(low1): return False
+    return bool(float(last['close']) < float(low1) and float(last['volume']) > 0)
+
+def ft_exit_bandtastic(df: pd.DataFrame) -> bool:
+    """MFI>46 & close>الحد العلوي لبولنجر(20,2) (الأصلي حرفيًا)."""
+    last, _ = _ft_last(df)
+    if last is None: return False
+    mfi, up2 = last.get('ft_mfi14'), last.get('ft_tp_up2')
+    if pd.isna(mfi) or pd.isna(up2): return False
+    return bool(float(mfi) > 46 and float(last['close']) > float(up2))
+
+
+# --- سجل المواصفات بأعداداتها الكانونية الحرفية (minimal_roi/stoploss/trailing) ---
+# الوحدات: نسب freqtrade الأصلية (0.01 = 1%). مفاتيح minimal_roi بالدقائق.
+FREQTRADE_STRATEGIES: Dict[str, Dict[str, Any]] = {
+    'FT_BbandRsi': {
+        'name': 'FT_BbandRsi', 'key': 'FT_BBANDRSI', 'ar_name': 'بولنجر+RSI الأصلي (BbandRsi)',
+        'source': 'freqtrade-strategies/berlinguyinca/BbandRsi.py', 'timeframe_canon': '1h',
+        'minimal_roi': {0: 0.10}, 'stoploss': -0.25,
+        'trailing_stop': False, 'trailing_stop_positive': None,
+        'trailing_stop_positive_offset': None, 'trailing_only_offset_is_reached': False,
+        'entry_fn': ft_entry_bbandrsi, 'exit_fn': ft_exit_bbandrsi, 'family': 'reversal'},
+    'FT_CombinedBinHAndCluc': {
+        'name': 'FT_CombinedBinHAndCluc', 'key': 'FT_BINHCLUC', 'ar_name': 'BinH+Cluc المدمج الأصلي',
+        'source': 'freqtrade-strategies/berlinguyinca/CombinedBinHAndCluc.py', 'timeframe_canon': '5m',
+        'minimal_roi': {0: 0.05}, 'stoploss': -0.05,
+        'trailing_stop': False, 'trailing_stop_positive': None,
+        'trailing_stop_positive_offset': None, 'trailing_only_offset_is_reached': False,
+        'entry_fn': ft_entry_binhcluc, 'exit_fn': ft_exit_binhcluc, 'family': 'reversal'},
+    'FT_EMASkipPump': {
+        'name': 'FT_EMASkipPump', 'key': 'FT_EMASKIPPUMP', 'ar_name': 'EMA Skip Pump الأصلي (مضاد المضخات)',
+        'source': 'freqtrade-strategies/berlinguyinca/EMASkipPump.py', 'timeframe_canon': '5m',
+        'minimal_roi': {0: 0.10}, 'stoploss': -0.05,
+        'trailing_stop': False, 'trailing_stop_positive': None,
+        'trailing_stop_positive_offset': None, 'trailing_only_offset_is_reached': False,
+        'entry_fn': ft_entry_emaskippump, 'exit_fn': ft_exit_emaskippump, 'family': 'reversal'},
+    'FT_Quickie': {
+        'name': 'FT_Quickie', 'key': 'FT_QUICKIE', 'ar_name': 'Quickie الأصلي (إغلاق سريع)',
+        'source': 'freqtrade-strategies/berlinguyinca/Quickie.py', 'timeframe_canon': '5m',
+        'minimal_roi': {10: 0.15, 15: 0.06, 30: 0.03, 100: 0.01}, 'stoploss': -0.25,
+        'trailing_stop': False, 'trailing_stop_positive': None,
+        'trailing_stop_positive_offset': None, 'trailing_only_offset_is_reached': False,
+        'entry_fn': ft_entry_quickie, 'exit_fn': ft_exit_quickie, 'family': 'reversal'},
+    'FT_ADXMomentum': {
+        'name': 'FT_ADXMomentum', 'key': 'FT_ADXMOMENTUM', 'ar_name': 'زخم ADX الأصلي (ADXMomentum)',
+        'source': 'freqtrade-strategies/berlinguyinca/ADXMomentum.py', 'timeframe_canon': '1h',
+        'minimal_roi': {0: 0.01}, 'stoploss': -0.25,
+        'trailing_stop': False, 'trailing_stop_positive': None,
+        'trailing_stop_positive_offset': None, 'trailing_only_offset_is_reached': False,
+        'entry_fn': ft_entry_adxmomentum, 'exit_fn': ft_exit_adxmomentum, 'family': 'trend'},
+    'FT_Bandtastic': {
+        'name': 'FT_Bandtastic', 'key': 'FT_BANDTASTIC', 'ar_name': 'Bandtastic الأصلي (15م أصلًا)',
+        'source': 'freqtrade-strategies/user_data/strategies/Bandtastic.py', 'timeframe_canon': '15m',
+        'minimal_roi': {0: 0.162, 69: 0.097, 229: 0.061, 566: 0.0}, 'stoploss': -0.345,
+        'trailing_stop': True, 'trailing_stop_positive': 0.01,
+        'trailing_stop_positive_offset': 0.058, 'trailing_only_offset_is_reached': False,
+        'entry_fn': ft_entry_bandtastic, 'exit_fn': ft_exit_bandtastic, 'family': 'reversal'},
+}
+
+# تهيئة مفاتيح التفعيل (كلها مفعلة افتراضيًا — تُقرأ تحت ft_strategies_lock)
+for _ft_name in FREQTRADE_STRATEGIES:
+    FT_STRATEGY_ENABLED.setdefault(_ft_name, True)
+
+
 class EnhancedTradingStrategy:
     def __init__(self, symbol: str):
         self.symbol = symbol
@@ -3903,6 +4226,161 @@ def calculate_dynamic_tp_sl(df: pd.DataFrame, entry_price: float, is_long: bool 
         return None
 
 
+# ============================================================
+# [V9.29.0] محرك الخروج بنهج freqtrade — منطق الغلق الأصلي لصفقات FT_*
+# الترتيب لكل نبضة (نمط IStrategy): وقف الخسارة → ROI الزمني → إشارة الخروج → التريلينغ
+# ROI الزمني: جدول {دقائق: نسبة} — العتبة تُحتسب من أكبر مفتاح ≤ عمر الصفقة (تنخفض مع العمر
+# كما في freqtrade get_minimal_roi). التريلينغ: بمسافة trailing_stop_positive بعد بلوغ
+# trailing_stop_positive_offset من القمة مع احترام trailing_only_offset_is_reached —
+# والوقف يُرفع فقط ولا يُخفض أبدًا (دلالة freqtrade الحرفية).
+# ============================================================
+
+def ft_roi_threshold(spec: Dict[str, Any], elapsed_min: float) -> Optional[float]:
+    """عتبة ROI الزمني عند عمر معين: قيمة أكبر مفتاح (دقائق) ≤ العمر. None إن لم يبلغ أول مفتاح."""
+    try:
+        best: Optional[Tuple[float, float]] = None
+        for k, v in (spec.get('minimal_roi') or {}).items():
+            kf = float(k)
+            if elapsed_min >= kf and (best is None or kf > best[0]):
+                best = (kf, float(v))
+        return best[1] if best else None
+    except Exception:
+        return None
+
+
+FT_EXIT_IND_CACHE: Dict[str, Tuple[float, Optional[pd.DataFrame]]] = {}
+ft_exit_ind_lock = Lock()
+
+def ft_exit_indicators(symbol: str) -> Optional[pd.DataFrame]:
+    """شموع خفيفة بمؤشرات إشارة الخروج — كاش 60ث (نمط get_cached_atr) حتى لا تثقل
+    حلقة إدارة الصفقات بنداءات متكررة لكل نبضة سعر."""
+    now = time.time()
+    with ft_exit_ind_lock:
+        cached = FT_EXIT_IND_CACHE.get(symbol)
+        if cached and cached[0] is not None and (now - cached[0]) < FT_EXIT_IND_TTL_SEC:
+            return cached[1]
+    out: Optional[pd.DataFrame] = None
+    try:
+        df = fetch_historical_data(symbol, SIGNAL_GENERATION_TIMEFRAME, 210)
+        if df is not None and len(df) >= 60:
+            df_ft = calculate_all_features(df, None)
+            if df_ft is not None and not df_ft.empty:
+                out = df_ft
+    except Exception as ind_err:
+        logger.debug(f"[FT خروج] فشل حساب مؤشرات {symbol}: {ind_err}")
+        out = cached[1] if cached else None
+    with ft_exit_ind_lock:
+        FT_EXIT_IND_CACHE[symbol] = (now, out)
+    return out
+
+def ft_initial_tp_sl(entry_price: float, spec: Dict[str, Any]) -> Dict[str, Any]:
+    """TP/SL الافتتاحي لصفقة FT: وقف الكانوني مقيّد بسقف الحماية MAX_SL_DISTANCE_PCT
+    (التكيف 2 في التقرير أعلاه)، والهدف المعروض = ROI عند 0 دقيقة — محرك ROI الزمني
+    هو الحاكم الفعلي للخروج الربحي (الهدف يُحدَّث لاحقًا بأسباب ft_* عند الإغلاق)."""
+    base_pct = abs(float(spec.get('stoploss') or -0.05)) * 100.0
+    eff_pct = min(base_pct, MAX_SL_DISTANCE_PCT) if MAX_SL_DISTANCE_PCT > 0 else base_pct
+    stop_loss = entry_price * (1.0 - eff_pct / 100.0)
+    roi_tbl = spec.get('minimal_roi') or {}
+    roi0 = float(roi_tbl.get(0, roi_tbl.get('0', 0.05))) * 100.0
+    roi0 = min(max(roi0, 0.5), 30.0)
+    target = entry_price * (1.0 + roi0 / 100.0)
+    rr = (target - entry_price) / max(entry_price - stop_loss, 1e-9)
+    return {'target_price': round(target, 6), 'stop_loss': round(stop_loss, 6),
+            'initial_stop_loss': round(stop_loss, 6),
+            'source': f"FREQTRADE_{spec.get('name', 'FT')}", 'rr_ratio': round(rr, 2),
+            'ft_stop_pct': round(eff_pct, 3), 'ft_roi0_pct': round(roi0, 2)}
+
+def _ft_elapsed_minutes(signal: Dict[str, Any]) -> Optional[float]:
+    """عمر الصفقة بالدقائق من طابعها الزمني (نفس منطق الخروج الزمني V9.26)."""
+    try:
+        ts = signal.get('timestamp')
+        if ts is None:
+            return None
+        if isinstance(ts, str):
+            dt = datetime.fromisoformat(str(ts).replace('Z', '+00:00'))
+        else:
+            dt = ts if getattr(ts, 'tzinfo', None) else ts.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - dt).total_seconds() / 60.0
+    except Exception:
+        return None
+
+def ft_exit_engine_step(signal: Dict[str, Any], signal_id: int, symbol: str,
+                        current_price: float, spec: Dict[str, Any]) -> bool:
+    """خطوة إدارة خروج freqtrade لصفقة FT واحدة. يعيد True إذا أُغلقت الصفقة.
+    الترتيب: وقف → ROI → إشارة خروج → تريلينغ. أسباب ft_* تُحتسب في StoplossGuard."""
+    entry = float(signal.get('entry_price') or 0.0)
+    if entry <= 0 or current_price <= 0:
+        return False
+    profit_pct = (current_price / entry - 1.0) * 100.0
+    peak = max(float(signal.get('current_peak_price') or entry), current_price)
+    peak_pct = (peak / entry - 1.0) * 100.0
+
+    # 1) وقف الخسارة (الكانوني مقيّد بالسقف عند الدخول؛ يُرفع فقط عبر التريلينغ)
+    sl = float(signal.get('stop_loss') or 0.0)
+    if sl > 0 and current_price <= sl:
+        initial_sl = float(signal.get('initial_stop_loss', sl) or sl)
+        reason = 'ft_trailing_stop' if sl > initial_sl + 1e-12 else 'ft_stoploss'
+        logger.info(f"🛑 [{symbol}] خروج FT ({reason}): سعر {current_price:.6f} ≤ وقف {sl:.6f}")
+        close_signal(signal_id, current_price, reason)
+        return True
+
+    # 2) ROI الزمني (جدول freqtrade الأصلي حرفيًا)
+    elapsed = _ft_elapsed_minutes(signal)
+    if elapsed is not None:
+        thr = ft_roi_threshold(spec, elapsed)
+        if thr is not None and profit_pct >= thr * 100.0:
+            logger.info(f"🎯 [{symbol}] خروج FT ROI: ربح {profit_pct:.2f}% ≥ عتبة {thr*100:.2f}% عند عمر {elapsed:.0f}د")
+            close_signal(signal_id, current_price, 'ft_roi')
+            return True
+
+    # 3) إشارة الخروج الأصلية (populate_exit_trend على شمعة مغلقة — كاش 60ث)
+    exit_fn = spec.get('exit_fn')
+    if exit_fn is not None:
+        dfx = ft_exit_indicators(symbol)
+        if dfx is not None:
+            try:
+                if exit_fn(dfx):
+                    logger.info(f"📤 [{symbol}] خروج FT: إشارة الخروج الأصلية تحققت")
+                    close_signal(signal_id, current_price, 'ft_exit_signal')
+                    return True
+            except Exception as ex_sig_err:
+                logger.debug(f"[FT خروج] إشارة خروج {symbol} تخطأت: {ex_sig_err}")
+
+    # 4) التريلينغ الأصلي (بمعاني freqtrade الحرفية: مسافة تضيق عند بلوغ الإزاحة من القمة)
+    stop_changed = False
+    if spec.get('trailing_stop'):
+        pos = spec.get('trailing_stop_positive')
+        offset = spec.get('trailing_stop_positive_offset')
+        only_offset = bool(spec.get('trailing_only_offset_is_reached', False))
+        if pos is not None and offset is not None and peak > entry:
+            if not (only_offset and (peak_pct / 100.0) < offset):
+                base_pct = abs(float(spec.get('stoploss') or -0.05)) * 100.0
+                eff_pct = min(base_pct, MAX_SL_DISTANCE_PCT) if MAX_SL_DISTANCE_PCT > 0 else base_pct
+                dist = float(pos) if (peak_pct / 100.0) > offset else (eff_pct / 100.0)
+                new_stop = peak * (1.0 - dist)
+                if new_stop > sl + 1e-12:
+                    signal['stop_loss'] = new_stop
+                    stop_changed = True
+                    logger.info(f"🛡️ [{symbol}] تريلينغ FT: وقف → {new_stop:.6f} (قمة {peak:.6f} بمسافة {dist*100:.2f}%)")
+
+    # 5) حفظ القمة/الوقف المحدثة (كاش + DB — نفس نمط بقية الحلقة)
+    peak_old = float(signal.get('current_peak_price') or entry)
+    if peak > peak_old + 1e-12 or stop_changed:
+        signal['current_peak_price'] = peak
+        with signal_cache_lock:
+            open_signals_cache[symbol] = signal
+        try:
+            if check_db_connection():
+                with conn.cursor() as cur:
+                    cur.execute("UPDATE signals SET current_peak_price = %s, stop_loss = %s WHERE id = %s",
+                                (float(peak), float(signal['stop_loss']), signal_id))
+                conn.commit()
+        except Exception as db_err:
+            logger.error(f"خطأ في قاعدة البيانات عند تحديث FT peak/stop لـ {symbol}: {db_err}")
+            conn.rollback()
+    return False
+
+
 # ---------------------- دوال إدارة الصفقات ----------------------
 def adjust_quantity_to_lot_size(symbol: str, quantity: float) -> Optional[Decimal]:
     try:
@@ -4068,7 +4546,10 @@ def close_signal(signal_id: int, closing_price: float, reason: str) -> bool:
                 'take_profit': '🎯 أخذ الربح', 'stop_loss': '🛑 وقف الخسارة', 'manual': '🖐️ إغلاق يدوي',
                 'atr_trailing_stop': '🛡️ وقف خسارة متحرك', 'journey_completed': '🏁 اكتملت الرحلة',
                 'take_profit_full_exit_on_small_size': '🎯 أخذ الربح (إغلاق كامل لصفقة صغيرة)',
-                'stale_time_exit': '⌛ خروج زمني (صفقة عجوز بلا ربح — نمط Freqtrade)'
+                'stale_time_exit': '⌛ خروج زمني (صفقة عجوز بلا ربح — نمط Freqtrade)',
+                # [V9.29.0] أسباب محرك الخروج الأصلي freqtrade
+                'ft_roi': '🎯 هدف ROI الزمني (freqtrade)', 'ft_stoploss': '🛑 وقف الخسارة (freqtrade)',
+                'ft_trailing_stop': '🛡️ وقف متحرك (freqtrade)', 'ft_exit_signal': '📤 إشارة خروج أصلي (freqtrade)'
             }
             emoji = "✅" if profit_percentage >= 0 else "🔻"
             trade_type = "حقيقية" if signal_to_close.get('is_real_trade') else "تجريبية"
@@ -4122,7 +4603,8 @@ def insert_signal_into_db(signal_data: Dict) -> Optional[Dict]:
             rr_ratio = float(signal_data.get('rr_ratio', 0.0))
 
             journey_state = None
-            if USE_DYNAMIC_JOURNEY:
+            # [V9.29.0] صفقات freqtrade الأصلية بلا "رحلة" جزئية — محرك ROI/التريلينغ الأصلي يحكم الخروج كليًا
+            if USE_DYNAMIC_JOURNEY and str(signal_data.get('strategy_name') or '') not in FREQTRADE_STRATEGIES:
                 journey_state = {
                     "targets_hit": 0,
                     "is_complete": False,
@@ -5021,7 +5503,7 @@ function updateStrategyCandidates() {
             c.innerHTML = '<div class="text-text-secondary text-sm text-center py-4">بناء الدائرة الواسعة جارٍ (بعد الإقلاع)...</div>';
             return;
         }
-        const names = {MACD_EMA: 'تقاطعات MACD+EMA', BB_STOCH: 'الارتداد من القاع', EMA_RSI: 'تقاطع EMA+RSI', PULLBACK: 'شراء التراجع', BB_SQUEEZE: 'انفجار الانضغاط', BULLISH_MOMENTUM: 'زخم صاعد', SR_BREAKOUT: 'اختراق المقاومات'};
+        const names = {MACD_EMA: 'تقاطعات MACD+EMA', BB_STOCH: 'الارتداد من القاع', EMA_RSI: 'تقاطع EMA+RSI', PULLBACK: 'شراء التراجع', BB_SQUEEZE: 'انفجار الانضغاط', BULLISH_MOMENTUM: 'زخم صاعد', SR_BREAKOUT: 'اختراق المقاومات', FT_BBANDRSI: 'بولنجر+RSI الأصلي', FT_BINHCLUC: 'BinH+Cluc الأصلي', FT_EMASKIPPUMP: 'EMA Skip Pump الأصلي', FT_QUICKIE: 'Quickie الأصلي', FT_ADXMOMENTUM: 'زخم ADX الأصلي', FT_BANDTASTIC: 'Bandtastic الأصلي'};
         c.innerHTML = Object.entries(data.candidates).map(([key, list]) => {
             const chips = (list || []).map(n => {
                 const dim = n.examinable === false;
@@ -5192,6 +5674,8 @@ def get_market_status():
             "use_bb_squeeze_strategy": use_bb_squeeze,
             "use_bullish_momentum_strategy": use_bullish_momentum,
             "use_sr_breakout_strategy": use_sr_breakout,
+            "use_ft_strategies": FT_STRATEGIES_ENABLED,
+            "ft_strategies": {**FT_STRATEGY_ENABLED} if FT_STRATEGIES_ENABLED else {},
         }
     })
 
@@ -5399,6 +5883,12 @@ def api_strategy_candidates():
                 if USE_BULLISH_MOMENTUM_STRATEGY: display_names['BULLISH_MOMENTUM'] = "Bullish_Momentum"
             with sr_breakout_strategy_lock:
                 if USE_SR_BREAKOUT_STRATEGY: display_names['SR_BREAKOUT'] = "SR_Breakout_Enhanced"
+            # [V9.29.0] استراتيجيات freqtrade الأصلية في دائرة الترشيح المعروضة
+            if FT_STRATEGIES_ENABLED:
+                with ft_strategies_lock:
+                    for _ft_name, _ft_spec in FREQTRADE_STRATEGIES.items():
+                        if FT_STRATEGY_ENABLED.get(_ft_name, True):
+                            display_names[_ft_spec['key']] = _ft_name
         except Exception:
             display_names = {}
         out = {}
@@ -5739,7 +6229,7 @@ def _evaluate_protections_on_close():
     sl_window = now_ts - PROTECTION_SL_LOOKBACK_MIN * 60
     sl_closes = [c for c in closes
                  if c['ts'] >= sl_window and c['profit_pct'] < 0.0
-                 and c['reason'] in ('stop_loss', 'atr_trailing_stop')]
+                 and c['reason'] in ('stop_loss', 'atr_trailing_stop', 'ft_stoploss', 'ft_trailing_stop')]  # [V9.29.0] + وقفات freqtrade الأصلية
     if len(sl_closes) >= PROTECTION_SL_COUNT:
         _add_protection_lock(
             'global', None, PROTECTION_SL_STOP_MIN,
@@ -5941,6 +6431,18 @@ def trade_management_loop():
                 except Exception as stale_err:
                     logger.debug(f"[مدير الصفقات] فحص العمر تجاهل: {stale_err}")
 
+                # [V9.29.0] صفقات استراتيجيات freqtrade الأصلية تُدار كليًا بمحرك الخروج الأصلي:
+                # وقف ← ROI الزمني ← إشارة خروج ← تريلينغ — بلا ATR-trail ولا رحلة جزئية.
+                # (هذا هو "منطق الغلق" المطلوب: نفس ترتيب وأولويات freqtrade حرفيًا)
+                _ft_spec_mg = FREQTRADE_STRATEGIES.get(str(signal.get('strategy_name')))
+                if _ft_spec_mg is not None:
+                    try:
+                        if ft_exit_engine_step(signal, signal_id, symbol, current_price, _ft_spec_mg):
+                            continue
+                    except Exception as ft_err:
+                        logger.error(f"❌ [{symbol}] خطأ محرك خروج freqtrade: {ft_err}", exc_info=True)
+                    continue  # الصفقة مملوكة لمحرك FT في كل الأحوال — لا تطرق الإدارة العامة
+
                 if current_price <= sl:
                     reason = 'atr_trailing_stop' if USE_ATR_TRAILING_STOP and sl > float(signal.get('initial_stop_loss', sl)) else 'stop_loss'
                     close_signal(signal_id, current_price, reason)
@@ -6117,6 +6619,13 @@ def _evidence_strategy_table() -> List[Tuple[str, Any, str]]:
         ('BB_SQUEEZE', check_bb_squeeze_strategy, 'BB_Squeeze_Breakout'),
         ('BULLISH_MOMENTUM', check_bullish_momentum_strategy, 'Bullish_Momentum'),
         ('SR_BREAKOUT', check_support_resistance_strategy_enhanced, 'SR_Breakout_Enhanced'),
+        # [V9.29.0] استراتيجيات freqtrade الأصلية — أدلة حسابية من إعادة التشغيل نفسها
+        ('FT_BBANDRSI', ft_entry_bbandrsi, 'FT_BbandRsi'),
+        ('FT_BINHCLUC', ft_entry_binhcluc, 'FT_CombinedBinHAndCluc'),
+        ('FT_EMASKIPPUMP', ft_entry_emaskippump, 'FT_EMASkipPump'),
+        ('FT_QUICKIE', ft_entry_quickie, 'FT_Quickie'),
+        ('FT_ADXMOMENTUM', ft_entry_adxmomentum, 'FT_ADXMomentum'),
+        ('FT_BANDTASTIC', ft_entry_bandtastic, 'FT_Bandtastic'),
     ]
 
 
@@ -6197,6 +6706,64 @@ def _evidence_simulate_exit(df: pd.DataFrame, sig_i: int, atr_sig: float, n: int
             return None
         gross = sum(p * f for p, f in fills) / entry - 1.0
         return gross * 100.0 - 2.0 * (EVIDENCE_FEE_PCT + EVIDENCE_SLIP_PCT)
+    except Exception:
+        return None
+
+
+def _ft_evidence_simulate_exit(df: pd.DataFrame, sig_i: int, spec: Dict[str, Any], n: int) -> Optional[float]:
+    """باك تيست خروج freqtrade الأصلي لصفقات FT (بديل محاكاة V9.22 للاستراتيجيات المحلية):
+    دخول عند open الشمعة التالية؛ لكل شمعة 15م بالترتيب المحافظ:
+    وقف (ب low) ← ROI الزمني (ب high بعتبة العمر) ← إشارة خروج أصلي (إغلاق الشمعة)
+    ← تريلينغ أصلي من قمة الشمعة (رفع فقط). أقصى احتفاظ 48 ساعة (192 شمعة)
+    كما في بقية المحاكاة. يعيد الصافي % بعد رسوم جانبين + انزلاق."""
+    try:
+        e_i = sig_i + 1
+        if e_i >= n:
+            return None
+        entry = float(df['open'].iloc[e_i])
+        if not (entry > 0):
+            return None
+        base_pct = abs(float(spec.get('stoploss') or -0.05)) * 100.0
+        eff_pct = min(base_pct, MAX_SL_DISTANCE_PCT) if MAX_SL_DISTANCE_PCT > 0 else base_pct
+        sl = entry * (1.0 - eff_pct / 100.0)
+        peak = entry
+        pos = spec.get('trailing_stop_positive')
+        offset = spec.get('trailing_stop_positive_offset')
+        only_offset = bool(spec.get('trailing_only_offset_is_reached', False))
+        exit_fn = spec.get('exit_fn')
+        end_j = min(n, e_i + 192)
+        if end_j <= e_i:
+            return None
+        exit_px: Optional[float] = None
+        for j in range(e_i, end_j):
+            lo = float(df['low'].iloc[j])
+            hi = float(df['high'].iloc[j])
+            if lo <= sl:
+                exit_px = sl
+                break
+            elapsed_min = (j - e_i + 1) * 15.0
+            thr = ft_roi_threshold(spec, elapsed_min)
+            if thr is not None and (hi / entry - 1.0) >= thr:
+                exit_px = entry * (1.0 + thr)
+                break
+            if exit_fn is not None:
+                try:
+                    if exit_fn(df.iloc[max(0, j - 3): j + 1]):
+                        exit_px = float(df['close'].iloc[j])
+                        break
+                except Exception:
+                    pass
+            if hi > peak:
+                peak = hi
+            if spec.get('trailing_stop') and pos is not None and offset is not None and peak > entry:
+                peak_pct = peak / entry - 1.0
+                if not (only_offset and peak_pct < offset):
+                    dist = float(pos) if peak_pct > offset else (eff_pct / 100.0)
+                    sl = max(sl, peak * (1.0 - dist))
+        if exit_px is None:
+            exit_px = float(df['close'].iloc[end_j - 1])
+        gross = (exit_px / entry - 1.0) * 100.0
+        return gross - 2.0 * (EVIDENCE_FEE_PCT + EVIDENCE_SLIP_PCT)
     except Exception:
         return None
 
@@ -6317,7 +6884,9 @@ def _evidence_replay_symbol(symbol: str, btc_df: Optional[pd.DataFrame]) -> List
                 continue
             if not fn(win):
                 continue
-            net = _evidence_simulate_exit(df_feat, i, atr_i, n)
+            _ft_spec_ev = FREQTRADE_STRATEGIES.get(name)
+            net = (_ft_evidence_simulate_exit(df_feat, i, _ft_spec_ev, n) if _ft_spec_ev is not None
+                   else _evidence_simulate_exit(df_feat, i, atr_i, n))  # [V9.29.0] خروج freqtrade لصفقات FT
             if net is not None:
                 out.append((name, regime, float(net)))
                 last_sig[name] = i + EVIDENCE_ENTRY_SPACING
@@ -6628,6 +7197,12 @@ def main_loop_enhanced():
                 if USE_BULLISH_MOMENTUM_STRATEGY: strategies_to_check.append(('BULLISH_MOMENTUM', check_bullish_momentum_strategy, "Bullish_Momentum"))
             with sr_breakout_strategy_lock:
                 if USE_SR_BREAKOUT_STRATEGY: strategies_to_check.append(('SR_BREAKOUT', check_support_resistance_strategy_enhanced, "SR_Breakout_Enhanced"))
+            # [V9.29.0] استراتيجيات freqtrade الأصلية بأعداداتها — مفعلة جماعيًا أو لكل واحدة
+            if FT_STRATEGIES_ENABLED:
+                with ft_strategies_lock:
+                    for _ft_name, _ft_spec in FREQTRADE_STRATEGIES.items():
+                        if FT_STRATEGY_ENABLED.get(_ft_name, True):
+                            strategies_to_check.append((_ft_spec['key'], _ft_spec['entry_fn'], _ft_name))
 
             # [V9.25.0] الحلقة استراتيجيةً: كل استراتيجية تفحص مرشحيها العشرة حصرًا.
             # بوابات مستوى الاستراتيجية (حالة السوق + ثبات الصاعد) قبل جلب أي شموع.
@@ -6812,7 +7387,9 @@ def main_loop_enhanced():
                         # المُطلِقات — التوصية فعلها هو حكم الفلاتر نفسها، فتكفي بوابات:
                         # القائد + دفتر الطلبات + قابلية حساب الهدف/الوقف
                         if signal_source != 'filter_recommendation':
-                            if strategy_used == 'BB_Stoch_Reversal_Enhanced':
+                            if strategy_used in FREQTRADE_STRATEGIES:
+                                pass  # [V9.29.0] نهج freqtrade الأصلي: شروط الدخول هي البوابة ذاتها — بلا تأكيد فريم أعلى ولا فلتر قمة
+                            elif strategy_used == 'BB_Stoch_Reversal_Enhanced':
                                 # استراتيجية ارتدادية: تجنب الشراء عند قمة آخر 24 ساعة
                                 if not check_price_peak_filter(df_with_indicators, entry_price):
                                     continue
@@ -6832,7 +7409,13 @@ def main_loop_enhanced():
                             continue
 
                         logger.info(f"  -> [{symbol}] ✅ نجح فلتر دفتر الطلبات. جاري تحضير الصفقة...")
-                        tp_sl_data = calculate_dynamic_tp_sl(df_with_indicators, entry_price)
+                        # [V9.29.0] صفقات freqtrade الأصلية: وقف/هدف من مواصفة الاستراتيجية نفسها
+                        # (وقف الكانوني مقيّد بسقف الحماية 6%، والهدف = ROI عند 0 دقيقة)
+                        _ft_spec_open = FREQTRADE_STRATEGIES.get(strategy_used)
+                        if _ft_spec_open is not None:
+                            tp_sl_data = ft_initial_tp_sl(entry_price, _ft_spec_open)
+                        else:
+                            tp_sl_data = calculate_dynamic_tp_sl(df_with_indicators, entry_price)
                         if not tp_sl_data: continue
 
                         new_signal = {
