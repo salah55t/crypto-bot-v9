@@ -1783,6 +1783,14 @@ class MarketStreamHub:
                 logger.warning(f"🛰️ [مركز البيانات] فشل إرسال تحديث الاشتراك: {e}")
 
     def _current_universe(self) -> List[str]:
+        # [V9.25.0] الصيانة تزامن الاتحاد (العميق + المرشحين) لا العميق وحده —
+        # وإلا قلّصت الاشتراكات بعد كل دورة وعادت شموع المرشحين إلى REST
+        try:
+            union = scan_universe_union()
+            if union:
+                return union
+        except Exception:
+            pass
         try:
             with universe_lock:
                 return list(validated_symbols_to_scan)
@@ -2463,7 +2471,7 @@ def refresh_universe_if_needed(force: bool = False) -> None:
     if stream_hub is not None:
         try:
             with universe_lock:
-                stream_hub.set_universe(list(validated_symbols_to_scan))
+                stream_hub.set_universe(scan_universe_union())
         except Exception:
             pass
 
@@ -2594,6 +2602,30 @@ def nominate_strategy_candidates(force: bool = False) -> Dict[str, List[Dict[str
                           if str(n['symbol']).upper() not in open_syms][:NOMINEES_PER_STRATEGY]
         STRATEGY_NOMINEES = final
         return {k: list(v) for k, v in STRATEGY_NOMINEES.items()}
+
+
+def scan_universe_union() -> List[str]:
+    """[V9.25.0] كون اشتراك WS: العميق + كل مرشحي الاستراتيجيات + الصفقات المفتوحة.
+    شموع كل ما سيُفحص في الدورة تظل حية ومجانية في المركز — بعد التدفئة صفر وزن REST
+    لكل فحوصات الدورة. كل مواضع set_universe تستخدم هذا الاتحاد حتى لا يُقلّص الاشتراك."""
+    syms = {str(s).upper() for s in (validated_symbols_to_scan or [])}
+    try:
+        with nominees_lock:
+            for lst in STRATEGY_NOMINEES.values():
+                for n in lst:
+                    syms.add(str(n['symbol']).upper())
+    except Exception:
+        pass
+    try:
+        with signal_cache_lock:
+            syms |= {str(s).upper() for s in open_signals_cache.keys()}
+    except Exception:
+        pass
+    try:
+        syms |= {str(s).upper() for s in LEADER_SYMBOLS}
+    except Exception:
+        pass
+    return sorted(syms)
 
 
 # --- دوال جلب البيانات وحساب المؤشرات ---
@@ -6052,9 +6084,7 @@ def main_loop_enhanced():
             strategy_nominees_map = nominate_strategy_candidates()
             try:
                 if stream_hub is not None:
-                    _union_syms = list(validated_symbols_to_scan) + [
-                        n['symbol'] for _lst in strategy_nominees_map.values() for n in _lst]
-                    stream_hub.set_universe(sorted(set(_union_syms)))
+                    stream_hub.set_universe(scan_universe_union())
             except Exception:
                 pass
             # [V9.17.0] ترشيحات هذه الدورة: الأزواج المطابقة لكل استراتيجية (تُنشر للوحة آخر الدورة)
@@ -6300,7 +6330,7 @@ def main_loop_enhanced():
                             # [V9.19.0] تثبيت فوري لتدفق WS للرمز المفتوح حديثًا — بدل انتظار
                             # دورة الصيانة (≤60ث) كان أول دقيقة من الصفقة بلا سعر حي
                             if stream_hub is not None:
-                                try: stream_hub.set_universe(validated_symbols_to_scan)
+                                try: stream_hub.set_universe(scan_universe_union())
                                 except Exception: pass
                             if signal_source == 'filter_recommendation':
                                 # [V9.18.0] محاسبة التوصية المفتوحة (كليًا ولكل استراتيجية)
