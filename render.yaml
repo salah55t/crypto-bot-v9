@@ -117,3 +117,34 @@ services:
         value: "1.15"
       - key: EVIDENCE_REFRESH_MIN
         value: "240"
+      # --- [V9.26.0] الحمايات — نمط Freqtrade (StoplossGuard/MaxDrawdown/LowProfitPairs/Cooldown) ---
+      - key: PROTECTIONS_ENABLED
+        value: "True"
+      - key: PROTECTION_SL_COUNT
+        value: "4"
+      - key: PROTECTION_SL_LOOKBACK_MIN
+        value: "240"
+      - key: PROTECTION_SL_STOP_MIN
+        value: "240"
+      - key: PROTECTION_DD_MAX_PCT
+        value: "12.0"
+      - key: PROTECTION_DD_LOOKBACK_MIN
+        value: "1440"
+      - key: PROTECTION_DD_TRADE_LIMIT
+        value: "5"
+      - key: PROTECTION_DD_STOP_MIN
+        value: "360"
+      - key: PROTECTION_PAIR_TRADES
+        value: "2"
+      - key: PROTECTION_PAIR_LOOKBACK_MIN
+        value: "720"
+      - key: PROTECTION_PAIR_STOP_MIN
+        value: "360"
+      - key: PROTECTION_COOLDOWN_MIN
+        value: "240"
+      - key: MAX_SL_DISTANCE_PCT
+        value: "6.0"
+      - key: STALE_TRADE_HOURS
+        value: "24.0"
+      - key: STALE_MIN_PROFIT_PCT
+        value: "0.2"

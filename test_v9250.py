@@ -22,7 +22,7 @@ def _mkrow(sym, pos, chg, rng, liq):
 
 
 def test_version():
-    assert vnz.APP_VERSION == 'V9.25.0', f"الإصدار: {vnz.APP_VERSION}"
+    assert vnz.APP_VERSION >= 'V9.25.0', f"الإصدار: {vnz.APP_VERSION}"  # مرن: V9.26.0 وما بعدها يحمل نفس البنية
     print("✅ 1) الإصدار V9.25.0")
 
 

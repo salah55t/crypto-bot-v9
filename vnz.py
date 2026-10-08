@@ -25,7 +25,7 @@ from flask_cors import CORS
 from threading import Thread, Lock, current_thread, enumerate as threading_enumerate
 from datetime import datetime, timezone, timedelta
 from decouple import config
-from typing import List, Dict, Optional, Any, Set, Tuple
+from typing import List, Dict, Optional, Any, Set, Tuple, Deque
 from sklearn.preprocessing import StandardScaler
 from collections import deque, Counter, defaultdict
 # [V9.16.0] مركز بيانات WebSocket — لا يخضع لأوزان REST ويعمل أثناء الحظر
@@ -49,7 +49,7 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-APP_VERSION: str = 'V9.25.0'  # [V9.21.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
+APP_VERSION: str = 'V9.26.0'  # [V9.21.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
 logger = logging.getLogger(f'CryptoBot{APP_VERSION}')
 
 # زمن إقلاع العملية لحساب مدة التشغيل في لوحة التحكم
@@ -442,6 +442,35 @@ ATR_TS_MULTIPLIER: float = 2.8
 # هذا الحد فوق سعر الدخول (0 = السلوك القديم). كان الرفع من أول قمة غبارية
 # يُغلق الرابحين مبكرًا (+0.03→+0.74) ويستنزف بالدوران والرسوم
 ATR_TRAIL_ACTIVATE_PROFIT_PCT: float = config('ATR_TRAIL_ACTIVATE_PROFIT_PCT', default=1.5, cast=float)
+
+# --- [V9.26.0] طبقة الحماية والانضباط — مستوحاة من Freqtrade (plugins/protections/) ---
+# الفكرة المركزية في freqtrade: الخسائر المتكررة تُغلق باب الدخول مؤقتًا (PairLock مع expiry)
+# بدل الاستمرار في الدخول على نفس الظروف الخاسرة. مراجع الأفكار:
+#   stoploss_guard.py / max_drawdown_protection.py / low_profit_pairs.py / cooldown_period.py
+# [الدليل الحي 2026-10-08]: 21 إغلاقًا في ~13 ساعة = -27.13% (16 وقفة خسارة، أسوأها MET -10.67%)
+# والبوت واصل الدخول بلا أي قاطع مسار — الحمايات اليومية لا تتحرك في الوضع الورقي (4 USDT/صفقة)
+PROTECTIONS_ENABLED: bool = config('PROTECTIONS_ENABLED', default=True, cast=bool)
+# 1) StoplossGuard — "أوقف النزيف": N وقفات خسارة خلال نافذة → تجميد دخول شامل
+PROTECTION_SL_COUNT: int = config('PROTECTION_SL_COUNT', default=4, cast=int)
+PROTECTION_SL_LOOKBACK_MIN: int = config('PROTECTION_SL_LOOKBACK_MIN', default=240, cast=int)
+PROTECTION_SL_STOP_MIN: int = config('PROTECTION_SL_STOP_MIN', default=240, cast=int)
+# 2) MaxDrawdown — "حد التراجع الأقصى": تراكم خسائر النافذة (بالمئوية، محايد للوضع الورقي/الحقيقي)
+PROTECTION_DD_MAX_PCT: float = config('PROTECTION_DD_MAX_PCT', default=12.0, cast=float)
+PROTECTION_DD_LOOKBACK_MIN: int = config('PROTECTION_DD_LOOKBACK_MIN', default=1440, cast=int)
+PROTECTION_DD_TRADE_LIMIT: int = config('PROTECTION_DD_TRADE_LIMIT', default=5, cast=int)
+PROTECTION_DD_STOP_MIN: int = config('PROTECTION_DD_STOP_MIN', default=360, cast=int)
+# 3) LowProfitPairs — "لا نطعن في الجرح نفسه": زوج مجموع أرباحه سالب في النافذة → قفل الزوج فقط
+PROTECTION_PAIR_TRADES: int = config('PROTECTION_PAIR_TRADES', default=2, cast=int)
+PROTECTION_PAIR_LOOKBACK_MIN: int = config('PROTECTION_PAIR_LOOKBACK_MIN', default=720, cast=int)
+PROTECTION_PAIR_MIN_PROFIT: float = config('PROTECTION_PAIR_MIN_PROFIT', default=0.0, cast=float)
+PROTECTION_PAIR_STOP_MIN: int = config('PROTECTION_PAIR_STOP_MIN', default=360, cast=int)
+# 4) CooldownPeriod — تهدئة لكل زوج بعد أي إغلاق (تفحصها كل مسارات الدخول لا التوصيات حصرًا)
+PROTECTION_COOLDOWN_MIN: int = config('PROTECTION_COOLDOWN_MIN', default=240, cast=int)
+# 5) سقف مسافة الوقف (نمط stoploss الثابت في freqtrade — وقف ATR بلا سقف أنتج -10.67%)
+MAX_SL_DISTANCE_PCT: float = config('MAX_SL_DISTANCE_PCT', default=6.0, cast=float)
+# 6) الخروج الزمني (نمط ROI/custom_exit): صفقة عجوز بلا ربح تحرّر المكان وتقطع استنزاف الرسوم
+STALE_TRADE_HOURS: float = config('STALE_TRADE_HOURS', default=24.0, cast=float)
+STALE_MIN_PROFIT_PCT: float = config('STALE_MIN_PROFIT_PCT', default=0.2, cast=float)
 
 # --- متغيرات الحالة والكاش ---
 conn: Optional[psycopg2.extensions.connection] = None
@@ -3798,6 +3827,14 @@ def calculate_dynamic_tp_sl(df: pd.DataFrame, entry_price: float, is_long: bool 
         
         sl_distance = last['atr'] * atr_multiplier_sl
         tp_distance = last['atr'] * atr_multiplier_tp
+        # [V9.26.0] سقف مسافة الوقف — نمط freqtrade: وقف ثابت محدود النسبة دائمًا.
+        # وقف ATR بلا سقف (2.5×ATR ×1.2 للأسواق المتقلبة) أنتج خسارة مفردة -10.67% (MET)
+        # — خطر ذيل غير مقبول على محفظة صغيرة. السقف يقصّ الذيل فقط ولا يمس الوقوف العادية
+        if MAX_SL_DISTANCE_PCT > 0:
+            max_sl_distance = entry_price * (MAX_SL_DISTANCE_PCT / 100.0)
+            if sl_distance > max_sl_distance:
+                logger.info(f"  -> [{df.name}] 🛡️ سقف الوقف: {sl_distance / entry_price * 100:.2f}% > {MAX_SL_DISTANCE_PCT}% — تقييد الوقف (نمط Freqtrade)")
+                sl_distance = max_sl_distance
         
         if is_long:
             stop_loss = entry_price - sl_distance
@@ -3971,11 +4008,18 @@ def close_signal(signal_id: int, closing_price: float, reason: str) -> bool:
 
             log_and_notify('info', f"تم الإغلاق: {symbol_to_close} عند {closing_price:.4f}. السبب: {reason}. الربح/الخسارة: {profit_percentage:.2f}%", "TRADE_CLOSED")
             register_realized_pnl(signal_to_close, entry_price, closing_price)
+            # [V9.26.0] تغذية مدير الحماية (نمط Freqtrade): كل إغلاق يُقيَّم فورًا ضد
+            # الحمايات الأربع — وقفات متكررة/تراكم خاسر/زوج خاسر/تهدئة
+            try:
+                record_trade_close_for_protections(symbol_to_close, reason, profit_percentage)
+            except Exception as prot_err:
+                logger.warning(f"⚠️ [حمايات] فشل تقييم الإغلاق: {prot_err}")
 
             reason_map = {
                 'take_profit': '🎯 أخذ الربح', 'stop_loss': '🛑 وقف الخسارة', 'manual': '🖐️ إغلاق يدوي',
                 'atr_trailing_stop': '🛡️ وقف خسارة متحرك', 'journey_completed': '🏁 اكتملت الرحلة',
-                'take_profit_full_exit_on_small_size': '🎯 أخذ الربح (إغلاق كامل لصفقة صغيرة)'
+                'take_profit_full_exit_on_small_size': '🎯 أخذ الربح (إغلاق كامل لصفقة صغيرة)',
+                'stale_time_exit': '⌛ خروج زمني (صفقة عجوز بلا ربح — نمط Freqtrade)'
             }
             emoji = "✅" if profit_percentage >= 0 else "🔻"
             trade_type = "حقيقية" if signal_to_close.get('is_real_trade') else "تجريبية"
@@ -4279,6 +4323,17 @@ def get_dashboard_html():
                 <div class="text-text-secondary text-sm text-center py-4">بناء الدائرة الواسعة جارٍ...</div>
             </div>
             <div class="text-[11px] text-text-secondary mt-2">كل استراتيجية تفحص فقط عملاتها العشر الأقرب لظروفها الحتمية (موقع السعر في مدى 24س + اتجاه الحركة + ضيق المدى + السيولة) — مرّر على العملة لترى سبب ترشيحها. الباهتة = ممنوعة حاليًا بخريطة حالة السوق.</div>
+        </section>
+        <!-- [V9.26.0] الحمايات — مستوحاة من Freqtrade (Locks شفافة) -->
+        <section class="card p-4 mb-6">
+            <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
+                <h3 class="font-bold text-lg text-text-secondary">🛡️ الحمايات — نمط Freqtrade</h3>
+                <div class="text-xs font-mono" id="protections-status" dir="ltr">--</div>
+            </div>
+            <div id="protections-locks" class="grid grid-cols-1 md:grid-cols-2 gap-2 mb-2">
+                <div class="text-text-secondary text-sm text-center py-2">فحص الأقفال جارٍ...</div>
+            </div>
+            <div id="protections-config" class="text-[11px] text-text-secondary leading-5"></div>
         </section>
         <!-- [تحسين V9.11] بوصلة اتجاه BTC على الفريمات الثلاث (API مجاني) -->
         <section class="card p-4 mb-6">
@@ -4949,6 +5004,43 @@ document.addEventListener('DOMContentLoaded', () => {
     whenVisible(updateDataFeed, 60000);  // [V9.20.0] شارة مصدر البيانات كل دقيقة
     whenVisible(updateSmartPicks, 120000); // [V9.23.0] الترشيح الذكي — الأدلة تتجدد كل 4 ساعات
     whenVisible(updateStrategyCandidates, 60000); // [V9.25.0] دائرة الفحص الموسعة — الترشيح يتجدد مع كل تحديث للقائمة (كل 30د)
+
+// [V9.26.0] الحمايات — نمط Freqtrade: أقفال شفافة + إحصاءات (البطاقة تُحدّث كل 30ث)
+function updateProtections() {
+    fetch('/api/protections').then(r => r.json()).then(d => {
+        if (d.error) return;
+        const statusEl = document.getElementById('protections-status');
+        const locksEl = document.getElementById('protections-locks');
+        const cfgEl = document.getElementById('protections-config');
+        if (!statusEl || !locksEl) return;
+        if (!d.enabled) { statusEl.textContent = 'معطّلة'; statusEl.className = 'text-xs font-mono text-text-secondary'; locksEl.innerHTML = '<div class="text-text-secondary text-sm text-center py-2">الحمايات معطّلة بالإعدادات</div>'; return; }
+        const locks = d.active_locks || [];
+        const st = d.stats || {};
+        if (d.global_locked) {
+            statusEl.textContent = 'تجميد شامل مفعّل!';
+            statusEl.className = 'text-xs font-mono text-accent-red font-bold';
+        } else {
+            statusEl.textContent = `أقفال أزواج: ${locks.length} | منعّات دخول: ${st.entries_blocked || 0} | قفل تراكمي: ${st.locks_created_total || 0}`;
+            statusEl.className = 'text-xs font-mono ' + (locks.length > 0 ? 'text-amber-400' : 'text-accent-green');
+        }
+        const protIcons = {StoplossGuard: '🩸', MaxDrawdown: '📉', LowProfitPairs: '🩹', CooldownPeriod: '⏳'};
+        locksEl.innerHTML = locks.length === 0
+            ? '<div class="text-accent-green text-sm py-1">✅ لا أقفال نشطة — الدخول مفتوح وفق البوابات الأخرى</div>'
+            : locks.map(l => `
+                <div class="border rounded-lg p-2 ${l.scope === 'global' ? 'border-red-500/60 bg-red-500/10' : 'border-amber-500/50 bg-amber-500/10'}">
+                    <div class="flex justify-between items-center">
+                        <span class="font-bold text-sm">${protIcons[l.protection] || '🛡️'} ${l.protection}${l.scope === 'pair' ? ` · ${l.pair}` : (l.scope === 'global' ? ' · شامل' : '')}</span>
+                        <span class="text-xs font-mono">⏱ ${l.remaining_min}د</span>
+                    </div>
+                    <div class="text-[11px] text-text-secondary mt-1">${l.reason}</div>
+                </div>`).join('');
+        if (cfgEl && d.config) {
+            const c = d.config;
+            cfgEl.innerHTML = `🩸 StoplossGuard: ${c.stoploss_guard} &nbsp;|&nbsp; 📉 MaxDrawdown: ${c.max_drawdown} &nbsp;|&nbsp; 🩹 LowProfitPairs: ${c.low_profit_pairs} &nbsp;|&nbsp; ⏳ تهدئة: ${c.cooldown} &nbsp;|&nbsp; 🛡️ سقف الوقف: ${c.max_sl_distance_pct}% &nbsp;|&nbsp; ⌛ ${c.stale_exit}`;
+        }
+    }).catch(() => {});
+}
+whenVisible(updateProtections, 30000); // [V9.26.0] الحمايات — كل 30 ثانية
 });
 </script>
 </body></html>
@@ -5003,6 +5095,15 @@ def api_system_status():
             'universe_updated_sec_ago': int(time.time() - universe_last_refresh) if universe_last_refresh else None,
             'universe_top_preview': universe_meta.get('top_preview', []) if isinstance(universe_meta, dict) else [],
         })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/protections')
+def api_protections():
+    """[V9.26.0] حالة الحمايات المستوحاة من Freqtrade: الأقفال النشطة + إحصاءات + الإعدادات.
+    شفافية كاملة: المستخدم يرى لماذا توقف الدخول ومتى يُفتح (نمط عرض Locks في freqtrade UI)."""
+    try:
+        return jsonify(get_active_protections_snapshot())
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -5503,6 +5604,187 @@ def is_daily_loss_limit_hit() -> bool:
         send_telegram_message("🛑 *قاطع الحماية اليومي:* تم إيقاف فتح صفقات جديدة بسبب تجاوز حد الخسارة اليومي.")
     return hit
 
+# --- [V9.26.0] مدير الحماية والانضباط — اقتباس مباشر من فلسفة Freqtrade (plugins/protections/) ---
+# النموذج المرجعي في freqtrade: كل حماية تفحص الصفقات المغلقة في نافذة زمنية، وعند تجاوز الحد
+# تُنشئ PairLock بمهلة انتهاء تُفحص قبل أي دخول (global أو per-pair). نطبّق المبدأ نفسه
+# بأربعة حمايات: StoplossGuard، MaxDrawdown، LowProfitPairs، CooldownPeriod.
+_protection_locks: List[Dict[str, Any]] = []          # الأقفال النشطة: scope/pair/until/reason/created
+_protection_close_log: Deque[Dict[str, Any]] = deque(maxlen=400)  # إغلاقات حديثة: ts/symbol/reason/profit
+_protection_stats: Dict[str, Any] = {
+    'locks_created_total': 0, 'global_locks': 0, 'pair_locks': 0,
+    'entries_blocked': 0, 'last_lock_at': None, 'last_lock_reason': None,
+}
+_protection_lock = Lock()
+
+
+def _purge_expired_protection_locks(now_ts: float):
+    """حذف الأقفال المنتهية (نمط freqtrade: Lock له until — يُسقط تلقائيًا عند انتهائه)."""
+    with _protection_lock:
+        _protection_locks[:] = [lk for lk in _protection_locks if lk['until_ts'] > now_ts]
+
+
+def _add_protection_lock(scope: str, pair: Optional[str], minutes: int, reason: str,
+                         protection_name: str) -> bool:
+    """إنشاء قفل حماية. لا تكرار: إن وُجد قفل نفس النطاق أطول نُبقي الأطول (freqtrade: max until)."""
+    now_ts = time.time()
+    until_ts = now_ts + minutes * 60
+    with _protection_lock:
+        for lk in _protection_locks:
+            same_scope = (lk['scope'] == scope and
+                          ((scope == 'global') or (lk['pair'] == pair)))
+            if same_scope and lk['until_ts'] >= until_ts:
+                return False
+        _protection_locks[:] = [lk for lk in _protection_locks
+                                if not (lk['scope'] == scope and
+                                        ((scope == 'global') or (lk['pair'] == pair)))]
+        lock_entry = {
+            'scope': scope, 'pair': pair if scope == 'pair' else None,
+            'until_ts': until_ts, 'until': datetime.fromtimestamp(until_ts, timezone.utc).isoformat(),
+            'minutes': minutes, 'reason': reason, 'protection': protection_name,
+            'created': datetime.fromtimestamp(now_ts, timezone.utc).isoformat(),
+        }
+        _protection_locks.append(lock_entry)
+        with _scan_stats_lock:
+            _protection_stats['locks_created_total'] += 1
+            _protection_stats['last_lock_at'] = lock_entry['created']
+            _protection_stats['last_lock_reason'] = reason
+            if scope == 'global': _protection_stats['global_locks'] += 1
+            else: _protection_stats['pair_locks'] += 1
+    log_and_notify('warning',
+                   f"🛡️ حماية {protection_name}: {reason} — "
+                   f"{'تجميد الدخول الشامل' if scope == 'global' else f'قفل الزوج {pair}'} لمدة {minutes} دقيقة.",
+                   "PROTECTION_LOCK")
+    send_telegram_message(
+        f"🛡️ *حماية {protection_name} (نمط Freqtrade)*\n"
+        f"السبب: {reason}\n"
+        f"النطاق: {'كامل البوت' if scope == 'global' else f'الزوج {pair}'}"
+        f" — المدة: {minutes} دقيقة")
+    return True
+
+
+def _evaluate_protections_on_close():
+    """تقييم الحمايات الأربع على سجل الإغلاقات الحديثة — تُستدعى بعد كل إغلاق صفقة.
+    (مطابق لفكرة freqtrade: ProtectionManager.global_stop/local_stop بعد كل صفقة)."""
+    if not PROTECTIONS_ENABLED: return
+    now_ts = time.time()
+    with _protection_lock:
+        closes = list(_protection_close_log)
+
+    # 1) StoplossGuard: وقفات خسارة متتالية خلال النافذة → تجميد شامل
+    sl_window = now_ts - PROTECTION_SL_LOOKBACK_MIN * 60
+    sl_closes = [c for c in closes
+                 if c['ts'] >= sl_window and c['profit_pct'] < 0.0
+                 and c['reason'] in ('stop_loss', 'atr_trailing_stop')]
+    if len(sl_closes) >= PROTECTION_SL_COUNT:
+        _add_protection_lock(
+            'global', None, PROTECTION_SL_STOP_MIN,
+            f"{len(sl_closes)} وقفات خسارة خلال {PROTECTION_SL_LOOKBACK_MIN} دقيقة",
+            "StoplossGuard")
+
+    # 2) MaxDrawdown: تراكم النافذة (نسبة مئوية محايدة للوضع) تحت الحد → تجميد شامل
+    dd_window = now_ts - PROTECTION_DD_LOOKBACK_MIN * 60
+    dd_closes = [c for c in closes if c['ts'] >= dd_window]
+    if len(dd_closes) >= PROTECTION_DD_TRADE_LIMIT:
+        dd_sum = sum(c['profit_pct'] for c in dd_closes)
+        if dd_sum <= -abs(PROTECTION_DD_MAX_PCT):
+            _add_protection_lock(
+                'global', None, PROTECTION_DD_STOP_MIN,
+                f"تراكم النافذة {dd_sum:.1f}% عبر {len(dd_closes)} صفقة تجاوز حد -{abs(PROTECTION_DD_MAX_PCT):.1f}%",
+                "MaxDrawdown")
+
+    # 3) LowProfitPairs: زوج خاسر متكرر في النافذة → قفل الزوج فقط
+    pair_window = now_ts - PROTECTION_PAIR_LOOKBACK_MIN * 60
+    per_pair: Dict[str, List[Dict[str, Any]]] = {}
+    for c in closes:
+        if c['ts'] >= pair_window:
+            per_pair.setdefault(c['symbol'], []).append(c)
+    for pair_sym, pc in per_pair.items():
+        if len(pc) >= PROTECTION_PAIR_TRADES:
+            pair_sum = sum(x['profit_pct'] for x in pc)
+            if pair_sum < PROTECTION_PAIR_MIN_PROFIT:
+                _add_protection_lock(
+                    'pair', pair_sym, PROTECTION_PAIR_STOP_MIN,
+                    f"مجموع {len(pc)} صفقات = {pair_sum:.2f}% خلال "
+                    f"{PROTECTION_PAIR_LOOKBACK_MIN // 60} ساعات",
+                    "LowProfitPairs")
+
+    # 4) CooldownPeriod: تهدئة لكل زوج بعد أي إغلاق (كل المسارات لا التوصيات حصرًا)
+    latest_close = max((c['ts'] for c in closes), default=None)
+    if latest_close is not None:
+        sym_latest = [c['symbol'] for c in closes if c['ts'] == latest_close]
+        for pair_sym in sym_latest:
+            _add_protection_lock('pair', pair_sym, PROTECTION_COOLDOWN_MIN,
+                                 f"تهدئة ما بعد الإغلاق ({PROTECTION_COOLDOWN_MIN} دقيقة)",
+                                 "CooldownPeriod")
+
+
+def record_trade_close_for_protections(symbol: str, reason: str, profit_pct: float):
+    """تغذية مدير الحماية بإغلاق صفقة — تُستدعى من close_signal بعد كل إغلاق."""
+    if not PROTECTIONS_ENABLED: return
+    with _protection_lock:
+        _protection_close_log.append({
+            'ts': time.time(), 'symbol': symbol,
+            'reason': str(reason), 'profit_pct': float(profit_pct),
+        })
+    _evaluate_protections_on_close()
+
+
+def is_entry_protection_locked(symbol: Optional[str] = None) -> tuple:
+    """بوابة الدخول: هل يمنع الحماية فتح صفقة جديدة؟
+    - بلا رمز: تُقيَّم الأقفال الشاملة فقط (StoplossGuard / MaxDrawdown)
+    - برمز: تُقيَّم أقفال الزوج أيضًا (LowProfitPairs / CooldownPeriod)
+    يعيد (مقفول؟، السبب) — يُحصي محاولات الدخول الممنوعة للوحة."""
+    if not PROTECTIONS_ENABLED: return (False, None)
+    now_ts = time.time()
+    _purge_expired_protection_locks(now_ts)
+    with _protection_lock:
+        for lk in _protection_locks:
+            if lk['scope'] == 'global':
+                with _scan_stats_lock: _protection_stats['entries_blocked'] += 1
+                return (True, f"{lk['protection']}: {lk['reason']}")
+        if symbol is not None:
+            for lk in _protection_locks:
+                if lk['scope'] == 'pair' and lk['pair'] == symbol:
+                    with _scan_stats_lock: _protection_stats['entries_blocked'] += 1
+                    return (True, f"{lk['protection']}: {lk['reason']}")
+    return (False, None)
+
+
+def get_active_protections_snapshot() -> Dict[str, Any]:
+    """لقطة الحمايات للوحة/API: الأقفال النشطة + إحصاءات + الإعدادات."""
+    now_ts = time.time()
+    _purge_expired_protection_locks(now_ts)
+    with _protection_lock:
+        active = [
+            {'scope': lk['scope'], 'pair': lk['pair'], 'protection': lk['protection'],
+             'reason': lk['reason'], 'until': lk['until'],
+             'remaining_min': max(0, int((lk['until_ts'] - now_ts) / 60))}
+            for lk in _protection_locks
+        ]
+    with _scan_stats_lock:
+        stats = dict(_protection_stats)
+    with _protection_lock:
+        recent = list(_protection_close_log)[-12:]
+    return {
+        'enabled': PROTECTIONS_ENABLED,
+        'active_locks': active,
+        'global_locked': any(a['scope'] == 'global' for a in active),
+        'stats': stats,
+        'recent_closes': [
+            {'symbol': c['symbol'], 'reason': c['reason'], 'profit_pct': round(c['profit_pct'], 2),
+             'age_min': int((now_ts - c['ts']) / 60)} for c in recent
+        ],
+        'config': {
+            'stoploss_guard': f"{PROTECTION_SL_COUNT} وقفات/{PROTECTION_SL_LOOKBACK_MIN}د → تجميد {PROTECTION_SL_STOP_MIN}د",
+            'max_drawdown': f"<= -{abs(PROTECTION_DD_MAX_PCT)}% عبر {PROTECTION_DD_TRADE_LIMIT}+ صفقات/{PROTECTION_DD_LOOKBACK_MIN}د → تجميد {PROTECTION_DD_STOP_MIN}د",
+            'low_profit_pairs': f"{PROTECTION_PAIR_TRADES}+ صفقات بمجموع <{PROTECTION_PAIR_MIN_PROFIT}%/{PROTECTION_PAIR_LOOKBACK_MIN}د → قفل زوج {PROTECTION_PAIR_STOP_MIN}د",
+            'cooldown': f"{PROTECTION_COOLDOWN_MIN}د لكل زوج بعد أي إغلاق",
+            'max_sl_distance_pct': MAX_SL_DISTANCE_PCT,
+            'stale_exit': f"> {STALE_TRADE_HOURS}س بربح < {STALE_MIN_PROFIT_PCT}% → إغلاق",
+        },
+    }
+
+
 def get_cached_atr(symbol: str) -> Optional[float]:
     """[تحسين V9.8] جلب ATR مع كاش 60 ثانية لتقليل استدعاءات API في حلقة إدارة الصفقات
     (كانت الحلقة تجلب الشموع مع كل تحديث جديد للسعر)."""
@@ -5574,6 +5856,25 @@ def trade_management_loop():
                 current_price = float(current_price_str)
                 signal_id, symbol = signal['id'], signal['symbol']
                 tp, sl, entry = float(signal['target_price']), float(signal['stop_loss']), float(signal['entry_price'])
+
+                # [V9.26.0] الخروج الزمني — نمط freqtrade (custom_exit/ROI الزمني):
+                # صفقة تجاوزت عمرها المحدد بلا ربح يُذكر → إغلاق لتحرير مكان (MAX_OPEN)
+                # وقطع استنزاف الرسوم والانتباه الإداري على صفقة ميتة
+                try:
+                    _opened_at = signal.get('timestamp')
+                    if _opened_at is not None:
+                        if isinstance(_opened_at, str):
+                            _opened_dt = datetime.fromisoformat(str(_opened_at).replace('Z', '+00:00'))
+                        else:
+                            _opened_dt = _opened_at if getattr(_opened_at, 'tzinfo', None) else _opened_at.replace(tzinfo=timezone.utc)
+                        _age_hours = (datetime.now(timezone.utc) - _opened_dt).total_seconds() / 3600.0
+                        _cur_profit_pct = ((current_price - entry) / entry) * 100.0 if entry > 0 else 0.0
+                        if _age_hours >= STALE_TRADE_HOURS and _cur_profit_pct < STALE_MIN_PROFIT_PCT:
+                            logger.info(f"⌛ [{symbol}] خروج زمني: العمر {_age_hours:.1f}س بربح {_cur_profit_pct:.2f}% (< {STALE_MIN_PROFIT_PCT}%)")
+                            close_signal(signal_id, current_price, 'stale_time_exit')
+                            continue
+                except Exception as stale_err:
+                    logger.debug(f"[مدير الصفقات] فحص العمر تجاهل: {stale_err}")
 
                 if current_price <= sl:
                     reason = 'atr_trailing_stop' if USE_ATR_TRAILING_STOP and sl > float(signal.get('initial_stop_loss', sl)) else 'stop_loss'
@@ -6067,6 +6368,17 @@ def main_loop_enhanced():
                 time.sleep(300)
                 continue
 
+            # [V9.26.0] بوابة الحمايات الشاملة — نمط Freqtrade (StoplossGuard/MaxDrawdown):
+            # سلسلة وقفات أو تراكم خاسر يتجاوز الحد = تجميد الدخول مؤقتًا بدل الاستمرار
+            # في نفس الظروف الخاسرة (الدليل الحي: 16 وقفة خلال 13 ساعة بلا توقف)
+            if PROTECTIONS_ENABLED:
+                _gl_locked, _gl_reason = is_entry_protection_locked(None)
+                if _gl_locked:
+                    logger.warning(f"🛡️ [الحلقة الرئيسية] تجميد دخول شامل مفعّل ({_gl_reason}) — دورة مسح للمراقبة فقط")
+                    # المسح نفسه يستمر (يراقب ويحدّث اللوحة) لكن لا فتح صفقات:
+                    # بوابة الزوج أدناه سترفض كل الدخولات حتى انتهاء القفل
+                    pass
+
             # [تحسين V9.10] تحديث قائمة العملات الديناميكية عند موعدها (كل 30 دقيقة افتراضيًا)
             # يختار كل مرة العملات الأكثر حيوية: سيولة + تقلب + انفجارات سعرية
             refresh_universe_if_needed()
@@ -6082,6 +6394,17 @@ def main_loop_enhanced():
             # تطابقًا لبصمة ظروفها الرقمية (تكه 24س المجاني على الدائرة الواسعة 120)
             # بدل فحص كل عملة مع كل استراتيجية (2044 فحصًا بصفر اجتياز في السجل الحي).
             strategy_nominees_map = nominate_strategy_candidates()
+            # [V9.26.0] حمايات Freqtrade: الأزواج المقفلة (LowProfitPairs/Cooldown) تُستبعد
+            # من دوائر الفحص أصلًا — اللوحة تعرض الحقيقة والفحص لا يهدر شموعًا على مقفول
+            if PROTECTIONS_ENABLED and strategy_nominees_map:
+                try:
+                    for _sk in list(strategy_nominees_map.keys()):
+                        strategy_nominees_map[_sk] = [
+                            n for n in strategy_nominees_map[_sk]
+                            if not is_entry_protection_locked(n.get('symbol'))[0]
+                        ]
+                except Exception as prot_filter_err:
+                    logger.warning(f"⚠️ [حمايات] تعذر تصفية المرشحين: {prot_filter_err}")
             try:
                 if stream_hub is not None:
                     stream_hub.set_universe(scan_universe_union())
@@ -6142,6 +6465,13 @@ def main_loop_enhanced():
                     try:
                         with signal_cache_lock:
                             if symbol in open_signals_cache or len(open_signals_cache) >= MAX_OPEN_TRADES:
+                                continue
+                        # [V9.26.0] بوابة الحمايات لكل زوج (نمط Freqtrade PairLock) — قبل جلب
+                        # أي شموع: قفل شامل أو قفل زوج يمنع الدخول ويوفر جلب البيانات
+                        if PROTECTIONS_ENABLED:
+                            _pl_locked, _pl_reason = is_entry_protection_locked(symbol)
+                            if _pl_locked:
+                                logger.info(f"🛡️ [{symbol}] دخول ممنوع بحماية: {_pl_reason}")
                                 continue
                         # شموع الرمز — كاش الدورة (أبواب متعددة قد ترشح نفس الرمز: جلب واحد)
                         if symbol in df_cycle_cache:
