@@ -6282,7 +6282,7 @@ def api_pnl_history():
                 SELECT id, symbol, strategy_name, profit_percentage, closed_at,
                        original_quantity, entry_price, is_real_trade
                 FROM signals WHERE status = 'closed'
-                ORDER BY COALESCE(closed_at, id) ASC, id ASC;
+                ORDER BY id ASC;
             """)
             rows = cur.fetchall()
         series, cum = [], 0.0
