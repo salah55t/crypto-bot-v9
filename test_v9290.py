@@ -189,8 +189,11 @@ check("ربح 10% عند 9د < عتبة 15% → يبقى مفتوحًا", not cl
 # 7-د) التريلينغ دون الإزاحة: مسافة السقف 6% من القمة
 sig = {'id': 4, 'symbol': 'TESTUSDT', 'entry_price': 100.0, 'stop_loss': 94.0,
        'current_peak_price': 103.0, 'timestamp': _now - _dt.timedelta(minutes=30)}
+# 7-د) التريلينغ دون الإزاحة: مسافة السقف 6% من القمة — و[V9.33.0] سلّم قفل الأرباح
+# يرفع الناتج النهائي: الوقف = الأعلى بين تريلينغ المواصفة (قمة×0.94 = 96.82)
+# وأرضية السلم (قمة +3% → قفل +1.8% = 101.80) — حماية ما بعد القمة التي كان يفتقدها المحرك
 closed = vnz.ft_exit_engine_step(sig, 4, 'TESTUSDT', 102.9, FTS['FT_Bandtastic'])
-check("قمة 3% (< إزاحة 5.8%) → وقف = قمة×0.94 (مسافة السقف)", not closed and abs(sig['stop_loss'] - 103.0 * 0.94) < 1e-6)
+check("قمة 3% (< إزاحة 5.8%) → وقف = الأعلى بين قمة×0.94 وسلم القفل +1.8% (V9.33.0)", not closed and abs(sig['stop_loss'] - 101.8) < 1e-6)
 # 7-هـ) التريلينغ بعد الإزاحة: مسافة trailing_stop_positive = 1%
 sig = {'id': 5, 'symbol': 'TESTUSDT', 'entry_price': 100.0, 'stop_loss': 94.0,
        'current_peak_price': 107.0, 'timestamp': _now - _dt.timedelta(minutes=120)}

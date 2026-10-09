@@ -49,7 +49,7 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-APP_VERSION: str = 'V9.32.0'  # [V9.21.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
+APP_VERSION: str = 'V9.33.0'  # [V9.21.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
 logger = logging.getLogger(f'CryptoBot{APP_VERSION}')
 
 # زمن إقلاع العملية لحساب مدة التشغيل في لوحة التحكم
@@ -569,6 +569,37 @@ TIME_LIMIT_MIN_PROFIT_PCT: float = config('TIME_LIMIT_MIN_PROFIT_PCT', default=0
 # 0 يعطّل الآلية. الافتراضي 0.35% = رسوم 0.2% + هامش صافٍ 0.15%.
 FT_EXIT_MIN_PROFIT_PCT: float = config('FT_EXIT_MIN_PROFIT_PCT', default=0.35, cast=float)
 FT_EXIT_SKIP_MAX_MIN: float = config('FT_EXIT_SKIP_MAX_MIN', default=90.0, cast=float)
+
+# [V9.33.0] سلّم قفل الأرباح — اقتباس نمط custom_stoploss المتدرج من توثيق freqtrade
+# (strategy-callbacks/custom-stoploss: إعادة وقف أعلى كلما عبر الربح عتبة + stoploss_from_open)
+# المشكلة (تبليغ المستخدم 9 أكتوبر): صفقات FT الخمس (trailing=False الكانوني — لا تريلينغ أصلاً)
+# وصفقات العامة تحت بوابة ATR (+1.5%) تصعد للربح ثم تسقط وتضرب الوقف الأصلي بخسارة كاملة (-5/-6%).
+# الحل: كلما ارتفعت قمة الصفقة (ربحها الخام) عبر درجة، صار الوقف لا ينزل تحت دخول×(1+القفل).
+# رفع فقط (ratchet) — لا ينزّل وقفًا أرفع ولا يلمس تريلينغ ATR المثبت بالباك تيست (أرضية تحته).
+# [peak_pct، lock_pct] — قيم مُعايَرة على رسوم 0.2% وحجم صفقات ~4 USDT:
+#   قمة 0.75% → قفل 0.10% (تعادل تقريبا بدل -5% كاملة) | 1.25% → 0.45% (صافٍ موجب مضمون)
+#   2.0% → 1.0% | 3.0% → 1.8% | 4.5% → 3.0% — قابلة للضبط عبر PROFIT_LOCK_LADDER_JSON
+#   (تعطيل: "off" أو "[]" لا يعمل — استخدم off/disabled/0/none)
+_LADDER_DEFAULT_RAW = '[[0.75,0.10],[1.25,0.45],[2.0,1.0],[3.0,1.8],[4.5,3.0]]'
+
+def _parse_profit_lock_ladder(raw: str) -> List[Tuple[float, float]]:
+    try:
+        tiers = json.loads(raw)
+        out = []
+        for t in tiers:
+            tier_peak, tier_lock = float(t[0]), float(t[1])
+            if tier_peak > 0 and tier_lock >= 0:
+                out.append((tier_peak, tier_lock))
+        out.sort()
+        return out
+    except Exception:
+        return []
+
+_raw_ladder_env = str(config('PROFIT_LOCK_LADDER_JSON', default=_LADDER_DEFAULT_RAW, cast=str)).strip()
+if _raw_ladder_env.lower() in ('off', 'disabled', '0', 'none', ''):
+    PROFIT_LOCK_LADDER: List[Tuple[float, float]] = []
+else:
+    PROFIT_LOCK_LADDER = _parse_profit_lock_ladder(_raw_ladder_env) or _parse_profit_lock_ladder(_LADDER_DEFAULT_RAW)
 # الحاجز الزمني لكل استراتيجية بالدقائق (الاستراتيجيات الأصليات السبع — 0 يعطّل)
 # فلسفة: الاختراق يجب أن يعمل سريعًا (3-4س)، الاتجاهي يُعطى 5س، الارتدادي نطاق أوسع (6س)
 STRATEGY_TIME_LIMIT_DEFAULTS: Dict[str, int] = {
@@ -4466,6 +4497,23 @@ def _ft_exit_skip_expired(signal_id: int, symbol: str) -> bool:
         logger.debug(f"[FT خروج] {symbol}: إشارة خروج مؤجلة منذ {((now - first) / 60.0):.0f}د (ربح تحت الحد)")
         return False
 
+def profit_lock_ladder_stop(entry: float, peak_price: float) -> Optional[float]:
+    """[V9.33.0] أرضية الوقف من سلّم قفل الأرباح حسب قمة الصفقة (نمط custom_stoploss المتدرج
+    من freqtrade). يعيد سعر وقف مقترح (دخول×(1+قفل%)) أو None إذا القمة تحت أول درجة
+    أو السلم معطّل. الاستدعاء يقرر الرفع فعليًا (قفل تصاعدي: لا ينزّل وقفًا أرفع موجود)."""
+    if not PROFIT_LOCK_LADDER or entry <= 0 or peak_price <= 0:
+        return None
+    peak_pct = (peak_price / entry - 1.0) * 100.0
+    lock_pct: Optional[float] = None
+    for tier_peak, tier_lock in PROFIT_LOCK_LADDER:
+        if peak_pct >= tier_peak - 1e-9:  # epsilon حدود عشرية: 1.24999% = درجة 1.25
+            lock_pct = tier_lock
+        else:
+            break
+    if lock_pct is None:
+        return None
+    return entry * (1.0 + lock_pct / 100.0)
+
 def ft_exit_engine_step(signal: Dict[str, Any], signal_id: int, symbol: str,
                         current_price: float, spec: Dict[str, Any]) -> bool:
     """خطوة إدارة خروج freqtrade لصفقة FT واحدة. يعيد True إذا أُغلقت الصفقة.
@@ -4530,6 +4578,18 @@ def ft_exit_engine_step(signal: Dict[str, Any], signal_id: int, symbol: str,
                     signal['stop_loss'] = new_stop
                     stop_changed = True
                     logger.info(f"🛡️ [{symbol}] تريلينغ FT: وقف → {new_stop:.6f} (قمة {peak:.6f} بمسافة {dist*100:.2f}%)")
+
+    # 4.5) [V9.33.0] سلّم قفل الأرباح (اقتباس custom_stoploss المتدرج من freqtrade):
+    # كلما ارتفعت القمة نحو الهدف رُفع الوقف على درجات — رفع فقط ولا ينزّل وقفًا أرفع.
+    # يتكامل مع تريلينغ المواصفة أعلاه (الناتج النهائي = الأعلى بينهما عبر القفل التصاعدي)
+    # ومع بوابة تريلينغ ATR للصفقات العامة (السلم أرضية تحتها للمنطقة دون +1.5%).
+    _ladder_sl = profit_lock_ladder_stop(entry, peak)
+    if _ladder_sl is not None:
+        _cur_sl_after_trail = float(signal.get('stop_loss') or 0.0)
+        if _ladder_sl > _cur_sl_after_trail + 1e-12:
+            signal['stop_loss'] = _ladder_sl
+            stop_changed = True
+            logger.info(f"🔒 [{symbol}] سلم قفل الأرباح: قمة {peak_pct:.2f}% → وقف ≥ {_ladder_sl:.6f} (قفل +{(_ladder_sl/entry-1.0)*100:.2f}%)")
 
     # 5) حفظ القمة/الوقف المحدثة (كاش + DB — نفس نمط بقية الحلقة)
     peak_old = float(signal.get('current_peak_price') or entry)
@@ -6832,6 +6892,10 @@ def get_active_protections_snapshot() -> Dict[str, Any]:
             # [V9.32.0] حد أدنى لخروج إشارة FT (علاج الخروج المبكر)
             'ft_exit_guard': (f"إشارة خروج FT بربح خام 0–{FT_EXIT_MIN_PROFIT_PCT:.2f}% تُؤجّل حتى {FT_EXIT_SKIP_MAX_MIN:.0f}د (رسوم ذهاب/إياب ~0.2%، الخاسر يُغلق فورًا)"
                               if FT_EXIT_MIN_PROFIT_PCT > 0 else "معطّل"),
+            # [V9.33.0] سلّم قفل الأرباح (اقتباس freqtrade custom_stoploss المتدرج)
+            'profit_lock_ladder': ('سلّم قفل الأرباح: ' + ' | '.join(
+                f"قمة ≥ {p:.2f}% → وقف ≥ +{l:.2f}%" for p, l in PROFIT_LOCK_LADDER)
+                if PROFIT_LOCK_LADDER else 'معطّل'),
             # [V9.31.0] حاكم المخاطر (اقتباس Hummingbot): أقفال اليوم + الحاجز الزمني لكل استراتيجية
             'risk_governor': {
                 'profit_lock': f"ربح اليوم ≥ +{PROFIT_LOCK_USDT:.2f}$ → إيقاف فتح صفقات جديدة حتى يوم UTC جديد",
@@ -7104,6 +7168,15 @@ def trade_management_loop():
                                 new_trailing_stop_price = new_peak - (latest_atr * ATR_TS_MULTIPLIER)
                                 if new_trailing_stop_price > sl:
                                     signal['stop_loss'] = new_trailing_stop_price
+
+                    # [V9.33.0] سلّم قفل الأرباح — أرضية تحتها لا ينزل الوقف (اقتباس freqtrade
+                    # custom_stoploss المتدرج): يغطي المنطقة دون بوابة ATR (+1.5%) التي كانت
+                    # تترك صفقات قمتها 0.75-1.5% بلا أي حماية ثم تسقط للوقف الأصلي بخسارة.
+                    # رفع فقط — لا يلمس تريلينغ ATR أعلاه (الناتج = الأعلى بينهما)
+                    _ladder_sl = profit_lock_ladder_stop(entry, new_peak)
+                    if _ladder_sl is not None and _ladder_sl > float(signal.get('stop_loss') or 0.0):
+                        signal['stop_loss'] = _ladder_sl
+                        logger.info(f"🔒 [{symbol}] سلم قفل الأرباح: قمة {((new_peak/entry-1.0)*100):.2f}% → وقف ≥ {_ladder_sl:.6f}")
 
                     # [V9.30.0] كتابة مشروطة: لا إحياء لصفقة أُغلقت من خيط آخر
                     if not _cache_touch_open(symbol, signal_id, signal):
