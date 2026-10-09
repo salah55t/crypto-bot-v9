@@ -49,7 +49,7 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-APP_VERSION: str = 'V9.31.0'  # [V9.21.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
+APP_VERSION: str = 'V9.32.0'  # [V9.21.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
 logger = logging.getLogger(f'CryptoBot{APP_VERSION}')
 
 # زمن إقلاع العملية لحساب مدة التشغيل في لوحة التحكم
@@ -558,6 +558,17 @@ HWM_RETRACE_USDT: float = config('HWM_RETRACE_USDT', default=1.2, cast=float)
 STRAT_HWM_PEAK_FLOOR_USDT: float = config('STRAT_HWM_PEAK_FLOOR_USDT', default=0.4, cast=float)
 STRAT_HWM_RETRACE_USDT: float = config('STRAT_HWM_RETRACE_USDT', default=0.6, cast=float)
 TIME_LIMIT_MIN_PROFIT_PCT: float = config('TIME_LIMIT_MIN_PROFIT_PCT', default=0.2, cast=float)
+# [V9.32.0] حد أدنى لخروج إشارة FT — علاج الخروج المبكر (تحليل 9 أكتوبر: 11/16 إغلاق
+# عبر ft_exit_signal منها 6 بـ 0.00-0.37% خام = خسارة صافية بعد رسوم الذهاب والإياب ~0.2%).
+# الجذر: إشارة خروج Cluc/BinH (close > وسط بولنجر 20) مرساة متحركة تُعاد لكل شمعة وتتتبع
+# السعر لأسفل بعد الدخول — فتقفل الفائزين عند تماسك السعر بلا مرجع لسعر الدخول، وROI
+# الثابت (5%) لا يبلغه أحد فلا متنافس يحتفظ بالفائز.
+# القاعدة الحذرة: إشارة الخروج على صفقة ربحها الخام في نطاق [0، العتبة) تُؤجَّل فقط —
+# الخاسر (ربح < 0) يُغلق فورًا (قطع الخسارة)، الوقف/ROI/التريلينغ بلا مساس، وبعد سقف
+# التأجيل (من أول إعاقة) يُسمح بالإغلاق لتفادي احتجاز صفقة عالقة في نطاق 0-0.4%.
+# 0 يعطّل الآلية. الافتراضي 0.35% = رسوم 0.2% + هامش صافٍ 0.15%.
+FT_EXIT_MIN_PROFIT_PCT: float = config('FT_EXIT_MIN_PROFIT_PCT', default=0.35, cast=float)
+FT_EXIT_SKIP_MAX_MIN: float = config('FT_EXIT_SKIP_MAX_MIN', default=90.0, cast=float)
 # الحاجز الزمني لكل استراتيجية بالدقائق (الاستراتيجيات الأصليات السبع — 0 يعطّل)
 # فلسفة: الاختراق يجب أن يعمل سريعًا (3-4س)، الاتجاهي يُعطى 5س، الارتدادي نطاق أوسع (6س)
 STRATEGY_TIME_LIMIT_DEFAULTS: Dict[str, int] = {
@@ -4424,6 +4435,37 @@ def _ft_elapsed_minutes(signal: Dict[str, Any]) -> Optional[float]:
     except Exception:
         return None
 
+# [V9.32.0] سجل تأجيل إشارات الخروج المبكرة: signal_id → طابع أول إعاقة.
+# يدرك أول مرة وُقفت إشارة خروج لصفقة ربحها تحت الحد؛ عند انقضاء السقف يُسمح بالإغلاق.
+# يُنظَّف عند كل إغلاق فعلي (close_signal) وعند بلوغ القاموس حده الوقائي.
+_ft_exit_skip_since: Dict[int, float] = {}
+_ft_exit_skip_lock = Lock()
+
+def _ft_exit_skip_expired(signal_id: int, symbol: str) -> bool:
+    """[V9.32.0] بواب تأجيل خروج إشارة FT. يعيد True = اسمح بالإغلاق.
+    عند أول إعاقة يسجل الطابع ويعيد False؛ عند انقضاء FT_EXIT_SKIP_MAX_MIN
+    منذ أول إعاقة يعيد True (ويحذف السجل). معطّل كليًا إذا كانت العتبة/السقف ≤ 0."""
+    if FT_EXIT_MIN_PROFIT_PCT <= 0 or FT_EXIT_SKIP_MAX_MIN <= 0:
+        return True  # الآلية معطلة بالإعداد → اسمح بالإغلاق كالسابق
+    now = time.time()
+    with _ft_exit_skip_lock:
+        # تنظيف وقائي: لو تراكم السجل (تسريب نظري لمعرّفات أُغلقت بمسار بديل)
+        if len(_ft_exit_skip_since) > 256:
+            for k in [k for k, ts in _ft_exit_skip_since.items() if now - ts > 86400]:
+                _ft_exit_skip_since.pop(k, None)
+        first = _ft_exit_skip_since.get(signal_id)
+        if first is None:
+            _ft_exit_skip_since[signal_id] = now
+            logger.info(f"⏳ [{symbol}] تأجيل خروج FT: إشارة الخروج بربح خام تحت الحد "
+                        f"({FT_EXIT_MIN_PROFIT_PCT:.2f}%) — تُمنح حتى {FT_EXIT_SKIP_MAX_MIN:.0f}د لإثبات الحافة فوق الرسوم")
+            return False
+        if now - first >= FT_EXIT_SKIP_MAX_MIN * 60.0:
+            logger.info(f"⌛ [{symbol}] انقضى سقف تأجيل خروج FT ({FT_EXIT_SKIP_MAX_MIN:.0f}د) بلا حافة — يُسمح بالإغلاق بالإشارة")
+            _ft_exit_skip_since.pop(signal_id, None)
+            return True
+        logger.debug(f"[FT خروج] {symbol}: إشارة خروج مؤجلة منذ {((now - first) / 60.0):.0f}د (ربح تحت الحد)")
+        return False
+
 def ft_exit_engine_step(signal: Dict[str, Any], signal_id: int, symbol: str,
                         current_price: float, spec: Dict[str, Any]) -> bool:
     """خطوة إدارة خروج freqtrade لصفقة FT واحدة. يعيد True إذا أُغلقت الصفقة.
@@ -4454,15 +4496,21 @@ def ft_exit_engine_step(signal: Dict[str, Any], signal_id: int, symbol: str,
             return True
 
     # 3) إشارة الخروج الأصلية (populate_exit_trend على شمعة مغلقة — كاش 60ث)
+    #    [V9.32.0] حد أدنى للخروج: إشارة على صفقة ربحها الخام في [0، العتبة) تُؤجَّل —
+    #    مرساة بولنجر المتحركة كانت تقفل الفائزين تحت الرسوم. الخاسر (< 0) يُغلق فورًا،
+    #    وبعد سقف التأجيل يُسمح بالإغلاق. عند التأجيل يستمر التنفيذ للتريلينغ في نفس النبضة.
     exit_fn = spec.get('exit_fn')
     if exit_fn is not None:
         dfx = ft_exit_indicators(symbol)
         if dfx is not None:
             try:
                 if exit_fn(dfx):
-                    logger.info(f"📤 [{symbol}] خروج FT: إشارة الخروج الأصلية تحققت")
-                    close_signal(signal_id, current_price, 'ft_exit_signal')
-                    return True
+                    if 0.0 <= profit_pct < FT_EXIT_MIN_PROFIT_PCT and not _ft_exit_skip_expired(signal_id, symbol):
+                        pass  # تأجيل — لا إغلاق الآن، التريلينغ أسفله يُقيَّم كالمعتاد
+                    else:
+                        logger.info(f"📤 [{symbol}] خروج FT: إشارة الخروج الأصلية تحققت (ربح خام {profit_pct:.2f}%)")
+                        close_signal(signal_id, current_price, 'ft_exit_signal')
+                        return True
             except Exception as ex_sig_err:
                 logger.debug(f"[FT خروج] إشارة خروج {symbol} تخطأت: {ex_sig_err}")
 
@@ -4659,6 +4707,9 @@ def close_signal(signal_id: int, closing_price: float, reason: str) -> bool:
             # حذف نهائي من الكاش — تحت القفل لحظة واحدة
             with signal_cache_lock:
                 open_signals_cache.pop(symbol_to_close, None)
+                # [V9.32.0] تنظيف سجل تأجيل خروج FT مهما كان مسار الإغلاق (وقف/ROI/تريلينغ/زمني)
+                with _ft_exit_skip_lock:
+                    _ft_exit_skip_since.pop(signal_id, None)
                 # [V9.18.0] توثيق الإغلاق لتهدئة الرمز (لا توصية فورية بنفس الرمز)
                 _recent_close_ts[symbol_to_close] = time.time()
 
@@ -6778,6 +6829,9 @@ def get_active_protections_snapshot() -> Dict[str, Any]:
             'cooldown': f"{PROTECTION_COOLDOWN_MIN}د لكل زوج بعد أي إغلاق",
             'max_sl_distance_pct': MAX_SL_DISTANCE_PCT,
             'stale_exit': f"> {STALE_TRADE_HOURS}س بربح < {STALE_MIN_PROFIT_PCT}% → إغلاق",
+            # [V9.32.0] حد أدنى لخروج إشارة FT (علاج الخروج المبكر)
+            'ft_exit_guard': (f"إشارة خروج FT بربح خام 0–{FT_EXIT_MIN_PROFIT_PCT:.2f}% تُؤجّل حتى {FT_EXIT_SKIP_MAX_MIN:.0f}د (رسوم ذهاب/إياب ~0.2%، الخاسر يُغلق فورًا)"
+                              if FT_EXIT_MIN_PROFIT_PCT > 0 else "معطّل"),
             # [V9.31.0] حاكم المخاطر (اقتباس Hummingbot): أقفال اليوم + الحاجز الزمني لكل استراتيجية
             'risk_governor': {
                 'profit_lock': f"ربح اليوم ≥ +{PROFIT_LOCK_USDT:.2f}$ → إيقاف فتح صفقات جديدة حتى يوم UTC جديد",
