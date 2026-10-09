@@ -49,7 +49,7 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-APP_VERSION: str = 'V9.33.0'  # [V9.21.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
+APP_VERSION: str = 'V9.34.0'  # [V9.21.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
 logger = logging.getLogger(f'CryptoBot{APP_VERSION}')
 
 # زمن إقلاع العملية لحساب مدة التشغيل في لوحة التحكم
@@ -569,6 +569,56 @@ TIME_LIMIT_MIN_PROFIT_PCT: float = config('TIME_LIMIT_MIN_PROFIT_PCT', default=0
 # 0 يعطّل الآلية. الافتراضي 0.35% = رسوم 0.2% + هامش صافٍ 0.15%.
 FT_EXIT_MIN_PROFIT_PCT: float = config('FT_EXIT_MIN_PROFIT_PCT', default=0.35, cast=float)
 FT_EXIT_SKIP_MAX_MIN: float = config('FT_EXIT_SKIP_MAX_MIN', default=90.0, cast=float)
+
+# [V9.34.0] تقاعد الاستراتيجيات الضعيفة — تحليل OctoBot (Drakkar-Software) + طلب المستخدم:
+#   "قم بازالة الاستراتيجيات الضعيفة والعاطلة والتي لا تعطي نتائج وكذلك الفلاتر الغير ضرورية".
+# أ) الإزالة البنيوية المثبتة: BB_Stoch_Reversal ميتة بنيويًا — تناقض داخلي بين شرط دخولها
+#    (لمس BB السفلي بذيل ضاغط = السعر 2-4×ATR تحت EMA50 في الهبوط) وفلترها Connors
+#    (قبول ضمن 1×ATR من EMA50): 431 رفضًا ثم 155 ثم 156/156 فحصًا معطّلًا بلا نجاح واحد
+#    عبر حياتها المفلترة كلها، وشخصيتها (قاع-صيد الارتداد) تغطيها عائلة FT العكسية الخمس
+#    الأصلية بأداء حي أفضل (Bandtastic خلية PF 3.99، BinHCluc ربح فعلي). إزالتها توفّر
+#    156 فحصًا/دورة (~12% من ميزانية المسح) وبند فلترة وبند أدلة وبند واجهة بلا مقابل.
+# ب) التقاعد الآلي بالبيانات: أي استراتيجية أخرى تثبت ضعفها حيًا تُعلَّق تلقائيًا (انظر
+#    حاكم تقاعد الاستراتيجيات أدناه) — الإزالة بالبرهان لا بالتخمين (فلسفة بوابة الأدلة ذاتها).
+# ج) فلتر ارتداد القاع المحلي (اقتباس OctoBot DipAnalyser): min_has_just_been_reached من
+#    Evaluator/Util/trend_analysis.py (قبول 0.9-0.95 بتأخير 1-2) — السكين الذي ما زال
+#    يصنع قيعانًا جديدة يُرفض؛ الدخول فقط بعد تشكل القاع وبدء الارتداد.
+# القوائم قابلة للضبط عبر البيئة؛ "off" يعيد كل شيء لوضع ما قبل V9.34.
+STRATEGY_DISABLED_DEFAULT = ['BB_STOCH']
+
+def _parse_disabled_strategies(raw: str) -> List[str]:
+    try:
+        val = json.loads(raw)
+        if isinstance(val, list):
+            return [str(k).strip().upper() for k in val if str(k).strip()]
+        if isinstance(val, dict):
+            return [str(k).strip().upper() for k, v in val.items() if v]
+    except Exception:
+        pass
+    return []
+
+_raw_disabled_env = str(config('STRATEGY_DISABLED_JSON', default='', cast=str)).strip()
+if _raw_disabled_env.lower() in ('off', 'none', '-'):
+    DISABLED_STRATEGY_KEYS: List[str] = []
+else:
+    DISABLED_STRATEGY_KEYS = (_parse_disabled_strategies(_raw_disabled_env) if _raw_disabled_env
+                              else list(STRATEGY_DISABLED_DEFAULT))
+
+# حاكم تقاعد الاستراتيجيات: إحصاء حي من DB (صفقات مغلقة لكل strategy_name) وتعليق
+# الاستراتيجية من الفتح الجديد عند ثبات سوء الأداء — الصفقات المفتوحة تُدار طبيعيًا،
+# والإحصاء يعاد عند كل إغلاق + الإقلاع (يصمد في bot_state). القيم env-configurable.
+STRAT_RETIRE_ENABLED: bool = config('STRAT_RETIRE_ENABLED', default=True, cast=bool)
+STRAT_RETIRE_MIN_N: int = config('STRAT_RETIRE_MIN_N', default=12, cast=int)
+STRAT_RETIRE_MAX_PF: float = config('STRAT_RETIRE_MAX_PF', default=0.55, cast=float)
+STRAT_RETIRE_MIN_EXP_PCT: float = config('STRAT_RETIRE_MIN_EXP_PCT', default=-0.30, cast=float)
+_raw_retire_force = str(config('STRAT_RETIRE_FORCE_ACTIVE_JSON', default='', cast=str)).strip()
+try:
+    _retire_force_list = json.loads(_retire_force) if _retire_force else []
+    STRAT_RETIRE_FORCE_ACTIVE: List[str] = [str(x) for x in _retire_force_list] if isinstance(_retire_force_list, list) else []
+except Exception:
+    STRAT_RETIRE_FORCE_ACTIVE = []
+# فلتر ارتداد القاع المحلي لعائلة FT العكسية (اقتباس DipAnalyser — التفاصيل عند الفلتر)
+FT_REVERSAL_BOUNCE_FILTER: bool = config('FT_REVERSAL_BOUNCE_FILTER', default=True, cast=bool)
 
 # [V9.33.0] سلّم قفل الأرباح — اقتباس نمط custom_stoploss المتدرج من توثيق freqtrade
 # (strategy-callbacks/custom-stoploss: إعادة وقف أعلى كلما عبر الربح عتبة + stoploss_from_open)
@@ -2802,6 +2852,9 @@ def nominate_strategy_candidates(force: bool = False) -> Dict[str, List[Dict[str
             ranked: Dict[str, List[Dict[str, Any]]] = {}
             for sym, m in rows_snapshot.items():
                 for key in STRATEGY_SETUP_SCANNERS:
+                    # [V9.34.0] الاستراتيجيات المتقاعدة لا تُبنى لها دائرة ترشيح
+                    if key in DISABLED_STRATEGY_KEYS:
+                        continue
                     sc, why = _nominee_score_for(key, m)
                     ranked.setdefault(key, []).append({
                         'symbol': sym, 'score': sc, 'why_ar': why,
@@ -3340,6 +3393,25 @@ def passes_strategy_prefilters(df: pd.DataFrame, strategy_name: str) -> bool:
         if float(last['close']) < floor_price:
             return _fail(f"السعر أبعد من EMA50 بأكثر من {tol_atr:g}×ATR (Connors المرن)",
                          {'close': f"{float(last['close']):.6g}", 'ema_50': f"{float(last['ema_50']):.6g}", 'floor': f"{floor_price:.6g}"})
+
+    # 5) [V9.34.0] تأكيد ارتداد القاع المحلي — اقتباس OctoBot DipAnalyser
+    #    (Evaluator/Util/trend_analysis.py::min_has_just_been_reached بنافذة 0.9-0.95
+    #    وتأخير 1-2 كما يستخدمه KlingerReversalConfirmation + RSIWeight في dip_analyser_strategy.py).
+    #    الفكرة: عائلة قاع-صيد الارتداد (FT_REVERSAL) تشتري الغرق — لكن الغرق الذي ما زال
+    #    يصنع قيعانًا جديدة (سكين ساقط نشط) يُغرق الحساب برسومه أيضًا. الدخول الصحيح بعد
+    #    أن يتشكل القاع ويبدأ الارتداد: قاع آخر 7 شموع وقع في آخر شمعتين، والإغلاق الحالي
+    #    رفع نفسه عنه (ارتداد بدأ). المعايرة الحذرة: 7 شموع فقط (لا نطاق بعيد)، وتأخير ≤2،
+    #    والرفض يُحاسب في إحصاءات الفلاتر. معطّل بـ FT_REVERSAL_BOUNCE_FILTER=false.
+    if strategy_name and strategy_name.upper() in FT_REVERSAL_DISPLAY_NAMES and FT_REVERSAL_BOUNCE_FILTER and len(df) >= 8:
+        lows_recent = df['low'].astype(float).iloc[-7:]
+        if lows_recent.notna().all():
+            min_idx = int(lows_recent.values.argmin())          # 0 = أقدم، 6 = الأخيرة
+            bars_since = 6 - min_idx                             # كم شمعة منذ القاع
+            local_min = float(lows_recent.iloc[min_idx])
+            close_now = float(last['close']) if pd.notna(last['close']) else 0.0
+            if bars_since > 2 or close_now <= local_min:
+                return _fail("القاع لم يتأكد بعد (سكين يهبط — اقتباس DipAnalyser)",
+                             {'bars_since_min': bars_since, 'local_min': f"{local_min:.6g}", 'close': f"{close_now:.6g}"})
 
     return True
 
@@ -4162,6 +4234,12 @@ FREQTRADE_STRATEGIES: Dict[str, Dict[str, Any]] = {
 # تهيئة مفاتيح التفعيل (كلها مفعلة افتراضيًا — تُقرأ تحت ft_strategies_lock)
 for _ft_name in FREQTRADE_STRATEGIES:
     FT_STRATEGY_ENABLED.setdefault(_ft_name, True)
+
+# [V9.34.0] أسماء عرض عائلة FT العكسية (بالإملاء الكانوني) — الفلاتر تُستدعى باسم العرض
+# (FT_BbandRsi) بينما مفاتيح الفحص في FT_REVERSAL_KEYS بصيغة uppercase (FT_BBANDRSI،
+# ومفتاح BinHCluc مختلف حرفيًا عن اسم العرض FT_CombinedBinHAndCluc) — الفلتر يطابق الاثنين.
+FT_REVERSAL_DISPLAY_NAMES: frozenset = frozenset(
+    _nm.upper() for _nm, _spec in FREQTRADE_STRATEGIES.items() if _spec.get('key') in FT_REVERSAL_KEYS)
 
 
 class EnhancedTradingStrategy:
@@ -5190,6 +5268,7 @@ def get_dashboard_html():
         <div class="mb-4 border-b border-border-color"><nav class="flex space-x-6 space-x-reverse -mb-px">
             <button onclick="showTab('signals', this)" class="tab-btn active text-white py-3 px-1 font-semibold">الصفقات</button>
             <button onclick="showTab('stats', this)" class="tab-btn text-text-secondary hover:text-white py-3 px-1">الإحصائيات</button>
+            <button onclick="showTab('pnlperf', this)" class="tab-btn text-text-secondary hover:text-white py-3 px-1">أداء الاستراتيجيات</button>
             <button onclick="showTab('settings', this)" class="tab-btn text-text-secondary hover:text-white py-3 px-1">الإعدادات</button>
             <button onclick="showTab('notifications', this)" class="tab-btn text-text-secondary hover:text-white py-3 px-1">الإشعارات</button>
             <button onclick="showTab('rejections', this)" class="tab-btn text-text-secondary hover:text-white py-3 px-1">الصفقات المرفوضة</button>
@@ -5197,6 +5276,22 @@ def get_dashboard_html():
         <main>
             <div id="signals-tab" class="tab-content"><div class="overflow-x-auto card p-0"><table class="min-w-full text-sm text-right"><thead class="border-b border-border-color bg-black/20"><tr><th class="p-4 font-semibold">العملة</th><th class="p-4 font-semibold">الربح/الخسارة</th><th class="p-4 font-semibold">الدخول/الحالي/الهدف</th><th class="p-4 font-semibold">تحديث الهدف</th><th class="p-4 font-semibold">إجراء</th></tr></thead><tbody id="signals-table"></tbody></table></div></div>
             <div id="stats-tab" class="tab-content hidden"><div id="stats-container" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4"></div></div>
+            <div id="pnlperf-tab" class="tab-content hidden">
+                <div id="pnl-chart-card" class="card p-4 mb-4">
+                    <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
+                        <h4 class="text-sm font-bold text-neon">📈 منحنى الأرباح التراكمية (USDT صافي بعد الرسوم)</h4>
+                        <div id="pnl-chart-meta" class="font-mono text-xs text-text-secondary">—</div>
+                    </div>
+                    <div id="pnl-chart" class="w-full"></div>
+                </div>
+                <div id="strategy-pnl-card" class="card p-4">
+                    <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
+                        <h4 class="text-sm font-bold text-neon">🧭 أداء الاستراتيجيات (حكم ملون بالبيانات الحية)</h4>
+                        <div id="strategy-pnl-meta" class="font-mono text-xs text-text-secondary">—</div>
+                    </div>
+                    <div id="strategy-pnl-table"></div>
+                </div>
+            </div>
             <div id="settings-tab" class="tab-content hidden">
                 <div class="card p-6">
                     <h4 class="text-lg font-bold mb-4 text-text-secondary">الإعدادات العامة</h4>
@@ -5223,9 +5318,9 @@ def get_dashboard_html():
                     
                     <h4 class="text-lg font-bold mb-4 text-text-secondary">الاستراتيجيات المفعّلة</h4>
                     <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6 mt-6">
-                        <div class="flex items-center justify-between p-3 bg-black/20 rounded-lg strategy-toggle">
+                        <div class="flex items-center justify-between p-3 bg-black/20 rounded-lg opacity-50" title="متقاعدة في V9.34.0: 100% رفض فلتر عبر حياتها كلها (ميتة بنيويًا) وشخصيتها تغطيها عائلة FT العكسية الأفضل أداءً">
                             <span class="font-semibold">BB+Stoch (Enhanced)</span>
-                            <label class="flex items-center cursor-pointer"><div class="relative"><input type="checkbox" id="bb-stoch-strategy-toggle" class="sr-only"><div class="toggle-bg block bg-gray-600 w-12 h-7 rounded-full"></div></div></label>
+                            <span class="text-xs font-mono text-accent-yellow">⚱️ متقاعدة</span>
                         </div>
                         <div class="flex items-center justify-between p-3 bg-black/20 rounded-lg strategy-toggle">
                             <span class="font-semibold">MACD+EMA</span>
@@ -5398,7 +5493,7 @@ function updateMarketStatus() {
             document.getElementById('ob-ratio').value = data.settings.ob_ratio;
             document.getElementById('vol-multiplier').value = data.settings.vol_multiplier;
             document.getElementById('min-profit').value = data.settings.min_profit;
-            document.getElementById('bb-stoch-strategy-toggle').checked = data.settings.use_bb_stoch_strategy;
+            // [V9.34.0] BB+Stoch متقاعدة — عناصرها حُذفت من الإعدادات
             document.getElementById('macd-ema-strategy-toggle').checked = data.settings.use_macd_ema_strategy;
             document.getElementById('ema-rsi-strategy-toggle').checked = data.settings.use_ema_rsi_strategy;
             document.getElementById('pullback-strategy-toggle').checked = data.settings.use_pullback_strategy;
@@ -5483,13 +5578,129 @@ function updateStats() {
             container.innerHTML = `<div class="card p-4 text-center col-span-full text-accent-red">${data.error}</div>`;
             return;
         }
-        container.innerHTML = `<div class="card p-4 text-center"><h4 class="text-text-secondary">صافي الربح</h4><div class="text-2xl font-bold ${data.net_profit_usdt >= 0 ? 'text-accent-green' : 'text-accent-red'}">${parseFloat(data.net_profit_usdt).toFixed(2)}</div></div><div class="card p-4 text-center"><h4 class="text-text-secondary">معدل الربح</h4><div class="text-2xl font-bold">${parseFloat(data.win_rate).toFixed(2)}%</div></div><div class="card p-4 text-center"><h4 class="text-text-secondary">عامل الربح</h4><div class="text-2xl font-bold">${data.profit_factor === 'Infinity' ? '∞' : parseFloat(data.profit_factor).toFixed(2)}</div></div><div class="card p-4 text-center"><h4 class="text-text-secondary">الصفقات المغلقة</h4><div class="text-2xl font-bold">${data.total_closed_trades}</div></div>`;
+        // [V9.34.0] بطاقة البطل بنمط OctoBot (index.html profitability card): القيمة + الشرارة داخل البطاقة
+        const sparkId = 'net-spark';
+        container.innerHTML = `<div class="card p-4 text-center"><h4 class="text-text-secondary">صافي الربح</h4><div class="text-2xl font-bold ${data.net_profit_usdt >= 0 ? 'text-accent-green' : 'text-accent-red'}">${parseFloat(data.net_profit_usdt).toFixed(2)}</div><div id="${sparkId}" class="mt-1"></div></div><div class="card p-4 text-center"><h4 class="text-text-secondary">معدل الربح</h4><div class="text-2xl font-bold">${parseFloat(data.win_rate).toFixed(2)}%</div></div><div class="card p-4 text-center"><h4 class="text-text-secondary">عامل الربح</h4><div class="text-2xl font-bold">${data.profit_factor === 'Infinity' ? '∞' : parseFloat(data.profit_factor).toFixed(2)}</div></div><div class="card p-4 text-center"><h4 class="text-text-secondary">الصفقات المغلقة</h4><div class="text-2xl font-bold">${data.total_closed_trades}</div></div>`;
+        // الشرارة: منحنى مصغر للتراكمي (SVG بلا اعتماديات — نمط OctoBot equity-in-card)
+        fetchData('/api/pnl_history').then(h => {
+            if (!h || !h.trades || !h.trades.length) return;
+            const el = document.getElementById(sparkId);
+            if (!el) return;
+            const cums = h.trades.map(t => t.cum_usdt);
+            const W = 140, H = 34, lo = Math.min(0, ...cums), hi = Math.max(0, ...cums);
+            const rng = (hi - lo) || 1;
+            const pts = cums.map((v, i) => `${(i / Math.max(1, cums.length - 1) * W).toFixed(1)},${(H - 3 - (v - lo) / rng * (H - 6)).toFixed(1)}`).join(' ');
+            const col = cums[cums.length - 1] >= 0 ? '#00ff41' : '#ff2b4e';
+            el.innerHTML = `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:34px"><polyline points="${pts}" fill="none" stroke="${col}" stroke-width="1.6" opacity=".9"/></svg>`;
+        });
     });
 }
 function updateNotifications() {
     fetchData('/api/notifications').then(data => {
         if (!data) return;
-        document.getElementById('notifications-list').innerHTML = data.map(n => `<div class="p-2 border-b border-border-color"><span class="font-mono text-xs text-text-secondary">${new Date(n.timestamp).toLocaleString('ar-EG')}</span>: ${n.message}</div>`).join('');
+        // [V9.34.0] إشعارات ملوّنة بمستواها (اقتباس OctoBot level-tinted rows):
+        // الإغلاق الرابح أخضر والخاسر أحمر والحمايات كهرمانية — بقراءة نسبة الربح من نص الرسالة
+        document.getElementById('notifications-list').innerHTML = data.map(n => {
+            let border = 'border-border-color';
+            const msg = n.message || '';
+            if (n.type === 'TRADE_CLOSED') {
+                const m = msg.match(/الربح\\/الخسارة: (-?[\\d.]+)%/);
+                const pct = m ? parseFloat(m[1]) : null;
+                border = (pct === null) ? 'border-border-color' : (pct > 0 ? 'border-accent-green' : (pct < 0 ? 'border-accent-red' : 'border-accent-yellow'));
+            } else if (n.type === 'PROTECTION_LOCK' || n.type === 'STRATEGY_RETIREMENT' || n.type === 'RISK_GOVERNOR' || n.type === 'DAILY_LOSS_LIMIT') {
+                border = 'border-accent-yellow';
+            } else if (n.type === 'NEW_SIGNAL') {
+                border = 'border-blue-600';
+            }
+            return `<div class="p-2 border-r-2 ${border}"><span class="font-mono text-xs text-text-secondary">${new Date(n.timestamp).toLocaleString('ar-EG')}</span>: ${msg}</div>`;
+        }).join('');
+    });
+}
+// ================= [V9.34.0] لوحة الأداء — اقتباسات OctoBot =================
+// 1) منحنى الأرباح التراكمية: خط تراكمي + أعمدة خضراء/حمراء لكل صفقة (نمط pnl_history
+//    في custom_elements.js — ألوان rgba(0,142,0,.8)/rgba(198,40,40,.5)) — SVG خالص بلا CDN
+// 2) جدول أداء الاستراتيجيات بلون حكم لكل صف (نمط pair_status_card: teal/red/neutral)
+function renderPnlChart(trades) {
+    const box = document.getElementById('pnl-chart');
+    if (!box) return;
+    if (!trades || !trades.length) {
+        box.innerHTML = '<div class="text-xs text-text-secondary py-6 text-center">لا صفقات مغلقة بعد — المنحنى يُبنى من أول إغلاق</div>';
+        return;
+    }
+    const W = 900, H = 260, PAD_L = 46, PAD_R = 10, PAD_T = 14, PAD_B = 26;
+    const cums = trades.map(t => t.cum_usdt);
+    let lo = Math.min(0, ...cums), hi = Math.max(0, ...cums);
+    if (hi - lo < 0.5) { hi += 0.25; lo -= 0.25; }
+    const rng = hi - lo;
+    const x = i => PAD_L + (i / Math.max(1, trades.length - 1)) * (W - PAD_L - PAD_R);
+    const y = v => PAD_T + (1 - (v - lo) / rng) * (H - PAD_T - PAD_B);
+    // أعمدة الصفقات (الربح أخضر/الخسارة أحمر — محور الأعمدة: صفر)
+    const barW = Math.max(1.5, (W - PAD_L - PAD_R) / trades.length * 0.6);
+    const bars = trades.map((t, i) => {
+        const cx = x(i), v = t.net_usdt;
+        const y0 = y(0), y1 = y(v);
+        const top = Math.min(y0, y1), h = Math.max(1, Math.abs(y0 - y1));
+        const col = v > 0 ? 'rgba(0,255,65,.65)' : v < 0 ? 'rgba(255,43,78,.55)' : 'rgba(90,144,110,.4)';
+        const tip = `#${t.i} ${t.symbol} · ${t.strategy}\\n${t.pct_net >= 0 ? '+' : ''}${t.pct_net}% صافي = ${t.net_usdt >= 0 ? '+' : ''}${t.net_usdt}$ · تراكمي ${t.cum_usdt}$`;
+        return `<rect x="${(cx - barW / 2).toFixed(1)}" y="${top.toFixed(1)}" width="${barW.toFixed(1)}" height="${h.toFixed(1)}" fill="${col}"><title>${tip}</title></rect>`;
+    }).join('');
+    // الخط التراكمي + آخر نقطة
+    const path = trades.map((t, i) => `${i === 0 ? 'M' : 'L'}${x(i).toFixed(1)},${y(t.cum_usdt).toFixed(1)}`).join(' ');
+    const last = trades[trades.length - 1];
+    const lastCol = last.cum_usdt >= 0 ? '#00ff41' : '#ff2b4e';
+    // خط الصفر + شبكة علوي/سفلي
+    const grid = [hi, (hi + lo) / 2, lo].map(v =>
+        `<line x1="${PAD_L}" y1="${y(v).toFixed(1)}" x2="${W - PAD_R}" y2="${y(v).toFixed(1)}" stroke="#114d23" stroke-dasharray="3,4" stroke-width="1"/><text x="${PAD_L - 4}" y="${(y(v) + 3).toFixed(1)}" fill="#5d8f6d" font-size="10" font-family="Share Tech Mono" text-anchor="end">${v.toFixed(2)}</text>`).join('');
+    const zero = `<line x1="${PAD_L}" y1="${y(0).toFixed(1)}" x2="${W - PAD_R}" y2="${y(0).toFixed(1)}" stroke="#5d8f6d" stroke-width="1"/>`;
+    box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" class="w-full" preserveAspectRatio="none" style="height:260px">
+        ${grid}${zero}${bars}
+        <path d="${path}" fill="none" stroke="${lastCol}" stroke-width="2.2" opacity=".95"/>
+        <circle cx="${x(trades.length - 1).toFixed(1)}" cy="${y(last.cum_usdt).toFixed(1)}" r="4" fill="${lastCol}"/>
+        <text x="${(W - PAD_R)}" y="${(y(last.cum_usdt) - 8).toFixed(1)}" fill="${lastCol}" font-size="12" font-family="Share Tech Mono" text-anchor="end">${last.cum_usdt >= 0 ? '+' : ''}${last.cum_usdt.toFixed(2)}$</text>
+    </svg>`;
+}
+function updatePnlChart() {
+    fetchData('/api/pnl_history').then(data => {
+        if (!data || data.error) return;
+        renderPnlChart(data.trades || []);
+        const meta = document.getElementById('pnl-chart-meta');
+        if (meta) {
+            const cum = data.cum_final || 0;
+            meta.innerHTML = `<span class="${cum >= 0 ? 'text-accent-green' : 'text-accent-red'}">${cum >= 0 ? '+' : ''}${parseFloat(cum).toFixed(2)}$</span> عبر <span class="text-white">${data.count || 0}</span> صفقة مغلقة`;
+        }
+    });
+}
+function updateStrategyPnl() {
+    fetchData('/api/strategy_pnl').then(data => {
+        if (!data || data.error) return;
+        const box = document.getElementById('strategy-pnl-table');
+        if (!box) return;
+        const badge = {
+            active: '<span class="text-xs font-mono text-accent-green">نشطة</span>',
+            suspended: '<span class="text-xs font-mono text-accent-yellow" title="علّقها حاكم التقاعد بالبيانات الحية">⚱️ معلّقة تقاعدًا</span>',
+            retired: '<span class="text-xs font-mono text-gray-500" title="أزيلت بنيويًا (ميتة بنيويًا بلا نجاح واحد)"> متقاعدة</span>',
+        };
+        const rows = (data.strategies || []).map(s => {
+            const net = typeof s.net_usdt === 'number' ? s.net_usdt : parseFloat(s.net_usdt || 0);
+            const netCol = net > 0 ? 'text-accent-green' : net < 0 ? 'text-accent-red' : 'text-text-secondary';
+            const pfCol = s.pf != null ? (s.pf >= 1.15 ? 'text-accent-green' : s.pf >= 0.85 ? 'text-accent-yellow' : 'text-accent-red') : 'text-text-secondary';
+            const pfTxt = (s.pf == null) ? '—' : (s.pf >= 99 ? '∞' : parseFloat(s.pf).toFixed(2));
+            return `<tr class="border-b border-border-color/50 ${s.status === 'retired' ? 'opacity-50' : ''}">
+                <td class="py-2 font-mono text-xs">${s.strategy}</td>
+                <td class="py-2 text-center font-mono ${netCol}">${net >= 0 ? '+' : ''}${net.toFixed(2)}$</td>
+                <td class="py-2 text-center font-mono">${s.n}</td>
+                <td class="py-2 text-center font-mono ${pfCol}">${pfTxt}</td>
+                <td class="py-2 text-center font-mono">${s.wr != null ? parseFloat(s.wr).toFixed(0) + '%' : '—'}</td>
+                <td class="py-2 text-center font-mono ${s.exp_pct >= 0 ? 'text-accent-green' : 'text-accent-red'}">${s.exp_pct != null ? ((s.exp_pct >= 0 ? '+' : '') + parseFloat(s.exp_pct).toFixed(2) + '%') : '—'}</td>
+                <td class="py-2 text-center">${badge[s.status] || badge.active}</td>
+            </tr>`;
+        }).join('');
+        box.innerHTML = `<div class="overflow-x-auto"><table class="min-w-full text-xs text-right"><thead class="border-b border-border-color text-text-secondary">
+            <tr><th class="py-2">الاستراتيجية</th><th class="py-2 text-center">صافي USDT</th><th class="py-2 text-center">صفقات</th><th class="py-2 text-center" title="معامل الربح بعد الرسوم">PF</th><th class="py-2 text-center">فوز</th><th class="py-2 text-center" title="متوسط الصافي لكل صفقة">توقع/صفقة</th><th class="py-2 text-center">الحالة</th></tr>
+        </thead><tbody>${rows || '<tr><td colspan="7" class="py-4 text-center text-text-secondary">لا إحصاءات بعد</td></tr>'}</tbody></table></div>
+        <div class="text-xs text-text-secondary mt-2">محاسبة /api/stats نفسها: الصافي بعد رسوم الذهاب والإياب (${(2 * 0.1).toFixed(1)}%). التقاعد الآلي: n ≥ ${data.retirement?.min_n ?? 12} و (PF < ${data.retirement?.max_pf ?? 0.55} أو توقع < ${data.retirement?.min_exp_pct ?? -0.3}%) → تعليق من الفتح الجديد بإعلان تلغرام. متقاعدة = إزالة بنيوية موثقة في السجل.${data.retirement?.force_active?.length ? ' مستثنى من التقاعد: ' + data.retirement.force_active.join(', ') : ''}</div>`;
+        const meta = document.getElementById('strategy-pnl-meta');
+        if (meta) meta.textContent = `${(data.strategies || []).length} استراتيجية · منذ آخر إقلاع محفوظ بالأدلة`;
     });
 }
 function updateStrategyPairs() {
@@ -5682,7 +5893,8 @@ function saveSettings() {
         ob_ratio: parseFloat(document.getElementById('ob-ratio').value),
         vol_multiplier: parseFloat(document.getElementById('vol-multiplier').value),
         min_profit: parseFloat(document.getElementById('min-profit').value),
-        use_bb_stoch_strategy: document.getElementById('bb-stoch-strategy-toggle').checked,
+        // [V9.34.0] BB+Stoch متقاعدة — تُرسل قيمتها المخزنة كما هي بلا عنصر واجهة
+        use_bb_stoch_strategy: true,
         use_macd_ema_strategy: document.getElementById('macd-ema-strategy-toggle').checked,
         use_ema_rsi_strategy: document.getElementById('ema-rsi-strategy-toggle').checked,
         use_pullback_strategy: document.getElementById('pullback-strategy-toggle').checked,
@@ -5788,7 +6000,7 @@ function updateStrategyCandidates() {
 }
 
 document.addEventListener('DOMContentLoaded', () => {
-    ['MarketStatus', 'Signals', 'Stats', 'Notifications', 'Rejections', 'SystemStatus', 'BtcTrend', 'LeaderMap', 'SmartPicks', 'StrategyCandidates'].forEach(f => window[`update${f}`]());
+    ['MarketStatus', 'Signals', 'Stats', 'Notifications', 'Rejections', 'SystemStatus', 'BtcTrend', 'LeaderMap', 'SmartPicks', 'StrategyCandidates', 'PnlChart', 'StrategyPnl'].forEach(f => window[`update${f}`]());
     updateDataFeed();  // [V9.20.0] شارة مصدر البيانات
     // [تحسين V9.11.0] إيقاف الاستطلاع عند إخفاء التبويب — يمنع تراكم الطلبات
     // من التبويبات الخلفية ويخفف الضغط على خيوط الخادم (waitress queue)
@@ -5800,6 +6012,8 @@ document.addEventListener('DOMContentLoaded', () => {
     whenVisible(updateDataFeed, 60000);  // [V9.20.0] شارة مصدر البيانات كل دقيقة
     whenVisible(updateSmartPicks, 120000); // [V9.23.0] الترشيح الذكي — الأدلة تتجدد كل 4 ساعات
     whenVisible(updateStrategyCandidates, 60000); // [V9.25.0] دائرة الفحص الموسعة — الترشيح يتجدد مع كل تحديث للقائمة (كل 30د)
+    whenVisible(updatePnlChart, 60000);   // [V9.34.0] منحنى الأرباح — الإغلاقات بطيئة التغير
+    whenVisible(updateStrategyPnl, 60000); // [V9.34.0] جدول أداء الاستراتيجيات
 
 // [V9.26.0] الحمايات — نمط Freqtrade: أقفال شفافة + إحصاءات (البطاقة تُحدّث كل 30ث)
 function updateProtections() {
@@ -6020,6 +6234,83 @@ def get_stats():
         logger.error(f"❌ [API إحصائيات] خطأ: {e}", exc_info=True)
         return jsonify({"error": "Internal server error fetching stats"}), 500
 
+@app.route('/api/strategy_pnl')
+def api_strategy_pnl():
+    """[V9.34.0] أداء كل استراتيجية من الصفقات المغلقة (اقتباس فكرة OctoBot:
+    بطاقة أداء الاستراتيجيات بلون حكم لكل صف) — نفس محاسبة /api/stats:
+    الصافي = (النسبة − 2×رسوم) × حجم الصفقة. الحالة: نشطة/معلّقة تقاعدًا/متقاعدة."""
+    if not check_db_connection() or not conn:
+        return jsonify({"error": "DB connection failed"}), 500
+    try:
+        stats = _strategy_retire_db_stats()
+        retire = strategy_retirement_snapshot()
+        retired_keys = {('BB_Stoch_Reversal_Enhanced' if k == 'BB_STOCH' else k) for k in DISABLED_STRATEGY_KEYS}
+        rows = []
+        for name, s in stats.items():
+            if name in retired_keys:
+                status = 'retired'
+            elif retire.get('strategies', {}).get(name, {}).get('suspended'):
+                status = 'suspended'
+            else:
+                status = 'active'
+            rows.append({
+                'strategy': name, 'n': int(s.get('n', 0)), 'pf': s.get('pf'),
+                'wr': s.get('wr'), 'exp_pct': s.get('exp_pct'), 'net_usdt': s.get('net_usdt'),
+                'last_closed_at': str(s.get('last') or ''), 'status': status,
+            })
+        rows.sort(key=lambda r: (r['net_usdt'] if isinstance(r['net_usdt'], (int, float)) else 0), reverse=True)
+        return jsonify({
+            'strategies': rows,
+            'retirement': {'enabled': retire.get('enabled'), 'min_n': retire.get('min_n'),
+                           'max_pf': retire.get('max_pf'), 'min_exp_pct': retire.get('min_exp_pct'),
+                           'force_active': retire.get('force_active', [])},
+            'disabled_keys': list(DISABLED_STRATEGY_KEYS),
+        })
+    except Exception as e:
+        logger.error(f"❌ [API أداء الاستراتيجيات] خطأ: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/pnl_history')
+def api_pnl_history():
+    """[V9.34.0] سلسلة الصفقات المغلقة لرسم منحنى الأرباح التراكمية (اقتباس OctoBot
+    pnl_history: خط تراكمي + أعمدة خضراء/حمراء لكل صفقة على محور ثانوي)."""
+    if not check_db_connection() or not conn:
+        return jsonify({"error": "DB connection failed"}), 500
+    try:
+        with db_conn_lock, conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, symbol, strategy_name, profit_percentage, closed_at,
+                       original_quantity, entry_price, is_real_trade
+                FROM signals WHERE status = 'closed'
+                ORDER BY COALESCE(closed_at, id) ASC, id ASC;
+            """)
+            rows = cur.fetchall()
+        series, cum = [], 0.0
+        for r in rows:
+            try:
+                pct = float(r.get('profit_percentage') or 0.0)
+            except Exception:
+                continue
+            qty = float(r.get('original_quantity') or 0.0)
+            entry = float(r.get('entry_price') or 0.0)
+            try:
+                notional = (qty * entry) if (r.get('is_real_trade') and qty > 0 and entry > 0) else STATS_TRADE_SIZE_USDT
+            except Exception:
+                notional = STATS_TRADE_SIZE_USDT
+            net_pct = pct - (2 * TRADING_FEE_PERCENT)
+            net_usdt = round(net_pct / 100.0 * notional, 4)
+            cum = round(cum + net_usdt, 4)
+            series.append({
+                'i': len(series) + 1, 'symbol': r.get('symbol'),
+                'strategy': r.get('strategy_name'), 'pct_raw': round(pct, 3),
+                'pct_net': round(net_pct, 3), 'net_usdt': net_usdt, 'cum_usdt': cum,
+                'closed_at': str(r.get('closed_at') or ''),
+            })
+        return jsonify({'trades': series, 'cum_final': cum, 'count': len(series)})
+    except Exception as e:
+        logger.error(f"❌ [API تاريخ الأرباح] خطأ: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/api/signals')
 def get_signals():
     if not (check_db_connection() and redis_client):
@@ -6138,6 +6429,8 @@ def api_strategy_candidates():
         with market_state_lock:
             mkt = str(current_market_state.get('overall_regime', 'UNCERTAIN'))
         allowed = MARKET_STATE_STRATEGY_ALLOW.get(mkt)
+        # [V9.34.0] الاستراتيجيات المتقاعدة لا تُعرض في الترشيح/اللوحة
+        cand = {k: v for k, v in cand.items() if k not in DISABLED_STRATEGY_KEYS}
         display_names = {}
         try:
             with macd_ema_strategy_lock:
@@ -6412,6 +6705,12 @@ def register_realized_pnl(signal: Dict, entry_price: float, closing_price: float
             risk_gov_register_close(str(signal.get('strategy_name') or 'unknown'), pnl_usdt)
         except Exception as rg_err:
             logger.debug(f"[حاكم المخاطر] تعذر تسجيل الإغلاق: {rg_err}")
+        # [V9.34.0] حاكم التقاعد: إعادة إحصاء أداء الاستراتيجيات بالبيانات الحية —
+        # الاستراتيجية التي تثبت ضعفها (n≥12 و PF<0.55 أو EXP<-0.30%) تُعلَّق من الفتح الجديد
+        try:
+            strategy_retirement_refresh('close')
+        except Exception as sr_err:
+            logger.debug(f"[تقاعد الاستراتيجيات] تعذر إعادة الإحصاء: {sr_err}")
     except Exception as e:
         logger.error(f"❌ [قاطع الحماية] خطأ في تسجيل الأرباح المحققة: {e}")
 
@@ -6712,6 +7011,180 @@ def risk_governor_snapshot() -> Dict[str, Any]:
             'time_limit_min_profit_pct': TIME_LIMIT_MIN_PROFIT_PCT,
         }
 
+# ==================================================================
+# [V9.34.0] حاكم تقاعد الاستراتيجيات — فلسفة OctoBot (Drakkar-Software/OctoBot):
+#   الاستراتيجية تُحكم عليها ببياناتها الحية لا بتخمينها. الطلب: "ازالة الاستراتيجيات
+#   الضعيفة والعاطلة التي لا تعطي نتائج" — الحاكم يفعلها آليًا بالبرهان:
+#   - المصدر: جدول signals (status='closed') مُجمّع لكل strategy_name — نفس محاسبة
+#     /api/stats (الصافي بعد رسوم الذهاب والإياب 2×TRADING_FEE_PERCENT)
+#   - شرط التعليق: n ≥ STRAT_RETIRE_MIN_N و (PF < STRAT_RETIRE_MAX_PF أو
+#     متوسط الصافي/صفقة < STRAT_RETIRE_MIN_EXP_PCT) — عتبات متساهلة عن قصد:
+#     لا تُعلَّق إلا الهدر الواضح، والبقية تُترك لدورة أكمل من السوق
+#   - الأثر: منع الفتح الجديد فقط (كأنها risk_gov_strategy_blocked) — الصفقات
+#     المفتوحة تُدار طبيعيًا حتى حواجزها، والإحصاء يتجمد أثناء التعليق فلا
+#     تتحسن ولا تسوء أرقامها (لا فتحات جديدة)
+#   - الاستمرارية: bot_state['strategy_retirement'] تصمد عبر إعادة التشغيل
+#   - الرقابة: STRAT_RETIRE_FORCE_ACTIVE_JSON قائمة أسماء لا تُعلَّق أبدًا،
+#     STRAT_RETIRE_ENABLED=false يوقف الحاكم كليًا، وكل تعليق يُعلَن تلغرامًا
+# ==================================================================
+_strategy_retire_state: Dict[str, Dict[str, Any]] = {}
+_strategy_retire_lock = Lock()
+_strategy_retire_loaded: bool = False
+
+def _strategy_retire_db_stats() -> Dict[str, Dict[str, Any]]:
+    """إحصاء الصفقات المغلقة لكل استراتيجية من DB بنفس محاسبة /api/stats.
+    يعيد: {strategy_name: {n, pf, exp_pct, wr, net_usdt, last_closed_at}}"""
+    out: Dict[str, Dict[str, Any]] = {}
+    if not check_db_connection() or not conn:
+        return out
+    with db_conn_lock, conn.cursor() as cur:
+        cur.execute("""
+            SELECT strategy_name, profit_percentage, original_quantity, entry_price, is_real_trade, closed_at
+            FROM signals WHERE status = 'closed' AND strategy_name IS NOT NULL AND strategy_name <> '';
+        """)
+        rows = cur.fetchall()
+    for r in rows:
+        name = str(r.get('strategy_name') or '').strip()
+        if not name:
+            continue
+        try:
+            pct = float(r.get('profit_percentage') or 0.0)
+        except Exception:
+            continue
+        qty = float(r.get('original_quantity') or 0.0)
+        entry = float(r.get('entry_price') or 0.0)
+        try:
+            notional = (qty * entry) if (r.get('is_real_trade') and qty > 0 and entry > 0) else STATS_TRADE_SIZE_USDT
+        except Exception:
+            notional = STATS_TRADE_SIZE_USDT
+        net_pct = pct - (2 * TRADING_FEE_PERCENT)
+        net_usdt = net_pct / 100.0 * notional
+        st = out.setdefault(name, {'n': 0, 'wins': 0.0, 'losses': 0.0, 'net_usdt': 0.0, 'net_pcts': [], 'last': None})
+        st['n'] += 1
+        if net_pct > 0:
+            st['wins'] += net_pct
+        elif net_pct < 0:
+            st['losses'] += abs(net_pct)
+        st['net_usdt'] += net_usdt
+        st['net_pcts'].append(net_pct)
+        closed_at = r.get('closed_at')
+        if closed_at and (st['last'] is None or str(closed_at) > str(st['last'])):
+            st['last'] = closed_at
+    for name, st in out.items():
+        st['pf'] = round((st['wins'] / st['losses']) if st['losses'] > 0 else (99.0 if st['wins'] > 0 else 0.0), 3)
+        st['exp_pct'] = round(sum(st['net_pcts']) / len(st['net_pcts']), 4) if st['net_pcts'] else 0.0
+        st['wr'] = round(100.0 * sum(1 for x in st['net_pcts'] if x > 0) / len(st['net_pcts']), 1) if st['net_pcts'] else 0.0
+        st['net_usdt'] = round(st['net_usdt'], 4)
+        del st['net_pcts']
+    return out
+
+def _strategy_retire_save() -> None:
+    """حفظ حالة التقاعد في bot_state (يصمد عبر إعادة التشغيل)."""
+    if not check_db_connection() or not conn:
+        return
+    try:
+        payload = json.dumps({'strategies': _strategy_retire_state})
+        with db_conn_lock, conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO bot_state (key, value) VALUES (%s, %s::jsonb) "
+                "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW();",
+                ('strategy_retirement', payload))
+            conn.commit()
+    except Exception as e:
+        logger.debug(f"[تقاعد الاستراتيجيات] تعذر الحفظ: {e}")
+
+def _strategy_retire_ensure_loaded() -> None:
+    """تحميل حالة التقاعد من bot_state مرة واحدة (إقلاع/أول تقييم)."""
+    global _strategy_retire_loaded
+    if _strategy_retire_loaded:
+        return
+    _strategy_retire_loaded = True
+    if not check_db_connection() or not conn:
+        return
+    try:
+        with db_conn_lock, conn.cursor() as cur:
+            cur.execute("SELECT value FROM bot_state WHERE key = %s;", ('strategy_retirement',))
+            row = cur.fetchone()
+        if row and isinstance(row.get('value'), dict):
+            saved = row['value'].get('strategies')
+            if isinstance(saved, dict):
+                with _strategy_retire_lock:
+                    _strategy_retire_state.clear()
+                    _strategy_retire_state.update(saved)
+                logger.info(f"✅ [تقاعد الاستراتيجيات] استُعيدت الحالة من DB: "
+                            f"{len([s for s in saved.values() if s.get('suspended')])} معلّقة")
+    except Exception as e:
+        logger.debug(f"[تقاعد الاستراتيجيات] لا حالة محفوظة: {e}")
+
+def strategy_retirement_refresh(reason: str = 'close') -> None:
+    """إعادة حساب إحصاء كل استراتيجية من DB وتفعيل/رفع التعليقات الجديدة.
+    يُستدعى عند الإقلاع وعند كل إغلاق (نفاذة خفيفة — الإغلاقات قليلة بالساعة).
+    التعليق الجديد يُعلَن (سجل + تلغرام)؛ التعليق القائم يبقى حتى تحسن الإحصاء
+    فوق العتبات أو تُستثنى الاستراتيجية بـ STRAT_RETIRE_FORCE_ACTIVE_JSON."""
+    if not STRAT_RETIRE_ENABLED:
+        return
+    _strategy_retire_ensure_loaded()
+    stats = _strategy_retire_db_stats()
+    if not stats:
+        return
+    newly: List[str] = []
+    with _strategy_retire_lock:
+        for name, s in stats.items():
+            if name in STRAT_RETIRE_FORCE_ACTIVE:
+                continue
+            n, pf, exp = int(s.get('n', 0)), float(s.get('pf', 0.0)), float(s.get('exp_pct', 0.0))
+            st = _strategy_retire_state.get(name) or {}
+            bad = (n >= STRAT_RETIRE_MIN_N) and ((pf > 0 and pf < STRAT_RETIRE_MAX_PF) or exp < STRAT_RETIRE_MIN_EXP_PCT)
+            if bad and not st.get('suspended'):
+                _strategy_retire_state[name] = {
+                    'suspended': True, 'n': n, 'pf': pf, 'exp_pct': exp,
+                    'reason': f"PF={pf:.2f}/EXP={exp:+.2f}% على {n} صفقة",
+                    'since': datetime.now(timezone.utc).isoformat(), 'source': reason}
+                newly.append(name)
+            elif not bad and st.get('suspended'):
+                # تحسّن الإحصاء فوق العتبات (نظريًا نادر أثناء التعليق) — رفع التعليق
+                _strategy_retire_state[name] = {
+                    'suspended': False, 'n': n, 'pf': pf, 'exp_pct': exp,
+                    'reason': 'تحسن الإحصاء فوق العتبات', 'since': datetime.now(timezone.utc).isoformat(), 'source': reason}
+            else:
+                # تحديث الأرقام المعروضة مع الحفاظ على حالة التعليق
+                if st:
+                    st.update({'n': n, 'pf': pf, 'exp_pct': exp})
+        _strategy_retire_save()
+    for name in newly:
+        st = _strategy_retire_state.get(name) or {}
+        log_and_notify('warning', (
+            f"⚱️ تقاعد استراتيجية: [{name}] عُلّقت من فتح صفقات جديدة — أداؤها الحي الثابت "
+            f"({st.get('reason', '')}) تحت عتبات التقاعد (n≥{STRAT_RETIRE_MIN_N}, PF<{STRAT_RETIRE_MAX_PF}, "
+            f"EXP<{STRAT_RETIRE_MIN_EXP_PCT}%). الصفقات المفتوحة تُدار طبيعيًا حتى إغلاقها."
+        ), "STRATEGY_RETIREMENT")
+        send_telegram_message(
+            f"⚱️ *تقاعد استراتيجية:* [{name}] علّقها الحاكم بالبيانات — {st.get('reason', '')}. "
+            "ستدار صفقاتها المفتوحة حتى الإغلاق، ولا صفقات جديدة منها.")
+
+def strategy_retirement_blocked(strategy_name: str) -> Tuple[bool, str]:
+    """هل هذه الاستراتيجية معلّقة بالتقاعد؟ (فحص ذاكرة فقط — رخيص داخل حلقة المسح)"""
+    if not STRAT_RETIRE_ENABLED or not strategy_name:
+        return False, ''
+    if not _strategy_retire_loaded:
+        _strategy_retire_ensure_loaded()
+    with _strategy_retire_lock:
+        st = _strategy_retire_state.get(str(strategy_name or ''))
+        if st and st.get('suspended'):
+            return True, f"معلّقة بالتقاعد الآلي ({st.get('reason', 'أداء ضعيف ثابت')})"
+    return False, ''
+
+def strategy_retirement_snapshot() -> Dict[str, Any]:
+    """لقطة التقاعد للوحة و/protections: الحالة + العتبات."""
+    with _strategy_retire_lock:
+        return {
+            'enabled': bool(STRAT_RETIRE_ENABLED),
+            'min_n': STRAT_RETIRE_MIN_N, 'max_pf': STRAT_RETIRE_MAX_PF,
+            'min_exp_pct': STRAT_RETIRE_MIN_EXP_PCT,
+            'force_active': list(STRAT_RETIRE_FORCE_ACTIVE),
+            'strategies': {k: {**v, 'since': str(v.get('since', ''))} for k, v in _strategy_retire_state.items()},
+        }
+
 # --- [V9.26.0] مدير الحماية والانضباط — اقتباس مباشر من فلسفة Freqtrade (plugins/protections/) ---
 # النموذج المرجعي في freqtrade: كل حماية تفحص الصفقات المغلقة في نافذة زمنية، وعند تجاوز الحد
 # تُنشئ PairLock بمهلة انتهاء تُفحص قبل أي دخول (global أو per-pair). نطبّق المبدأ نفسه
@@ -6903,6 +7376,12 @@ def get_active_protections_snapshot() -> Dict[str, Any]:
                 'hwm_strategy': f"ذروة استراتيجية ≥ +{STRAT_HWM_PEAK_FLOOR_USDT:.2f}$ ثم تراجع ≥ {STRAT_HWM_RETRACE_USDT:.2f}$ → قفل الاستراتيجية",
                 'time_limit': 'حسب الاستراتيجية: ' + ', '.join(
                     f"{k.split('_')[0]}:{v}د" for k, v in STRATEGY_TIME_LIMIT_MIN.items() if v > 0) + f" (بربح < {TIME_LIMIT_MIN_PROFIT_PCT}% → إغلاق)",
+            },
+            # [V9.34.0] حاكم تقاعد الاستراتيجيات (فلسفة OctoBot: الإزالة بالبرهان) + المفاتيح البنيوية المتقاعدة
+            'strategy_retirement': strategy_retirement_snapshot(),
+            'disabled_strategies': {
+                'keys': list(DISABLED_STRATEGY_KEYS),
+                'bounce_filter': (f"عائلة FT العكسية تشتري فقط بعد تأكيد ارتداد القاع المحلي (اقتباس DipAnalyser)" if FT_REVERSAL_BOUNCE_FILTER else 'معطّل'),
             },
         },
     }
@@ -7222,7 +7701,8 @@ EVIDENCE_REFRESH_LOCK = Lock()
 
 # سجل الاستراتيجيات المفعلة (نفس ترتيب الحلقة الرئيسية) — يُبنى مرة
 def _evidence_strategy_table() -> List[Tuple[str, Any, str]]:
-    return [
+    # [V9.34.0] المفاتيح المتقاعدة مستبعدة من جدول الأدلة (لا فحص ولا بناء دليل لها)
+    return [(k, fn, n) for (k, fn, n) in [
         ('MACD_EMA', check_macd_ema_strategy, 'MACD_EMA_Crossover'),
         ('BB_STOCH', check_bb_stoch_strategy_enhanced, 'BB_Stoch_Reversal_Enhanced'),
         ('EMA_RSI', check_ema_rsi_strategy, 'EMA_RSI_Cross'),
@@ -7237,7 +7717,7 @@ def _evidence_strategy_table() -> List[Tuple[str, Any, str]]:
         ('FT_QUICKIE', ft_entry_quickie, 'FT_Quickie'),
         ('FT_ADXMOMENTUM', ft_entry_adxmomentum, 'FT_ADXMomentum'),
         ('FT_BANDTASTIC', ft_entry_bandtastic, 'FT_Bandtastic'),
-    ]
+    ] if k not in DISABLED_STRATEGY_KEYS]
 
 
 def _evidence_summarize(nets: List[float]) -> Dict[str, Any]:
@@ -7447,6 +7927,8 @@ def _evidence_replay_symbol(symbol: str, btc_df: Optional[pd.DataFrame]) -> List
     start = max(230, n - EVIDENCE_WINDOW_BARS)
     stop = n - 4
     table = _evidence_strategy_table()
+    # [V9.34.0] المفاتيح المتقاعدة لا تبني دليلًا (مرشّحة مرة قبل الحلقة)
+    table = [(k, fn, nm) for (k, fn, nm) in table if k not in DISABLED_STRATEGY_KEYS]
     last_sig: Dict[str, int] = {name: -10 ** 9 for _, _, name in table}
     # [V9.24.0] سلسلة حالة السوق العام (من BTC) محاذاة زمنيًا إلى شموع الرمز + ثبات الصاعد
     regime_series = _evidence_global_regime_series()
@@ -7802,30 +8284,40 @@ def main_loop_enhanced():
             examinations_total = 0
 
             strategies_to_check = []
+            # [V9.34.0] المفاتيح المتقاعدة (DISABLED_STRATEGY_KEYS) لا تدخل حلقة الفحص أصلًا —
+            # الافتراضي: BB_STOCH (ميتة بنيويًا: 100% رفض فلتر عبر حياتها كلها + مكررة بعائلة FT العكسية)
+            def _strategy_enabled(key: str) -> bool:
+                return key not in DISABLED_STRATEGY_KEYS
             with macd_ema_strategy_lock:
-                if USE_MACD_EMA_STRATEGY: strategies_to_check.append(('MACD_EMA', check_macd_ema_strategy, "MACD_EMA_Crossover"))
+                if USE_MACD_EMA_STRATEGY and _strategy_enabled('MACD_EMA'): strategies_to_check.append(('MACD_EMA', check_macd_ema_strategy, "MACD_EMA_Crossover"))
             with bb_stoch_strategy_lock:
-                if USE_BB_STOCH_STRATEGY: strategies_to_check.append(('BB_STOCH', check_bb_stoch_strategy_enhanced, "BB_Stoch_Reversal_Enhanced"))
+                if USE_BB_STOCH_STRATEGY and _strategy_enabled('BB_STOCH'): strategies_to_check.append(('BB_STOCH', check_bb_stoch_strategy_enhanced, "BB_Stoch_Reversal_Enhanced"))
             with ema_rsi_strategy_lock:
-                if USE_EMA_RSI_STRATEGY: strategies_to_check.append(('EMA_RSI', check_ema_rsi_strategy, "EMA_RSI_Cross"))
+                if USE_EMA_RSI_STRATEGY and _strategy_enabled('EMA_RSI'): strategies_to_check.append(('EMA_RSI', check_ema_rsi_strategy, "EMA_RSI_Cross"))
             with pullback_strategy_lock:
-                if USE_PULLBACK_STRATEGY: strategies_to_check.append(('PULLBACK', check_pullback_strategy, "Pullback_MACD"))
+                if USE_PULLBACK_STRATEGY and _strategy_enabled('PULLBACK'): strategies_to_check.append(('PULLBACK', check_pullback_strategy, "Pullback_MACD"))
             with bb_squeeze_strategy_lock:
-                if USE_BB_SQUEEZE_STRATEGY: strategies_to_check.append(('BB_SQUEEZE', check_bb_squeeze_strategy, "BB_Squeeze_Breakout"))
+                if USE_BB_SQUEEZE_STRATEGY and _strategy_enabled('BB_SQUEEZE'): strategies_to_check.append(('BB_SQUEEZE', check_bb_squeeze_strategy, "BB_Squeeze_Breakout"))
             with bullish_momentum_strategy_lock:
-                if USE_BULLISH_MOMENTUM_STRATEGY: strategies_to_check.append(('BULLISH_MOMENTUM', check_bullish_momentum_strategy, "Bullish_Momentum"))
+                if USE_BULLISH_MOMENTUM_STRATEGY and _strategy_enabled('BULLISH_MOMENTUM'): strategies_to_check.append(('BULLISH_MOMENTUM', check_bullish_momentum_strategy, "Bullish_Momentum"))
             with sr_breakout_strategy_lock:
-                if USE_SR_BREAKOUT_STRATEGY: strategies_to_check.append(('SR_BREAKOUT', check_support_resistance_strategy_enhanced, "SR_Breakout_Enhanced"))
+                if USE_SR_BREAKOUT_STRATEGY and _strategy_enabled('SR_BREAKOUT'): strategies_to_check.append(('SR_BREAKOUT', check_support_resistance_strategy_enhanced, "SR_Breakout_Enhanced"))
             # [V9.29.0] استراتيجيات freqtrade الأصلية بأعداداتها — مفعلة جماعيًا أو لكل واحدة
             if FT_STRATEGIES_ENABLED:
                 with ft_strategies_lock:
                     for _ft_name, _ft_spec in FREQTRADE_STRATEGIES.items():
-                        if FT_STRATEGY_ENABLED.get(_ft_name, True):
+                        if FT_STRATEGY_ENABLED.get(_ft_name, True) and _strategy_enabled(_ft_spec['key']):
                             strategies_to_check.append((_ft_spec['key'], _ft_spec['entry_fn'], _ft_name))
 
             # [V9.25.0] الحلقة استراتيجيةً: كل استراتيجية تفحص مرشحيها العشرة حصرًا.
             # بوابات مستوى الاستراتيجية (حالة السوق + ثبات الصاعد) قبل جلب أي شموع.
             for key, check_func, name in strategies_to_check:
+                # [V9.34.0] حاكم التقاعد: استراتيجية علّقها البيانات الحية (PF/EXP تحت العتبات
+                # على n كافٍ) لا تُفحص ولا تفتح — الصفقات المفتوحة تُدار طبيعيًا في حلقة الإدارة
+                _rt_block, _rt_reason = strategy_retirement_blocked(name)
+                if _rt_block:
+                    _count_strategy_filter_reject(name, _rt_reason)
+                    continue
                 # [V9.31.0] علامة مائية الاستراتيجية (Hummingbot HWM لكل متحكم): استراتيجية
                 # بلغت ذروة ربح اليوم ثم رجعت خلفها بقدر الحد تُقفل — لا فحص ولا فتح لها حتى يوم جديد
                 if RISK_GOV_ENABLED:
@@ -8231,6 +8723,13 @@ def initialize_bot_services():
             get_exchange_info_map()
             load_open_signals_to_cache()
             load_notifications_to_cache()
+            # [V9.34.0] حاكم التقاعد: استعادة الحالة المحفوظة ثم إحصاء حي من DB
+            # (قد تُعلَّق استراتيجية ضعيفة فور الإقلاع بدل انتظار أول إغلاق)
+            try:
+                _strategy_retire_ensure_loaded()
+                strategy_retirement_refresh('boot')
+            except Exception as sr_boot_err:
+                logger.debug(f"[تقاعد الاستراتيجيات] تعذر الإحصاء عند الإقلاع: {sr_boot_err}")
             validated_symbols_to_scan = get_validated_symbols()
             # [تحسين V9.10] حفظ القائمة الثابتة كبديل احتياطي ثم كشف فوري للعملات الأكثر حيوية
             _static_fallback_symbols[:] = validated_symbols_to_scan

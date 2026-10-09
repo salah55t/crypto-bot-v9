@@ -82,7 +82,9 @@ def test_nomination_deterministic_and_count():
         vnz.strategy_nominees_built_at = -1.0
         n1 = vnz.nominate_strategy_candidates()
         n2 = vnz.nominate_strategy_candidates()
-        assert set(n1.keys()) == set(vnz.STRATEGY_SETUP_SCANNERS.keys()), 'كل الاستراتيجيات لها قائمة'
+        # [V9.34.0] المتقاعدة (DISABLED_STRATEGY_KEYS) مستبعدة من دائرة الترشيح — البقية كلها قوائم
+        expected_keys = set(vnz.STRATEGY_SETUP_SCANNERS.keys()) - set(vnz.DISABLED_STRATEGY_KEYS)
+        assert set(n1.keys()) == expected_keys, 'كل الاستراتيجيات غير المتقاعدة لها قائمة'
         for key in n1:
             assert len(n1[key]) == 10, f"{key}: {len(n1[key])} بدل 10"
             assert [x['symbol'] for x in n1[key]] == [x['symbol'] for x in n2[key]], 'الترشيح غير حتمي!'
@@ -109,13 +111,16 @@ def test_nomination_excludes_open_positions_with_topup():
         vnz._NOMINEE_RANKED_POOL = {}
         vnz.strategy_nominees_built_at = -1.0
         first = vnz.nominate_strategy_candidates()
-        victim = first['BB_STOCH'][0]['symbol']          # الأول ستصبح صفقة مفتوحة
+        # [V9.34.0] BB_STOCH متقاعدة (مستبعدة من الترشيح) — نستخدم SR_BREAKOUT بدلها
+        # ونتحقق أيضًا من غيابها الكامل عن دائرة الترشيح (الإزالة البنيوية)
+        assert 'BB_STOCH' not in first, 'المتقاعدة BB_STOCH لا تُرشَّح أزواجًا!'
+        victim = first['SR_BREAKOUT'][0]['symbol']       # الأول ستصبح صفقة مفتوحة
         vnz.open_signals_cache[victim] = {'symbol': victim}
         second = vnz.nominate_strategy_candidates()
-        lst = second['BB_STOCH']
+        lst = second['SR_BREAKOUT']
         assert len(lst) == 10, f"بعد الاستبعاد والتزويد: {len(lst)} بدل 10"
         assert all(x['symbol'] != victim for x in lst), 'صفقة مفتوحة داخل قائمة الفحص!'
-        print(f"✅ 5) استبعاد الصفقة المفتوحة ({victim}) بتزويد تلقائي — القائمة بقيت 10")
+        print(f"✅ 5) استبعاد الصفقة المفتوحة ({victim}) بتزويد تلقائي — القائمة بقيت 10 (+ غياب المتقاعدة BB_STOCH)")
     finally:
         vnz.wide_universe_rows, vnz.universe_last_refresh = old_rows, old_marker
         vnz._NOMINEE_RANKED_POOL, vnz.STRATEGY_NOMINEES = old_pool, old_nom
