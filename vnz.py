@@ -49,7 +49,7 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-APP_VERSION: str = 'V9.30.0'  # [V9.21.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
+APP_VERSION: str = 'V9.31.0'  # [V9.21.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
 logger = logging.getLogger(f'CryptoBot{APP_VERSION}')
 
 # زمن إقلاع العملية لحساب مدة التشغيل في لوحة التحكم
@@ -540,6 +540,49 @@ MAX_SL_DISTANCE_PCT: float = config('MAX_SL_DISTANCE_PCT', default=6.0, cast=flo
 STALE_TRADE_HOURS: float = config('STALE_TRADE_HOURS', default=24.0, cast=float)
 STALE_MIN_PROFIT_PCT: float = config('STALE_MIN_PROFIT_PCT', default=0.2, cast=float)
 
+# [V9.31.0] حاكم المخاطر — اقتباس من Hummingbot (kill_switch.py + v2_with_controllers.py):
+#   أ) قفل الربح (ActiveKillSwitch الاتجاه الموجب): عند بلوغ ربح اليوم +X USDT يتوقف فتح صفقات
+#      جديدة حتى بداية يوم UTC جديد — "خذ المال واركض" بدل استرداده بصفقات متعجلة
+#   ب) علامة المائية (HWM Drawdown): تتبّع ذروة ربح اليوم (محقق + غير محقق) عالميًا ولكل
+#      استراتيجية؛ إذا تراجع الربح عن الذروة بمقدار X USDT يُقفل الدخول حتى نهاية اليوم —
+#      والقفل لا يُرفع تلقائيًا داخل اليوم (نمط drawdown_exited_controllers)
+#   ج) الحاجز الزمني لكل استراتيجية (TripleBarrier time_limit): صفقة الاستراتيجيات الأصليات
+#      تجاوزت عمرها المحدد بلا ربح يُذكر → إغلاق سوقي (صفقات FT معزولة بمحرك ROI الزمني)
+#   المعايرة على حجم البوت الفعلي (صفقة ورقية ≈ 4 USDT، تأرجح اليوم ±2 USDT): كل القيم
+#   قابلة للضبط عبر البيئة، و0 يعطّل الآلية المعنية. تُحفظ الحالة في جدول bot_state
+#   (تصمد عبر إعادة التشغيل داخل اليوم، وتتصفّر تلقائيًا مع بداية يوم UTC جديد)
+RISK_GOV_ENABLED: bool = config('RISK_GOV_ENABLED', default=True, cast=bool)
+PROFIT_LOCK_USDT: float = config('PROFIT_LOCK_USDT', default=2.0, cast=float)
+HWM_PEAK_FLOOR_USDT: float = config('HWM_PEAK_FLOOR_USDT', default=0.8, cast=float)
+HWM_RETRACE_USDT: float = config('HWM_RETRACE_USDT', default=1.2, cast=float)
+STRAT_HWM_PEAK_FLOOR_USDT: float = config('STRAT_HWM_PEAK_FLOOR_USDT', default=0.4, cast=float)
+STRAT_HWM_RETRACE_USDT: float = config('STRAT_HWM_RETRACE_USDT', default=0.6, cast=float)
+TIME_LIMIT_MIN_PROFIT_PCT: float = config('TIME_LIMIT_MIN_PROFIT_PCT', default=0.2, cast=float)
+# الحاجز الزمني لكل استراتيجية بالدقائق (الاستراتيجيات الأصليات السبع — 0 يعطّل)
+# فلسفة: الاختراق يجب أن يعمل سريعًا (3-4س)، الاتجاهي يُعطى 5س، الارتدادي نطاق أوسع (6س)
+STRATEGY_TIME_LIMIT_DEFAULTS: Dict[str, int] = {
+    'SR_Breakout_Enhanced': 180,
+    'BB_Squeeze_Breakout': 240,
+    'MACD_EMA_Crossover': 300,
+    'EMA_RSI_Cross': 300,
+    'Bullish_Momentum': 300,
+    'BB_Stoch_Reversal_Enhanced': 360,
+    'Pullback_MACD': 360,
+}
+def _load_strategy_time_limits() -> Dict[str, int]:
+    try:
+        raw = os.environ.get('STRATEGY_TIME_LIMITS_JSON', '').strip()
+        if raw:
+            override = json.loads(raw)
+            if isinstance(override, dict):
+                merged = dict(STRATEGY_TIME_LIMIT_DEFAULTS)
+                merged.update({str(k): int(v) for k, v in override.items()})
+                return merged
+    except Exception:
+        pass
+    return dict(STRATEGY_TIME_LIMIT_DEFAULTS)
+STRATEGY_TIME_LIMIT_MIN: Dict[str, int] = _load_strategy_time_limits()
+
 # --- متغيرات الحالة والكاش ---
 conn: Optional[psycopg2.extensions.connection] = None
 client: Optional[Client] = None
@@ -615,6 +658,20 @@ daily_realized_pnl_usdt: float = 0.0
 daily_pnl_date: str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
 daily_loss_notified: bool = False
 daily_pnl_lock = Lock()
+
+# [V9.31.0] حالة حاكم المخاطر (تصمد عبر إعادة التشغيل داخل اليوم عبر جدول bot_state)
+_risk_gov_lock = Lock()
+_risk_gov_state: Dict[str, Any] = {
+    'date': datetime.now(timezone.utc).strftime('%Y-%m-%d'),
+    'daily_realized': 0.0,
+    'global_peak': 0.0,
+    'global_profit_locked': False,
+    'global_hwm_locked': False,
+    'strat': {},
+}
+_risk_gov_loaded: bool = False
+_risk_gov_last_eval: float = 0.0
+_risk_gov_eval_interval_sec: float = 30.0
 ATR_TRAILING_CACHE: Dict[str, Tuple[float, float]] = {}
 atr_trailing_lock = Lock()
 
@@ -2277,6 +2334,14 @@ def init_db(retries: int = 5, delay: int = 5) -> None:
                     CREATE TABLE IF NOT EXISTS notifications (
                         id SERIAL PRIMARY KEY, timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
                         type TEXT NOT NULL, message TEXT NOT NULL, is_read BOOLEAN DEFAULT FALSE
+                    );
+                """)
+                # [V9.31.0] متجر حالة عام (مفتاح → JSON): حاكم المخاطر (علامة المائية/قفل الربح)
+                # يصمد عبر إعادة التشغيل داخل اليوم — أي مفتاح مستقبلي يحتاج استمرارية يستخدمه
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS bot_state (
+                        key TEXT PRIMARY KEY, value JSONB NOT NULL,
+                        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
                     );
                 """)
                 conn.commit()
@@ -4617,6 +4682,7 @@ def close_signal(signal_id: int, closing_price: float, reason: str) -> bool:
                 'atr_trailing_stop': '🛡️ وقف خسارة متحرك', 'journey_completed': '🏁 اكتملت الرحلة',
                 'take_profit_full_exit_on_small_size': '🎯 أخذ الربح (إغلاق كامل لصفقة صغيرة)',
                 'stale_time_exit': '⌛ خروج زمني (صفقة عجوز بلا ربح — نمط Freqtrade)',
+                'strategy_time_limit': '⏱️ حاجز زمني للاستراتيجية (بلا تقدم — نمط Hummingbot TripleBarrier)',
                 # [V9.29.0] أسباب محرك الخروج الأصلي freqtrade
                 'ft_roi': '🎯 هدف ROI الزمني (freqtrade)', 'ft_stoploss': '🛑 وقف الخسارة (freqtrade)',
                 'ft_trailing_stop': '🛡️ وقف متحرك (freqtrade)', 'ft_exit_signal': '📤 إشارة خروج أصلي (freqtrade)'
@@ -4939,6 +5005,7 @@ def get_dashboard_html():
                 <div class="text-text-secondary text-sm text-center py-2">فحص الأقفال جارٍ...</div>
             </div>
             <div id="protections-config" class="text-[11px] text-text-secondary leading-5"></div>
+            <div id="protections-riskgov" class="text-[11px] text-text-secondary leading-5 mt-1 pt-1 border-t border-white/5"></div>
         </section>
         <!-- [تحسين V9.11] بوصلة اتجاه BTC على الفريمات الثلاث (API مجاني) -->
         <section class="card p-4 mb-6">
@@ -5002,6 +5069,7 @@ def get_dashboard_html():
                 <div class="flex items-center gap-2"><span class="text-text-secondary">التنفيذ:</span><span id="sys-exec" class="font-mono">--</span></div>
                 <div class="flex items-center gap-2"><span class="text-text-secondary">PnL اليوم:</span><span id="sys-pnl" class="font-mono">--</span></div>
                 <div class="flex items-center gap-2"><span class="text-text-secondary">قاطع الحماية:</span><span id="sys-lossguard" class="font-mono">--</span></div>
+                <div class="flex items-center gap-2"><span class="text-text-secondary">حاكم المخاطر:</span><span id="sys-riskgov" class="font-mono">--</span></div>
                 <div class="flex items-center gap-2"><span class="text-text-secondary">التخزين:</span><span id="sys-storage" class="font-mono text-accent-blue">--</span></div>
                 <div class="flex items-center gap-2"><span class="text-text-secondary">البيانات الحية:</span><span id="sys-ws" class="font-mono">--</span></div>
                 <div class="flex items-center gap-2"><span class="text-text-secondary">العملات:</span><span id="sys-symbols" class="font-mono">--</span></div>
@@ -5405,6 +5473,18 @@ function updateSystemStatus() {
         const lg = document.getElementById('sys-lossguard');
         if (data.daily_loss_limit_hit) { lg.textContent = 'مفعّل!'; lg.className = 'font-mono text-accent-red'; }
         else { lg.textContent = 'سليم'; lg.className = 'font-mono text-accent-green'; }
+        // [V9.31.0] حاكم المخاطر: قفل الربح + علامة المائية (اقتباس Hummingbot)
+        const rgo = document.getElementById('sys-riskgov');
+        const rgs = data.risk_governor || {};
+        if (rgs.enabled) {
+            let rgoTxt = `ذروة ${rgs.global_peak}$`;
+            let rgoCls = 'font-mono ' + (rgs.global_peak >= 0 ? 'text-accent-green' : 'text-accent-red');
+            if (rgs.profit_locked) { rgoTxt += ' | 🔒 قفل ربح'; rgoCls = 'font-mono text-accent-blue'; }
+            if (rgs.hwm_locked) { rgoTxt += ' | 🛡️ علامة مائية'; rgoCls = 'font-mono text-accent-red'; }
+            const lockedStrats = Object.values(rgs.strategies || {}).filter(s => s.locked).length;
+            if (lockedStrats > 0) { rgoTxt += ` | ${lockedStrats} استراتيجية مقفولة`; }
+            rgo.textContent = rgoTxt; rgo.className = rgoCls;
+        } else { rgo.textContent = 'معطّل'; rgo.className = 'font-mono text-text-secondary'; }
         const st = document.getElementById('sys-storage');
         st.textContent = data.redis_mode === 'redis' ? 'Redis' : (data.redis_mode === 'memory' ? 'ذاكرة داخلية' : 'غير متصل');
         document.getElementById('sys-symbols').textContent = data.symbols_count + (data.universe_mode === 'dynamic' ? ' ⚡ديناميكية' : ' 📋ثابتة');
@@ -5642,6 +5722,10 @@ function updateProtections() {
         if (cfgEl && d.config) {
             const c = d.config;
             cfgEl.innerHTML = `🩸 StoplossGuard: ${c.stoploss_guard} &nbsp;|&nbsp; 📉 MaxDrawdown: ${c.max_drawdown} &nbsp;|&nbsp; 🩹 LowProfitPairs: ${c.low_profit_pairs} &nbsp;|&nbsp; ⏳ تهدئة: ${c.cooldown} &nbsp;|&nbsp; 🛡️ سقف الوقف: ${c.max_sl_distance_pct}% &nbsp;|&nbsp; ⌛ ${c.stale_exit}`;
+            // [V9.31.0] حاكم المخاطر (اقتباس Hummingbot): قفل الربح + علامة المائية + الحاجز الزمني
+            const rgCfg = (c.risk_governor || {});
+            const rgCfgEl = document.getElementById('protections-riskgov');
+            if (rgCfgEl) { rgCfgEl.innerHTML = `🔒 ${rgCfg.profit_lock || ''} &nbsp;|&nbsp; 🛡️ ${rgCfg.hwm_global || ''} &nbsp;|&nbsp; ${rgCfg.hwm_strategy || ''} &nbsp;|&nbsp; ⏱️ ${rgCfg.time_limit || ''}`; }
         }
     }).catch(() => {});
 }
@@ -5689,6 +5773,8 @@ def api_system_status():
             'daily_pnl_usdt': pnl,
             'daily_max_loss_usdt': DAILY_MAX_LOSS_USDT,
             'daily_loss_limit_hit': daily_hit,
+            # [V9.31.0] حاكم المخاطر: قفل الربح + علامة المائية (عالمي/لكل استراتيجية) + الحواجز الزمنية
+            'risk_governor': risk_governor_snapshot(),
             'lookback_days': SIGNAL_GENERATION_LOOKBACK_DAYS,
             'symbols_count': len(validated_symbols_to_scan),
             'open_trades': open_count,
@@ -6210,6 +6296,11 @@ def register_realized_pnl(signal: Dict, entry_price: float, closing_price: float
             if daily_pnl_date != today:
                 daily_pnl_date, daily_realized_pnl_usdt, daily_loss_notified = today, 0.0, False
             daily_realized_pnl_usdt += pnl_usdt
+        # [V9.31.0] حاكم المخاطر: يضيف المحقق لسجله (اليوم + الاستراتيجية) ويُقيّم الذروة/الأقفال فورًا
+        try:
+            risk_gov_register_close(str(signal.get('strategy_name') or 'unknown'), pnl_usdt)
+        except Exception as rg_err:
+            logger.debug(f"[حاكم المخاطر] تعذر تسجيل الإغلاق: {rg_err}")
     except Exception as e:
         logger.error(f"❌ [قاطع الحماية] خطأ في تسجيل الأرباح المحققة: {e}")
 
@@ -6233,6 +6324,282 @@ def is_daily_loss_limit_hit() -> bool:
         ), "DAILY_LOSS_LIMIT")
         send_telegram_message("🛑 *قاطع الحماية اليومي:* تم إيقاف فتح صفقات جديدة بسبب تجاوز حد الخسارة اليومي.")
     return hit
+
+# ==================================================================
+# [V9.31.0] حاكم المخاطر — اقتباس من Hummingbot:
+#   - scripts/v2_with_controllers.py:36-85 (control_max_drawdown: علامة المائية
+#     العالمية ولكل متحكم + عدم إعادة تشغيل الخارج بالانخفاض داخل اليوم)
+#   - hummingbot/core/utils/kill_switch.py:44-63 (فحص دوري مزدوج الاتجاه:
+#     خسارة الحد → توقف، ربح الهدف → توقف أيضًا "قفل الربح")
+# الفروق المحسوبة لبيئتنا:
+#   1) الحساب بنفس محاسبة القاطع اليومي (register_realized_pnl): صفقة حقيقية
+#      بكميتها الفعلية، ورقية بـ STATS_TRADE_SIZE_USDT — لا مقاييس مصطنعة
+#   2) الذروة تشمل غير المحقق (unrealized) كما في PerformanceReport.global_pnl_quote
+#   3) القفل يمنع فتح صفقات جديدة فقط — الصفقات المفتوحة تستمر بإدارتها الطبيعية
+#      (حواجزها الخاصة) — النسخة الحذرة من إيقاف Hummingbot الشامل
+#   4) القفل اليومي يتصفّر مع بداية يوم UTC جديد (يصمد عبر إعادة التشغيل في bot_state)
+# ==================================================================
+def _risk_gov_rollover() -> str:
+    """تصفير الحالة عند بداية يوم UTC جديد — يعيد تاريخ اليوم الحالي."""
+    today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    if _risk_gov_state.get('date') != today:
+        _risk_gov_state.update({
+            'date': today, 'daily_realized': 0.0, 'global_peak': 0.0,
+            'global_profit_locked': False, 'global_hwm_locked': False, 'strat': {},
+        })
+    return today
+
+def _risk_gov_persist() -> None:
+    """حفظ حالة الحاكم في bot_state (تصمد عبر إعادة التشغيل داخل اليوم).
+    فشل الحفظ لا يكسر التداول — الحالة تبقى في الذاكرة وتُعاد المحاولة عند التقييم التالي."""
+    if not check_db_connection() or not conn:
+        return
+    try:
+        payload = json.dumps({
+            'date': _risk_gov_state.get('date'),
+            'daily_realized': float(_risk_gov_state.get('daily_realized', 0.0)),
+            'global_peak': float(_risk_gov_state.get('global_peak', 0.0)),
+            'global_profit_locked': bool(_risk_gov_state.get('global_profit_locked')),
+            'global_hwm_locked': bool(_risk_gov_state.get('global_hwm_locked')),
+            'strat': _risk_gov_state.get('strat', {}),
+        })
+        with db_conn_lock, conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO bot_state (key, value, updated_at) VALUES (%s, %s::jsonb, NOW()) "
+                "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW();",
+                ('risk_governor', payload))
+            conn.commit()
+    except Exception as e:
+        logger.debug(f"[حاكم المخاطر] تعذر الحفظ: {e}")
+
+def _risk_gov_ensure_loaded() -> None:
+    """تحميل حالة اليوم من bot_state مرة واحدة عند أول تقييم — يستعيد الذروة
+    والأقفال وربح اليوم المحقق لو أُعيد تشغيل البوت داخل نفس يوم UTC."""
+    global _risk_gov_loaded
+    if _risk_gov_loaded:
+        return
+    _risk_gov_loaded = True
+    if not check_db_connection() or not conn:
+        return
+    try:
+        with db_conn_lock, conn.cursor() as cur:
+            cur.execute("SELECT value FROM bot_state WHERE key = %s;", ('risk_governor',))
+            row = cur.fetchone()
+        if row and isinstance(row.get('value'), dict):
+            saved = row['value']
+            with _risk_gov_lock:
+                if saved.get('date') == _risk_gov_state.get('date'):
+                    _risk_gov_state['daily_realized'] = float(saved.get('daily_realized', 0.0))
+                    _risk_gov_state['global_peak'] = float(saved.get('global_peak', 0.0))
+                    _risk_gov_state['global_profit_locked'] = bool(saved.get('global_profit_locked'))
+                    _risk_gov_state['global_hwm_locked'] = bool(saved.get('global_hwm_locked'))
+                    strat_saved = saved.get('strat')
+                    if isinstance(strat_saved, dict):
+                        _risk_gov_state['strat'] = strat_saved
+                    logger.info(
+                        f"✅ [حاكم المخاطر] استُعيدت حالة اليوم من DB: ذروة {_risk_gov_state['global_peak']:.2f}، "
+                        f"محقق {_risk_gov_state['daily_realized']:.2f}، "
+                        f"قفل ربح={_risk_gov_state['global_profit_locked']}، قفل مائية={_risk_gov_state['global_hwm_locked']}")
+    except Exception as e:
+        logger.debug(f"[حاكم المخاطر] لا حالة محفوظة (بداية نظيفة): {e}")
+
+def _risk_gov_evaluate_locked(total_global: float, strat_totals: Dict[str, float]) -> None:
+    """تحديث الذُرى وتقييم الأقفال (يُستدعى داخل _risk_gov_lock).
+    total_global/strat_totals = محقق + غير محقق. الذروة ترتفع فقط (watermark)،
+    والقفل المُفعّل لا يُرفع داخل اليوم (نمط drawdown_exited_controllers)."""
+    today = _risk_gov_rollover()
+    changed = False
+
+    # --- المستوى العالمي ---
+    peak = float(_risk_gov_state.get('global_peak', 0.0))
+    if total_global > peak:
+        _risk_gov_state['global_peak'] = round(total_global, 4)
+        changed = True
+    peak = float(_risk_gov_state.get('global_peak', 0.0))
+    if PROFIT_LOCK_USDT > 0 and not _risk_gov_state.get('global_profit_locked') and total_global >= PROFIT_LOCK_USDT:
+        _risk_gov_state['global_profit_locked'] = True
+        changed = True
+        log_and_notify('warning', (
+            f"🔒 قفل الربح اليومي: ربح اليوم ({total_global:.2f} USDT) بلغ الهدف ({PROFIT_LOCK_USDT:.2f}). "
+            "توقف فتح صفقات جديدة حتى بداية يوم UTC جديد — الصفقات المفتوحة تستمر بإدارتها الطبيعية."
+        ), "RISK_GOVERNOR")
+        send_telegram_message(
+            f"🔒 *قفل الربح اليومي:* ربح اليوم +{total_global:.2f} USDT — توقف فتح صفقات جديدة حتى الغد (UTC).")
+    if (HWM_RETRACE_USDT > 0 and HWM_PEAK_FLOOR_USDT > 0
+            and not _risk_gov_state.get('global_hwm_locked')
+            and peak >= HWM_PEAK_FLOOR_USDT
+            and total_global <= peak - HWM_RETRACE_USDT):
+        _risk_gov_state['global_hwm_locked'] = True
+        changed = True
+        log_and_notify('warning', (
+            f"🛡️ علامة المائية العالمية: اليوم بلغ ذروته +{peak:.2f} ثم تراجع إلى {total_global:.2f} "
+            f"(تراجع {peak - total_global:.2f} ≥ {HWM_RETRACE_USDT:.2f}). إيقاف فتح صفقات جديدة حتى يوم UTC جديد "
+            "— لا نُرجع أرباح اليوم للسوق."
+        ), "RISK_GOVERNOR")
+        send_telegram_message(
+            f"🛡️ *علامة المائية:* تراجع اليوم عن ذروته ({peak:.2f} → {total_global:.2f} USDT) — توقف فتح صفقات جديدة حتى الغد (UTC).")
+
+    # --- مستوى الاستراتيجية ---
+    st_map: Dict[str, Any] = _risk_gov_state.setdefault('strat', {})
+    for name, total in strat_totals.items():
+        st = st_map.setdefault(str(name), {'realized': 0.0, 'peak': 0.0, 'locked': False})
+        p = float(st.get('peak', 0.0))
+        if total > p:
+            st['peak'] = round(float(total), 4)
+            changed = True
+            p = st['peak']
+        if (STRAT_HWM_RETRACE_USDT > 0 and STRAT_HWM_PEAK_FLOOR_USDT > 0
+                and not st.get('locked')
+                and p >= STRAT_HWM_PEAK_FLOOR_USDT
+                and total <= p - STRAT_HWM_RETRACE_USDT):
+            st['locked'] = True
+            changed = True
+            log_and_notify('warning', (
+                f"🛡️ علامة مائية لاستراتيجية {name}: بلغت ذروة +{p:.2f} ثم تراجعت إلى {total:.2f} "
+                f"(تراجع {p - total:.2f} ≥ {STRAT_HWM_RETRACE_USDT:.2f}). تُقفل هذه الاستراتيجية حتى يوم UTC جديد."
+            ), "RISK_GOVERNOR")
+            send_telegram_message(
+                f"🛡️ *علامة مائية لاستراتيجية {name}:* تراجعت عن ذروتها ({p:.2f} → {total:.2f}) — تُقفل حتى الغد (UTC).")
+    if changed:
+        _risk_gov_persist()
+    logger.debug(
+        f"[حاكم المخاطر] {today}: اليوم {total_global:.2f} | ذروة {float(_risk_gov_state.get('global_peak', 0.0)):.2f} | "
+        f"أقفال: ربح={_risk_gov_state.get('global_profit_locked')} مائية={_risk_gov_state.get('global_hwm_locked')}")
+
+def _risk_gov_unrealized_by_strategy() -> Tuple[float, Dict[str, float]]:
+    """غير المحقق الحالي: عالمي ولكل استراتيجية — بنفس محاسبة register_realized_pnl
+    (حقيقية بكميتها، ورقية بـ STATS_TRADE_SIZE_USDT). الأسعار من كاش WS/Redis."""
+    unrealized_global = 0.0
+    unrealized_by_strat: Dict[str, float] = {}
+    try:
+        with signal_cache_lock:
+            signals = list(open_signals_cache.values())
+        prices: Dict[str, float] = {}
+        if redis_client is not None:
+            try:
+                prices = {k: float(v) for k, v in (redis_client.hgetall(REDIS_PRICES_HASH_NAME) or {}).items()}
+            except Exception:
+                prices = {}
+        if stream_hub is not None and signals:
+            try:
+                hub_live = stream_hub.get_prices([str(s['symbol']).upper() for s in signals])
+                if hub_live:
+                    prices.update({k: float(v) for k, v in hub_live.items()})
+            except Exception:
+                pass
+        for s in signals:
+            entry = float(s.get('entry_price') or 0.0)
+            cur = prices.get(str(s.get('symbol') or '').upper())
+            if entry <= 0 or cur is None:
+                continue
+            qty = float(s.get('original_quantity') or s.get('quantity') or 0.0)
+            if s.get('is_real_trade') and qty > 0:
+                notional = qty * entry
+            else:
+                notional = STATS_TRADE_SIZE_USDT
+            pnl = ((cur - entry) / entry) * notional
+            unrealized_global += pnl
+            name = str(s.get('strategy_name') or 'unknown')
+            unrealized_by_strat[name] = unrealized_by_strat.get(name, 0.0) + pnl
+    except Exception as e:
+        logger.debug(f"[حاكم المخاطر] خطأ حساب غير المحقق: {e}")
+    return unrealized_global, unrealized_by_strat
+
+def risk_governor_step(force: bool = False) -> None:
+    """نبضة التقييم الدورية (كل 30ث من حلقة إدارة الصفقات): يدمج غير المحقق مع
+    المحقق ليحدّث الذُرى والأقفال. خفيفة: بلا شبكة، من الكاش فقط."""
+    global _risk_gov_last_eval
+    if not RISK_GOV_ENABLED:
+        return
+    now = time.time()
+    if not force and (now - _risk_gov_last_eval) < _risk_gov_eval_interval_sec:
+        return
+    _risk_gov_last_eval = now
+    try:
+        _risk_gov_ensure_loaded()
+        unreal_global, unreal_by_strat = _risk_gov_unrealized_by_strategy()
+        with _risk_gov_lock:
+            today = _risk_gov_rollover()
+            total_global = float(_risk_gov_state.get('daily_realized', 0.0)) + unreal_global
+            strat_totals: Dict[str, float] = {}
+            st_map: Dict[str, Any] = _risk_gov_state.setdefault('strat', {})
+            for name, st in st_map.items():
+                strat_totals[name] = float(st.get('realized', 0.0)) + float(unreal_by_strat.get(name, 0.0))
+            # استراتيجية لها غير محقق وليس لها سجل بعد — أضفها (ذروة حية منذ الافتتاح)
+            for name, u in unreal_by_strat.items():
+                if name not in strat_totals:
+                    strat_totals[name] = float(u)
+            _risk_gov_evaluate_locked(total_global, strat_totals)
+    except Exception as e:
+        logger.debug(f"[حاكم المخاطر] خطأ نبضة التقييم: {e}")
+
+def risk_gov_register_close(strategy_name: str, pnl_usdt: float) -> None:
+    """تُستدعى من register_realized_pnl عند كل إغلاق: يُضاف المحقق لسجل الاستراتيجية
+    ويُقيَّم الحاكم فورًا (الإغلاقات هي أحداث الذروة/التراجع الحاسمة)."""
+    if not RISK_GOV_ENABLED:
+        return
+    try:
+        _risk_gov_ensure_loaded()
+        with _risk_gov_lock:
+            today = _risk_gov_rollover()
+            _risk_gov_state['daily_realized'] = float(_risk_gov_state.get('daily_realized', 0.0)) + float(pnl_usdt)
+            st = _risk_gov_state.setdefault('strat', {}).setdefault(
+                str(strategy_name or 'unknown'), {'realized': 0.0, 'peak': 0.0, 'locked': False})
+            st['realized'] = float(st.get('realized', 0.0)) + float(pnl_usdt)
+            total_global = float(_risk_gov_state['daily_realized'])  # عند الإغلاق: غير المحقق 0 لهذه الصفقة
+            strat_totals = {n: float(v.get('realized', 0.0)) for n, v in _risk_gov_state['strat'].items()}
+            _risk_gov_evaluate_locked(total_global, strat_totals)
+    except Exception as e:
+        logger.debug(f"[حاكم المخاطر] خطأ تسجيل إغلاق: {e}")
+
+def risk_gov_global_blocked() -> Tuple[bool, str]:
+    """هل حاكم المخاطر يقفل الدخول العالمي (قفل ربح أو علامة مائية)؟"""
+    if not RISK_GOV_ENABLED:
+        return False, ''
+    with _risk_gov_lock:
+        _risk_gov_rollover()
+        if _risk_gov_state.get('global_profit_locked'):
+            return True, f"قفل الربح اليومي مفعّل (هدف {PROFIT_LOCK_USDT:.2f} USDT بلُغ)"
+        if _risk_gov_state.get('global_hwm_locked'):
+            return True, f"علامة المائية العالمية مفعّلة (ذروة {float(_risk_gov_state.get('global_peak', 0.0)):.2f} USDT تراجعت عنها)"
+    return False, ''
+
+def risk_gov_strategy_blocked(strategy_name: str) -> Tuple[bool, str]:
+    """هل هذه الاستراتيجية مقفولة بعلامتها المائية الخاصة؟"""
+    if not RISK_GOV_ENABLED:
+        return False, ''
+    with _risk_gov_lock:
+        _risk_gov_rollover()
+        st = (_risk_gov_state.get('strat') or {}).get(str(strategy_name or ''))
+        if st and st.get('locked'):
+            return True, (f"علامة مائية الاستراتيجية مفعّلة (ذروتها {float(st.get('peak', 0.0)):.2f} USDT "
+                          f"تراجعت عنها ≥ {STRAT_HWM_RETRACE_USDT:.2f})")
+    return False, ''
+
+def risk_governor_snapshot() -> Dict[str, Any]:
+    """لقطة حالة الحاكم للوحة التحكم و/api/system_status."""
+    with _risk_gov_lock:
+        _risk_gov_rollover()
+        strat_view = {
+            name: {'realized': round(float(st.get('realized', 0.0)), 4),
+                   'peak': round(float(st.get('peak', 0.0)), 4),
+                   'locked': bool(st.get('locked'))}
+            for name, st in (_risk_gov_state.get('strat') or {}).items()
+        }
+        return {
+            'enabled': bool(RISK_GOV_ENABLED),
+            'date': _risk_gov_state.get('date'),
+            'daily_realized': round(float(_risk_gov_state.get('daily_realized', 0.0)), 4),
+            'global_peak': round(float(_risk_gov_state.get('global_peak', 0.0)), 4),
+            'profit_locked': bool(_risk_gov_state.get('global_profit_locked')),
+            'hwm_locked': bool(_risk_gov_state.get('global_hwm_locked')),
+            'profit_lock_usdt': PROFIT_LOCK_USDT,
+            'hwm_floor_usdt': HWM_PEAK_FLOOR_USDT,
+            'hwm_retrace_usdt': HWM_RETRACE_USDT,
+            'strategies': strat_view,
+            'time_limits': dict(STRATEGY_TIME_LIMIT_MIN),
+            'time_limit_min_profit_pct': TIME_LIMIT_MIN_PROFIT_PCT,
+        }
 
 # --- [V9.26.0] مدير الحماية والانضباط — اقتباس مباشر من فلسفة Freqtrade (plugins/protections/) ---
 # النموذج المرجعي في freqtrade: كل حماية تفحص الصفقات المغلقة في نافذة زمنية، وعند تجاوز الحد
@@ -6411,6 +6778,14 @@ def get_active_protections_snapshot() -> Dict[str, Any]:
             'cooldown': f"{PROTECTION_COOLDOWN_MIN}د لكل زوج بعد أي إغلاق",
             'max_sl_distance_pct': MAX_SL_DISTANCE_PCT,
             'stale_exit': f"> {STALE_TRADE_HOURS}س بربح < {STALE_MIN_PROFIT_PCT}% → إغلاق",
+            # [V9.31.0] حاكم المخاطر (اقتباس Hummingbot): أقفال اليوم + الحاجز الزمني لكل استراتيجية
+            'risk_governor': {
+                'profit_lock': f"ربح اليوم ≥ +{PROFIT_LOCK_USDT:.2f}$ → إيقاف فتح صفقات جديدة حتى يوم UTC جديد",
+                'hwm_global': f"ذروة ≥ +{HWM_PEAK_FLOOR_USDT:.2f}$ ثم تراجع ≥ {HWM_RETRACE_USDT:.2f}$ → إيقاف الفتح حتى يوم جديد",
+                'hwm_strategy': f"ذروة استراتيجية ≥ +{STRAT_HWM_PEAK_FLOOR_USDT:.2f}$ ثم تراجع ≥ {STRAT_HWM_RETRACE_USDT:.2f}$ → قفل الاستراتيجية",
+                'time_limit': 'حسب الاستراتيجية: ' + ', '.join(
+                    f"{k.split('_')[0]}:{v}د" for k, v in STRATEGY_TIME_LIMIT_MIN.items() if v > 0) + f" (بربح < {TIME_LIMIT_MIN_PROFIT_PCT}% → إغلاق)",
+            },
         },
     }
 
@@ -6465,6 +6840,13 @@ def trade_management_loop():
                 except Exception as rec_err:
                     logger.warning(f"⚠️ [مصالحة الكاش] فشل محاولة المواءمة: {rec_err}")
 
+            # [V9.31.0] نبضة حاكم المخاطر كل 30ث: تحديث الذروة بالأرباح غير المحققة وتقييم الأقفال
+            # (الإغلاقات تُقيَّم فورًا من register_realized_pnl — هذه النبضة لتتبع حي بين الإغلاقات)
+            try:
+                risk_governor_step()
+            except Exception as rg_step_err:
+                logger.debug(f"[حاكم المخاطر] خطأ النبضة الدورية: {rg_step_err}")
+
             if not has_signals or not redis_client:
                 time.sleep(5)  # النوم خارج القفل الآن
                 continue
@@ -6506,6 +6888,19 @@ def trade_management_loop():
                             logger.info(f"⌛ [{symbol}] خروج زمني: العمر {_age_hours:.1f}س بربح {_cur_profit_pct:.2f}% (< {STALE_MIN_PROFIT_PCT}%)")
                             close_signal(signal_id, current_price, 'stale_time_exit')
                             continue
+                        # [V9.31.0] الحاجز الزمني لكل استراتيجية (Hummingbot TripleBarrier time_limit):
+                        # صفقة الاستراتيجيات الأصليات تجاوزت عمرها المحدد بلا ربح يُذكر → إغلاق سوقي.
+                        # صفقات FT معزولة (محرك ROI الزمني هو حاجزها الزمني) وصفقة ربحت فوق العتبة
+                        # أو انطلقت رحلتها الجزئية تُترك لحواجزها الطبيعية (تريلينغ/وقف متحرك)
+                        _tl_min = STRATEGY_TIME_LIMIT_MIN.get(str(signal.get('strategy_name') or '')) if RISK_GOV_ENABLED else None
+                        if _tl_min and float(_tl_min) > 0:
+                            _js_state = signal.get('journey_state') or {}
+                            if (not _js_state.get('partial_exit_done')
+                                    and (_age_hours * 60.0) >= float(_tl_min)
+                                    and _cur_profit_pct < TIME_LIMIT_MIN_PROFIT_PCT):
+                                logger.info(f"⏱️ [{symbol}] حاجز زمني للاستراتيجية {signal.get('strategy_name')}: العمر {(_age_hours * 60.0):.0f}د ≥ {_tl_min}د بربح {_cur_profit_pct:.2f}%")
+                                close_signal(signal_id, current_price, 'strategy_time_limit')
+                                continue
                 except Exception as stale_err:
                     logger.debug(f"[مدير الصفقات] فحص العمر تجاهل: {stale_err}")
 
@@ -7221,6 +7616,14 @@ def main_loop_enhanced():
                 time.sleep(300)
                 continue
 
+            # [V9.31.0] حاكم المخاطر (اقتباس Hummingbot): قفل الربح + علامة المائية العالمية
+            # — نفس سلوك القاطع اليومي: بلا فتح صفقات جديدة، والمسح/الإدارة يستمران حتى نهاية اليوم UTC
+            _rg_block, _rg_reason = risk_gov_global_blocked()
+            if _rg_block:
+                logger.warning(f"🔒 [الحلقة الرئيسية] حاكم المخاطر يمنع الدخول ({_rg_reason}) — انتظار 5 دقائق...")
+                time.sleep(300)
+                continue
+
             # [V9.26.0] بوابة الحمايات الشاملة — نمط Freqtrade (StoplossGuard/MaxDrawdown):
             # سلسلة وقفات أو تراكم خاسر يتجاوز الحد = تجميد الدخول مؤقتًا بدل الاستمرار
             # في نفس الظروف الخاسرة (الدليل الحي: 16 وقفة خلال 13 ساعة بلا توقف)
@@ -7296,6 +7699,13 @@ def main_loop_enhanced():
             # [V9.25.0] الحلقة استراتيجيةً: كل استراتيجية تفحص مرشحيها العشرة حصرًا.
             # بوابات مستوى الاستراتيجية (حالة السوق + ثبات الصاعد) قبل جلب أي شموع.
             for key, check_func, name in strategies_to_check:
+                # [V9.31.0] علامة مائية الاستراتيجية (Hummingbot HWM لكل متحكم): استراتيجية
+                # بلغت ذروة ربح اليوم ثم رجعت خلفها بقدر الحد تُقفل — لا فحص ولا فتح لها حتى يوم جديد
+                if RISK_GOV_ENABLED:
+                    _sg_block, _sg_reason = risk_gov_strategy_blocked(name)
+                    if _sg_block:
+                        _count_strategy_filter_reject(name, _sg_reason)
+                        continue
                 # [V9.24.0] خريطة السوق العام (حتمية): في الهبوط الحاد لا زخم ولا اختراق
                 # صاعد ضد الاتجاه — فقط قاع-صيد الارتداد واختراق الدعوم.
                 allowed_keys = MARKET_STATE_STRATEGY_ALLOW.get(overall_market_regime)
