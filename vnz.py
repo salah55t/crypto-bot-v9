@@ -22,7 +22,7 @@ from binance.client import Client
 from binance.exceptions import BinanceAPIException
 from flask import Flask, jsonify, render_template_string, request, Response
 from flask_cors import CORS
-from threading import Thread, Lock, current_thread, enumerate as threading_enumerate
+from threading import Thread, Lock, RLock, current_thread, enumerate as threading_enumerate
 from datetime import datetime, timezone, timedelta
 from decouple import config
 from typing import List, Dict, Optional, Any, Set, Tuple, Deque
@@ -49,7 +49,7 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-APP_VERSION: str = 'V9.29.0'  # [V9.21.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
+APP_VERSION: str = 'V9.30.0'  # [V9.21.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
 logger = logging.getLogger(f'CryptoBot{APP_VERSION}')
 
 # زمن إقلاع العملية لحساب مدة التشغيل في لوحة التحكم
@@ -566,6 +566,12 @@ strategy_nominees_updated_at: Optional[str] = None
 _static_fallback_symbols: List[str] = []
 open_signals_cache: Dict[str, Dict] = {}
 signal_cache_lock = Lock()
+# [V9.30.0] قفل اتصال قاعدة البيانات المشترك: `conn` كائن psycopg2 واحد تستخدمه كل
+# الخيوط (مدير الصفقات، الحلقة الرئيسية، نقاط اللوحة، محرك الأدلة...). psycopg2 لا
+# يتحمّل مشاركة الاتصال بلا تسلسل: rollback من خيط (مسار خطأ في log_and_notify مثلًا)
+# كان يُلغي UPDATE إغلاق صفقة نفّذه خيط آخر قبل commitه — فيُرسل تلغرام "أُغلقت"
+# وتبقى الصف مفتوحة في DB وتعود للوحة عند إعادة التشغيل. تسلسل الكتابة يحسم هذا.
+db_conn_lock = RLock()
 # [إصلاح V9.12.0] حارس منع الإغلاق المزدوج: بعد نقل العمل الشبكي خارج القفل،
 # قد يستدعي خيطان نفس الصفقة (حلقة الإدارة + إغلاق يدوي) فيبيع مرتين —
 # هذا المجموعة يضمن عملية إغلاق واحدة فقط لكل signal_id
@@ -2251,7 +2257,8 @@ def init_db(retries: int = 5, delay: int = 5) -> None:
         try:
             conn = psycopg2.connect(db_url_to_use, connect_timeout=15, cursor_factory=RealDictCursor)
             conn.autocommit = False
-            with conn.cursor() as cur:
+            # [V9.30.0] التنفيذ والإثبات داخل قفل DB المشترك
+            with db_conn_lock, conn.cursor() as cur:
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS signals (
                         id SERIAL PRIMARY KEY, symbol TEXT NOT NULL, entry_price DOUBLE PRECISION NOT NULL,
@@ -2272,12 +2279,13 @@ def init_db(retries: int = 5, delay: int = 5) -> None:
                         type TEXT NOT NULL, message TEXT NOT NULL, is_read BOOLEAN DEFAULT FALSE
                     );
                 """)
-            conn.commit()
+                conn.commit()
             logger.info("✅ [قاعدة البيانات] الاتصال وتحديث المخطط بنجاح.")
             return
         except Exception as e:
             logger.error(f"❌ [قاعدة البيانات] خطأ أثناء التهيئة (محاولة {attempt + 1}/{retries}): {e}")
-            if conn: conn.rollback()
+            if conn:
+                with db_conn_lock: conn.rollback()
             if attempt < retries - 1: time.sleep(delay)
             else: logger.critical("❌ [قاعدة البيانات] فشل الاتصال.")
 
@@ -2288,7 +2296,7 @@ def check_db_connection() -> bool:
         init_db()
     try:
         if conn and conn.closed == 0:
-            with conn.cursor() as cur: cur.execute("SELECT 1;")
+            with db_conn_lock, conn.cursor() as cur: cur.execute("SELECT 1;")
             return True
         return False
     except (OperationalError, InterfaceError) as e:
@@ -2307,11 +2315,14 @@ def log_and_notify(level: str, message: str, notification_type: str):
     try:
         new_notification = {"timestamp": datetime.now(timezone.utc).isoformat(), "type": notification_type, "message": message}
         with notifications_lock: notifications_cache.appendleft(new_notification)
-        with conn.cursor() as cur: cur.execute("INSERT INTO notifications (type, message) VALUES (%s, %s);", (notification_type, message))
-        conn.commit()
+        # [V9.30.0] التنفيذ والإثبات داخل قفل DB المشترك
+        with db_conn_lock, conn.cursor() as cur:
+            cur.execute("INSERT INTO notifications (type, message) VALUES (%s, %s);", (notification_type, message))
+            conn.commit()
     except Exception as e:
         logger.error(f"❌ [قاعدة البيانات] فشل حفظ الإشعار: {e}")
-        if conn: conn.rollback()
+        if conn:
+            with db_conn_lock: conn.rollback()
 
 def log_rejection(symbol: str, reason_key: str, details: Optional[Dict] = None):
     if _evidence_replaying:
@@ -3065,7 +3076,7 @@ def load_open_signals_to_cache(retries: int = 4, delay: int = 10):
             logger.warning(f"[تحميل] قاعدة البيانات غير جاهزة (محاولة {attempt}/{retries})...")
             time.sleep(delay); continue
         try:
-            with conn.cursor() as cur:
+            with db_conn_lock, conn.cursor() as cur:
                 cur.execute("SELECT * FROM signals WHERE status IN ('open', 'updated');")
                 open_signals = cur.fetchall()
                 with signal_cache_lock:
@@ -3080,7 +3091,7 @@ def load_open_signals_to_cache(retries: int = 4, delay: int = 10):
 def load_notifications_to_cache():
     if not check_db_connection() or not conn: return
     try:
-        with conn.cursor() as cur:
+        with db_conn_lock, conn.cursor() as cur:
             cur.execute("SELECT * FROM notifications ORDER BY timestamp DESC LIMIT 50;")
             recent = cur.fetchall()
             with notifications_lock:
@@ -3091,6 +3102,50 @@ def load_notifications_to_cache():
             logger.info(f"✅ [تحميل] تم تحميل {len(notifications_cache)} إشعار إلى الذاكرة المؤقتة.")
     except Exception as e:
         logger.error(f"❌ [تحميل] فشل تحميل الإشعارات: {e}")
+
+# --- [V9.30.0] حمايات اتساق الصفقات: حارس الكتابة + مصالحة ثنائية الاتجاه ---
+def _cache_touch_open(symbol: str, signal_id: int, signal: Dict) -> bool:
+    """كتابة قاموس صفقة إلى كاش المفتوحة فقط إذا كانت الصفقة ما تزال موجودة فيه
+    (نفس المعرف). لماذا: حلقة الإدارة تحمل قاموسًا قديمًا (snapshot) — إذا أُغلقت
+    الصفقة أثناء الدورة (SL/TP/يدوي) يحذف close_signal مفتاحها من الكاش، وأي
+    كتابة لاحقة للقاموس القديم (status='open') تُحيي المغلقة في اللوحة — الجذر
+    التاريخي لظهور الصفقات المغلقة بعد أن يقول تلغرام إنها أُغلقت."""
+    with signal_cache_lock:
+        existing = open_signals_cache.get(symbol)
+        if existing is None or existing.get('id') != signal_id:
+            return False
+        open_signals_cache[symbol] = signal
+        return True
+
+def _reconcile_cache_with_db():
+    """[V9.30.0] مصالحة ثنائية الاتجاه بين كاش الصفقات وقاعدة البيانات كل 60ث —
+    شبكة الأمان النهائية ضد أي سباق (سقوط UPDATE بـ rollback خيط آخر، إحياء
+    قاموس قديم، سقوط عملية أثناء إقلاع بارد):
+    الاتجاه 1: صفقة في الكاش مغلقة في DB → تُحذف من الكاش فورًا
+      (تنتهي ظهورها في اللوحة خلال ≤60ث مهما كان السبب)
+    الاتجاه 2: صفقة مفتوحة في DB غائبة عن الكاش → تُحمّل
+      (لا صفقات يتيمة بلا وقف خسارة ولا أهداف — استعلام واحد عند الحاجة فقط)
+    خفيفة: SELECT واحد + عمليات ذاكرة تحت القفل لحظة واحدة."""
+    if not check_db_connection() or not conn:
+        return
+    try:
+        with db_conn_lock, conn.cursor() as cur:
+            cur.execute("SELECT id, symbol, status FROM signals WHERE status IN ('open', 'updated');")
+            db_open_rows = cur.fetchall()
+        db_open = {row['symbol']: row['id'] for row in db_open_rows}
+        with signal_cache_lock:
+            cache_syms = set(open_signals_cache.keys())
+            stale = [s for s in cache_syms if s not in db_open]
+            for s in stale:
+                removed = open_signals_cache.pop(s, None)
+                if removed is not None:
+                    logger.info(f"🧹 [مصالحة] إزالة {s} (id={removed.get('id')}) من الكاش — مغلق في قاعدة البيانات")
+            missing = [s for s in db_open if s not in cache_syms]
+        if missing:
+            logger.info(f"🔄 [مصالحة] صفقات مفتوحة في DB غائبة عن الكاش: {missing} — إعادة تحميل")
+            load_open_signals_to_cache(retries=1, delay=0)
+    except Exception as rec_err:
+        logger.warning(f"⚠️ [مصالحة الكاش↔DB] فشل: {rec_err}")
 
 # ---------------------- منطق التداول والفلاتر ----------------------
 
@@ -4367,17 +4422,18 @@ def ft_exit_engine_step(signal: Dict[str, Any], signal_id: int, symbol: str,
     peak_old = float(signal.get('current_peak_price') or entry)
     if peak > peak_old + 1e-12 or stop_changed:
         signal['current_peak_price'] = peak
-        with signal_cache_lock:
-            open_signals_cache[symbol] = signal
+        # [V9.30.0] حارس الكتابة: صفقة أُغلقت للتو (من خيط آخر) لا تُعاد إلى الكاش
+        if not _cache_touch_open(symbol, signal_id, signal):
+            return False
         try:
             if check_db_connection():
-                with conn.cursor() as cur:
+                with db_conn_lock, conn.cursor() as cur:
                     cur.execute("UPDATE signals SET current_peak_price = %s, stop_loss = %s WHERE id = %s",
                                 (float(peak), float(signal['stop_loss']), signal_id))
-                conn.commit()
+                    conn.commit()
         except Exception as db_err:
             logger.error(f"خطأ في قاعدة البيانات عند تحديث FT peak/stop لـ {symbol}: {db_err}")
-            conn.rollback()
+            with db_conn_lock: conn.rollback()
     return False
 
 
@@ -4514,12 +4570,26 @@ def close_signal(signal_id: int, closing_price: float, reason: str) -> bool:
         if not check_db_connection() or not conn: return False
 
         try:
-            with conn.cursor() as cur:
+            # [V9.30.0] التنفيذ والإثبات داخل قفل DB المشترك: لا خيط يستطيع
+            # rollback/commit بينهما (الجذر التاريخي لعودة المغلقة إلى DB ثم اللوحة)
+            with db_conn_lock, conn.cursor() as cur:
                 cur.execute("""
                     UPDATE signals SET status = 'closed', closing_price = %s, closed_at = NOW(),
                     profit_percentage = %s, closing_reason = %s WHERE id = %s;
                 """, (closing_price, profit_percentage, reason, signal_id))
-            conn.commit()
+                conn.commit()
+            # [V9.30.0] تحقق بعد الإثبات (شبكة أمان أخيرة): هل الصف مغلقة فعلًا؟
+            with db_conn_lock, conn.cursor() as cur:
+                cur.execute("SELECT status FROM signals WHERE id = %s", (signal_id,))
+                _ver_row = cur.fetchone()
+            if _ver_row and _ver_row.get('status') != 'closed':
+                logger.critical(f"🚨 [إغلاق] الصف {signal_id} ليس مغلقًا بعد الإثبات (الحالة: {_ver_row.get('status')}) — إعادة التنفيذ")
+                with db_conn_lock, conn.cursor() as cur:
+                    cur.execute("""
+                        UPDATE signals SET status = 'closed', closing_price = %s, closed_at = NOW(),
+                        profit_percentage = %s, closing_reason = %s WHERE id = %s;
+                    """, (closing_price, profit_percentage, reason, signal_id))
+                    conn.commit()
 
             # حذف نهائي من الكاش — تحت القفل لحظة واحدة
             with signal_cache_lock:
@@ -4562,7 +4632,9 @@ def close_signal(signal_id: int, closing_price: float, reason: str) -> bool:
             send_telegram_message(telegram_message)
             return True
         except Exception as e:
-            logger.error(f"❌ [قاعدة البيانات] فشل تحديث الصفقة المغلقة: {e}"); conn.rollback(); return False
+            logger.error(f"❌ [قاعدة البيانات] فشل تحديث الصفقة المغلقة: {e}")
+            with db_conn_lock: conn.rollback()
+            return False
     finally:
         # تحرير حارس الازدواجية في كل الحالات (نجاح/فشل/استثناء)
         with signal_cache_lock:
@@ -4580,7 +4652,7 @@ def _symbol_recently_closed(symbol: str) -> bool:
         return True
     try:
         if check_db_connection() and conn:
-            with conn.cursor() as cur:
+            with db_conn_lock, conn.cursor() as cur:
                 cur.execute(
                     "SELECT EXTRACT(EPOCH FROM (NOW() - closed_at)) AS sec "
                     "FROM signals WHERE symbol = %s AND status = 'closed' AND closed_at IS NOT NULL "
@@ -4595,7 +4667,7 @@ def _symbol_recently_closed(symbol: str) -> bool:
 def insert_signal_into_db(signal_data: Dict) -> Optional[Dict]:
     if not check_db_connection() or not conn: return None
     try:
-        with conn.cursor() as cur:
+        with db_conn_lock, conn.cursor() as cur:
             entry_price = float(signal_data['entry_price'])
             target_price = float(signal_data['target_price'])
             stop_loss = float(signal_data['stop_loss'])
@@ -4648,7 +4720,9 @@ def insert_signal_into_db(signal_data: Dict) -> Optional[Dict]:
             send_telegram_message(telegram_message)
             return dict(saved_signal)
     except Exception as e:
-        logger.error(f"❌ [قاعدة البيانات] فشل إدراج الإشارة: {e}", exc_info=True); conn.rollback(); return None
+        logger.error(f"❌ [قاعدة البيانات] فشل إدراج الإشارة: {e}", exc_info=True)
+        with db_conn_lock: conn.rollback()
+        return None
 
 
 # ---------------------- دوال النظام الأساسية ----------------------
@@ -5724,7 +5798,7 @@ def get_stats():
     if not check_db_connection() or not conn:
         return jsonify({"error": "DB connection failed"}), 500
     try:
-        with conn.cursor() as cur:
+        with db_conn_lock, conn.cursor() as cur:
             cur.execute("SELECT profit_percentage, is_real_trade, original_quantity, entry_price FROM signals WHERE status = 'closed';")
             closed_trades = cur.fetchall()
 
@@ -6079,10 +6153,10 @@ def update_target_price(signal_id):
 
             signal_to_update['target_price'] = new_target_price
 
-        # العمل الشبكي وقاعدة البيانات — خارج القفل تمامًا
-        with conn.cursor() as cur:
+        # العمل الشبكي وقاعدة البيانات — خارج القفل تمامًا (داخل قفل DB المشترك V9.30.0)
+        with db_conn_lock, conn.cursor() as cur:
             cur.execute("UPDATE signals SET target_price = %s WHERE id = %s", (new_target_price, signal_id))
-        conn.commit()
+            conn.commit()
 
         log_message = f"🖐️ [{symbol}] تم تحديث الهدف يدوياً من {old_target:.4f} إلى {new_target_price:.4f}"
         log_and_notify('warning', log_message, "MANUAL_TP_UPDATE")
@@ -6094,7 +6168,8 @@ def update_target_price(signal_id):
         return jsonify({"success": False, "message": "Invalid target price format"}), 400
     except Exception as e:
         logger.error(f"❌ [API تحديث الهدف] فشل تحديث الهدف لـ ID {signal_id}: {e}", exc_info=True)
-        if conn: conn.rollback()
+        if conn:
+            with db_conn_lock: conn.rollback()
         return jsonify({"success": False, "message": "An internal error occurred"}), 500
 
 
@@ -6377,18 +6452,21 @@ def trade_management_loop():
                 has_signals = bool(open_signals_cache)
                 signals_to_check = list(open_signals_cache.values()) if has_signals else []
 
+            # [V9.30.0] مصالحة دورية ثنائية الاتجاه كل 60ث — شبكة الأمان النهائية:
+            # 1) صفقة في الكاش مغلقة في DB → تُحذف من الكاش (تنتهي ظهورها في اللوحة)
+            # 2) صفقة مفتوحة في DB غائبة عن الكاش → تُحمّل (لا صفقات يتيمة بلا إدارة)
+            if (time.time() - _last_cache_reconcile) >= 60:
+                _last_cache_reconcile = time.time()
+                try:
+                    _reconcile_cache_with_db()
+                    with signal_cache_lock:
+                        has_signals = bool(open_signals_cache)
+                        signals_to_check = list(open_signals_cache.values()) if has_signals else []
+                except Exception as rec_err:
+                    logger.warning(f"⚠️ [مصالحة الكاش] فشل محاولة المواءمة: {rec_err}")
+
             if not has_signals or not redis_client:
                 time.sleep(5)  # النوم خارج القفل الآن
-                # [V9.19.1] مصالحة دورية للكاش الفارغ: إقلاع بارد فشل فيه التحميل
-                # الأولي (قاعدة باردة + حظر REST) يترك صفقات مفتوحة يتيمة في قاعدة
-                # البيانات — غير مرئية في اللوحة وغير مُدارة. كل 60ث محاولة خفيفة
-                # (استعلام واحد) حتى يظهر الكاش أو يثبت أن لا صفقات فعلًا.
-                if not has_signals and redis_client and (time.time() - _last_cache_reconcile) >= 60:
-                    _last_cache_reconcile = time.time()
-                    try:
-                        load_open_signals_to_cache(retries=1, delay=0)
-                    except Exception as rec_err:
-                        logger.warning(f"⚠️ [مصالحة الكاش] فشل محاولة المواءمة: {rec_err}")
                 continue
 
             current_prices = redis_client.hgetall(REDIS_PRICES_HASH_NAME)
@@ -6534,22 +6612,30 @@ def trade_management_loop():
                                 
                                 logger.info(f"🎯 [{symbol}] تمديد الرحلة! الهدف التالي: {next_tp:.4f}, وقف الخسارة الجديد: {new_sl:.4f}")
                                 
-                                with signal_cache_lock: open_signals_cache[symbol] = signal
+                                # [V9.30.0] كتابة مشروطة: لا إحياء لصفقة أُغلقت من خيط آخر
+                                if not _cache_touch_open(symbol, signal_id, signal):
+                                    continue
                                 try:
                                     if check_db_connection():
-                                        with conn.cursor() as cur:
+                                        with db_conn_lock, conn.cursor() as cur:
                                             cur.execute("UPDATE signals SET journey_state = %s, target_price = %s, stop_loss = %s, quantity = %s WHERE id = %s",
                                                         (json.dumps(journey_state, cls=NpEncoder), float(signal['target_price']), float(signal['stop_loss']), float(signal.get('quantity', 0)), signal_id))
-                                        conn.commit()
+                                            conn.commit()
                                 except Exception as e:
-                                    logger.error(f"خطأ في قاعدة البيانات عند تحديث رحلة الصفقة لـ {symbol}: {e}"); conn.rollback()
+                                    logger.error(f"خطأ في قاعدة البيانات عند تحديث رحلة الصفقة لـ {symbol}: {e}")
+                                    with db_conn_lock: conn.rollback()
                                 continue
                                 
                         logger.info(f"⏹️ [{symbol}] تحليل المسار لا يدعم التمديد أو فشل جلب البيانات. إغلاق الصفقة.")
                         journey_state['is_complete'] = True
                         close_signal(signal_id, current_price, 'journey_completed')
+                        # [V9.30.0] إصلاح الجذر: بلا continue كان التنفيذ ينسدل إلى كتلة
+                        # الذروة فيعيد القاموس القديم (status='open') إلى الكاش بعد أن حذفه
+                        # close_signal — فتبقى المغلقة ظاهرة في اللوحة وتُغلق مرتين!
+                        continue
                     else:
                         close_signal(signal_id, current_price, 'take_profit')
+                        continue
                 
                 peak_price = float(signal.get('current_peak_price', entry))
                 new_peak = max(peak_price, current_price)
@@ -6570,14 +6656,17 @@ def trade_management_loop():
                                 if new_trailing_stop_price > sl:
                                     signal['stop_loss'] = new_trailing_stop_price
 
-                    with signal_cache_lock: open_signals_cache[symbol] = signal
+                    # [V9.30.0] كتابة مشروطة: لا إحياء لصفقة أُغلقت من خيط آخر
+                    if not _cache_touch_open(symbol, signal_id, signal):
+                        continue
                     try:
                         if check_db_connection():
-                            with conn.cursor() as cur:
+                            with db_conn_lock, conn.cursor() as cur:
                                 cur.execute("UPDATE signals SET current_peak_price = %s, stop_loss = %s WHERE id = %s", (float(new_peak), float(signal['stop_loss']), signal_id))
-                            conn.commit()
+                                conn.commit()
                     except Exception as e:
-                        logger.error(f"خطأ في قاعدة البيانات عند تحديث سعر الذروة/الوقف لـ {symbol}: {e}"); conn.rollback()
+                        logger.error(f"خطأ في قاعدة البيانات عند تحديث سعر الذروة/الوقف لـ {symbol}: {e}")
+                        with db_conn_lock: conn.rollback()
             time.sleep(2)
         except Exception as e:
             logger.error(f"❌ [مدير الصفقات] خطأ في حلقة الإدارة: {e}", exc_info=True)
@@ -7547,6 +7636,30 @@ def price_update_loop():
             time.sleep(max(1.0, PRICE_UPDATE_INTERVAL_SEC))
         except Exception as e: logger.error(f"خطأ في حلقة تحديث الأسعار: {e}"); time.sleep(10)
 
+# --- [V9.30.0] نبضة البقاء الذاتية: لا نوم على خطة Render المجانية ---
+RENDER_KEEP_ALIVE_SEC: int = int(os.environ.get('RENDER_KEEP_ALIVE_SEC', '540'))
+_KEEP_ALIVE_URL: str = (os.environ.get('RENDER_EXTERNAL_URL') or '').rstrip('/')
+
+def keep_alive_loop():
+    """[V9.30.0] Render المجاني يُنم الخدمة بعد 15 دقيقة بلا طلبات واردة — وكان
+    هذا يجعل البوت غائبًا لساعات (فجوات 2.4–7 ساعات موثقة في سجل الإشعارات):
+    لا مراقبة للصفقات ولا وقف خسارة ولا أخذ ربح أثناء النوم. الكرون الخارجي
+    للمستخدم لم يكِ (فجواته أكبر من نافذة الخمول). الحل: نبضة ذاتية داخل
+    العملية كل 9 دقائق إلى /health (معفاة من المصادقة وخفيفة بلا أي نداء
+    Binance) تُبقي عداد الخمول مصفّرًا ما دامت العملية حية — بلا اعتماد على
+    أي خدمة خارجية، وتعمل حتى أثناء حظر Binance وانتظار التهيئة."""
+    if not _KEEP_ALIVE_URL:
+        logger.info("💤 [البقاء مستيقظًا] RENDER_EXTERNAL_URL غير متوفر — النبضة الذاتية معطلة (بيئة محلية؟)")
+        return
+    logger.info(f"💓 [البقاء مستيقظًا] نبضة ذاتية كل {RENDER_KEEP_ALIVE_SEC}ث إلى {_KEEP_ALIVE_URL}/health")
+    while True:
+        try:
+            r = requests.get(f"{_KEEP_ALIVE_URL}/health", timeout=15)
+            logger.debug(f"💓 نبضة: HTTP {r.status_code}")
+        except Exception as ping_err:
+            logger.debug(f"💓 نبضة تعذر إرسالها (ستعاد): {ping_err}")
+        time.sleep(max(60.0, float(RENDER_KEEP_ALIVE_SEC)))
+
 def initialize_bot_services():
     global client, validated_symbols_to_scan
     logger.info("🤖 [خدمات البوت] بدء التهيئة...")
@@ -7642,6 +7755,9 @@ if __name__ == "__main__":
     except Exception:
         pass
     logger.info(f"🚀 إطلاق بوت التداول ولوحة التحكم ({APP_VERSION} - Neon Security) 🚀")
+    # [V9.30.0] أول خيط على الإطلاق: النبضة الذاتية تبدأ حتى قبل تهيئة Binance
+    # — لتبقى الخدمة مستيقظة على Render حتى أثناء انتظار التهيئة أو الحظر الطويل
+    Thread(target=keep_alive_loop, daemon=True).start()
     Thread(target=initialize_bot_services, daemon=True).start()
     port = int(os.environ.get('PORT', 10000))
     host = "0.0.0.0"
