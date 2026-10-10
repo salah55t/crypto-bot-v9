@@ -49,7 +49,7 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-APP_VERSION: str = 'V9.34.0'  # [V9.21.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
+APP_VERSION: str = 'V9.35.0'  # [V9.21.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
 logger = logging.getLogger(f'CryptoBot{APP_VERSION}')
 
 # زمن إقلاع العملية لحساب مدة التشغيل في لوحة التحكم
@@ -4242,6 +4242,166 @@ FT_REVERSAL_DISPLAY_NAMES: frozenset = frozenset(
     _nm.upper() for _nm, _spec in FREQTRADE_STRATEGIES.items() if _spec.get('key') in FT_REVERSAL_KEYS)
 
 
+# ═══════════════ [V9.35.0] بوابة جودة الدخول لكل استراتيجية (Entry Quality Gate — EQG) ═══════════════
+# نقش مباشر لنتيجة تحليل القمم الحي (2026-10-10): 7 من 13 صفقة FT قممها الحقيقي < 0.62%
+# = منطقة الرسوم (لا صافي ربح مهما بذل محرك الخروج) — والمشكلة في الدخول لا في الخروج
+# (فرق الخروج-القمة متوسط 0.30% فقط، ومحاكاة ترك الأرباح تجري أسوأ). الفكرة المرجعية
+# بطلب المستخدم ("اقتباس افكار من المشاريع السابقة") من مشروعين مرجعيين مستنسخين:
+#   • OctoBot DipAnalyser (dip_analyser_strategy.py): فصل "البوابة الثنائية" عن "الوزن
+#     المتدرج" — لا تُنشر درجة دخول أصلًا ما لم يتحقق الشرط الثنائي أولًا.
+#   • OctoBot TechnicalAnalysisStrategyEvaluator (mixed_strategies.py): المتوسط الموزون
+#     متعدد المدخلات بأوزان معلنة — كل مكوّن من درجة الدخول يُوثق ولا يُخفى.
+#   • Hummingbot (supertrend_v1 + activation_bounds في position_executor): لا مطاردة —
+#     الدخول قرب مستوى الزناد فقط، وانحراف السعر كثيرًا عن المستوى يلغي الفرصة.
+#   • Hummingbot EMASkipPump روحًا: لا شراء في شمعة مضخة رأسية (تفصيلها في G3).
+# البوابات الثنائية (أي فشل = رفض موثق بالإحصاء):
+#   G1 أرضية المدى المتوقع: متوسط [max(high[i+1..i+8]) − close[i]] على آخر 30 شمعة قابلة
+#      للقياس — نفس منهجية إعادة بناء القمم لكن للخلف (صفر نظرة مستقبلية على الشمعة الحية).
+#      المعايرة على 26 رمزًا حيًا (scripts/eqg_calibration.py): مئين 10 للأحياء 0.45-0.94%،
+#      الميتون (XAUT/BTC/BNB/SOL) ≤ 0.36% — الأرضيات أدناه تقتل منطقة الرسوم حصرًا.
+#   G2 ضد الملاحقة: التوجهية (close−EMA21) ≤ max_ext_atr×ATR، والعكسية: الارتداد
+#      (close−قاع_7ش) ≤ max_bounce_atr×ATR — الارتداد فَرِشّ ولم يُستهلك (استكمال V9.34).
+#   G3 ضد المضخة: جسم شمعة الدخول ≤ max_body_atr×ATR.
+# ثم الدرجة المركبة EQS (0-100): 40×مطابقة الزوج + 30×وفرة المدى + 30×تداخل تأكيدات
+#   (حجم>متوسط 20، كفاءة ER≥0.20، شمعة الدخول صاعدة) — وأدنى درجة لكل استراتيجية.
+# تعطيل كامل: EQG_ENABLED=false. كل عتبة في الملف أدناه قابلة للتعديل لكل استراتيجية.
+ENTRY_QUALITY_GATE_ENABLED: bool = config('EQG_ENABLED', default=True, cast=bool)
+EQG_EXC_HORIZON: int = int(os.environ.get('EQG_EXC_HORIZON', '8'))    # أفق القمة المتوقعة (8×15م = ساعتان)
+EQG_EXC_WINDOW: int = int(os.environ.get('EQG_EXC_WINDOW', '30'))     # نافذة المتوسط الخلفي
+
+ENTRY_QUALITY_PROFILES: Dict[str, Dict[str, Optional[float]]] = {
+    #                     min_excursion_pct أرضية المدى المتوقع (فوق مئين 10 للأحياء)
+    #                     max_ext_atr سقف الملاحقة فوق EMA21 — للعائلات التوجهية/الاختراقية
+    #                     max_bounce_atr سقف استهلاك الارتداد عن قاع 7 شموع — للعائلة العكسية
+    #                     max_body_atr سقف جسم شمعة الدخول بوحدات ATR (EMASkipPump للجميع)
+    #                     min_eqs أدنى درجة جودة مركبة 0-100
+    'MACD_EMA_Crossover':         {'min_excursion_pct': 0.60, 'max_ext_atr': 2.5, 'max_bounce_atr': None, 'max_body_atr': 2.0, 'min_eqs': 55},
+    'EMA_RSI_Cross':              {'min_excursion_pct': 0.60, 'max_ext_atr': 2.5, 'max_bounce_atr': None, 'max_body_atr': 2.0, 'min_eqs': 55},
+    'Pullback_MACD':              {'min_excursion_pct': 0.60, 'max_ext_atr': 2.0, 'max_bounce_atr': None, 'max_body_atr': 2.0, 'min_eqs': 55},
+    'Bullish_Momentum':           {'min_excursion_pct': 0.70, 'max_ext_atr': 2.5, 'max_bounce_atr': None, 'max_body_atr': 2.5, 'min_eqs': 55},
+    'BB_Stoch_Reversal_Enhanced': {'min_excursion_pct': 0.55, 'max_ext_atr': None, 'max_bounce_atr': 1.5, 'max_body_atr': 2.0, 'min_eqs': 50},
+    'BB_Squeeze_Breakout':        {'min_excursion_pct': 0.85, 'max_ext_atr': 3.0, 'max_bounce_atr': None, 'max_body_atr': 2.5, 'min_eqs': 60},
+    'SR_Breakout_Enhanced':       {'min_excursion_pct': 0.85, 'max_ext_atr': 3.0, 'max_bounce_atr': None, 'max_body_atr': 2.5, 'min_eqs': 60},
+    # عائلة FT العكسية (قاع-صيد): بلا سقف ملاحقة (تشتري الغرقى شرعًا) — سقف الارتداد 1.5×ATR
+    'FT_BbandRsi':                {'min_excursion_pct': 0.55, 'max_ext_atr': None, 'max_bounce_atr': 1.5, 'max_body_atr': 2.0, 'min_eqs': 50},
+    'FT_CombinedBinHAndCluc':     {'min_excursion_pct': 0.55, 'max_ext_atr': None, 'max_bounce_atr': 1.5, 'max_body_atr': 2.0, 'min_eqs': 50},
+    'FT_EMASkipPump':             {'min_excursion_pct': 0.55, 'max_ext_atr': None, 'max_bounce_atr': 1.5, 'max_body_atr': 1.5, 'min_eqs': 50},
+    'FT_Quickie':                 {'min_excursion_pct': 0.55, 'max_ext_atr': None, 'max_bounce_atr': 1.5, 'max_body_atr': 2.0, 'min_eqs': 50},
+    'FT_Bandtastic':              {'min_excursion_pct': 0.55, 'max_ext_atr': None, 'max_bounce_atr': 1.5, 'max_body_atr': 2.0, 'min_eqs': 50},
+    'FT_ADXMomentum':             {'min_excursion_pct': 0.70, 'max_ext_atr': 2.5, 'max_bounce_atr': None, 'max_body_atr': 2.5, 'min_eqs': 55},
+}
+DEFAULT_ENTRY_QUALITY_PROFILE: Dict[str, Optional[float]] = {
+    'min_excursion_pct': 0.60, 'max_ext_atr': 3.0, 'max_bounce_atr': 1.5, 'max_body_atr': 2.0, 'min_eqs': 55}
+
+
+def _eqg_expected_excursion(df: pd.DataFrame, horizon: int = 8, window: int = 30) -> Optional[float]:
+    """المدى المتوقع (٪): متوسط [max(high[i+1..i+horizon]) − close[i]] / close[i] × 100
+    على آخر window شمعة قابلة للقياس — تقدير خلفي لسؤال "كم قمة نموذجية متاحة خلال
+    ساعتين إن اشترينا عند إغلاق شمعة؟" (منهجية peak_analysis_v2 بلا lookahead).
+    None = بيانات غير كافية — والبوابة تمرر (لا اختناق جديد بدرس V9.14)."""
+    try:
+        h = df['high'].astype(float).values
+        c = df['close'].astype(float).values
+        n = len(c)
+        if n < horizon + 5:
+            return None
+        sub = np.vstack([h[i + 1:i + 1 + horizon] for i in range(n - horizon)])
+        fwd_max = sub.max(axis=1)
+        base = c[:n - horizon]
+        with np.errstate(invalid='ignore', divide='ignore'):
+            exc = (fwd_max - base) / base * 100.0
+        exc = exc[np.isfinite(exc)]
+        tail = exc[-window:] if len(exc) > window else exc
+        tail = tail[np.isfinite(tail)]
+        return float(tail.mean()) if len(tail) else None
+    except Exception:
+        return None
+
+
+def entry_quality_gate(df: pd.DataFrame, strategy_name: str,
+                       regime_info: Optional[Dict[str, Any]] = None,
+                       fit_score: Optional[float] = None) -> Tuple[bool, Dict[str, Any]]:
+    """[V9.35.0] بوابة جودة الدخول — تُستدعى بعد إطلاق الاستراتيجية وقبل بوابة الأدلة
+    (على مسار المُطلِقات ومسار التوصية معًا). تُرجع (ok, info) و info قابل للتوثيق
+    في signal_details.entry_quality (لوحة/تليجرام/تحليل لاحق). أي فشل تقييم = تمرير
+    هادئ (البوابة لا تخنق إلا حين تستطيع القياس)."""
+    info: Dict[str, Any] = {'gate': 'EQG'}
+    if not ENTRY_QUALITY_GATE_ENABLED:
+        info['disabled'] = True
+        return True, info
+    prof = ENTRY_QUALITY_PROFILES.get(strategy_name) or DEFAULT_ENTRY_QUALITY_PROFILE
+    try:
+        if df is None or len(df) < 60:
+            return True, info
+        last = df.iloc[-1]
+        close = float(last['close']) if pd.notna(last['close']) else None
+        atr = float(last['atr']) if ('atr' in last and pd.notna(last['atr'])) else None
+        if not close or not atr or atr <= 0:
+            return True, info  # بلا ATR صالح لا قياس — تمرير هادئ
+
+        # --- G1: أرضية المدى المتوقع (قاتل منطقة الرسوم — الدرس المحوري للتحليل) ---
+        exc = _eqg_expected_excursion(df, EQG_EXC_HORIZON, EQG_EXC_WINDOW)
+        info['exc_pct'] = round(exc, 3) if exc is not None else None
+        min_exc = prof.get('min_excursion_pct')
+        if exc is not None and min_exc is not None and exc < min_exc:
+            info['reason_ar'] = f"المدى المتوقع {exc:.2f}% دون أرضية {min_exc:g}% (منطقة الرسوم)"
+            return False, info
+
+        # --- G2: ضد الملاحقة/الارتداد المُستهلك (Hummingbot supertrend proximity) ---
+        ext_atr = bounce_atr = None
+        ema21 = float(last['ema_21']) if ('ema_21' in last and pd.notna(last['ema_21'])) else None
+        if ema21 is not None:
+            ext_atr = (close - ema21) / atr
+        max_ext = prof.get('max_ext_atr')
+        if ext_atr is not None and max_ext is not None and ext_atr > max_ext:
+            info['ext_atr'] = round(ext_atr, 2)
+            info['reason_ar'] = f"مطاردة: السعر {ext_atr:.2f}×ATR فوق EMA21 (سقف {max_ext:g})"
+            return False, info
+        lows7 = df['low'].astype(float).iloc[-7:]
+        if prof.get('max_bounce_atr') is not None and len(lows7) and lows7.notna().all():
+            bounce_atr = (close - float(lows7.min())) / atr
+            if bounce_atr > float(prof['max_bounce_atr']):
+                info['bounce_atr'] = round(bounce_atr, 2)
+                info['reason_ar'] = f"الارتداد مُستهلك: {bounce_atr:.2f}×ATR فوق قاع 7 شموع (سقف {float(prof['max_bounce_atr']):g})"
+                return False, info
+        info['ext_atr'] = round(ext_atr, 2) if ext_atr is not None else None
+        info['bounce_atr'] = round(bounce_atr, 2) if bounce_atr is not None else None
+
+        # --- G3: ضد المضخة (روح EMASkipPump) ---
+        open_px = float(last['open']) if ('open' in last and pd.notna(last['open'])) else close
+        body_atr = abs(close - open_px) / atr
+        max_body = prof.get('max_body_atr')
+        info['body_atr'] = round(body_atr, 2)
+        if max_body is not None and body_atr > max_body:
+            info['reason_ar'] = f"شمعة مضخة: الجسم {body_atr:.2f}×ATR (سقف {max_body:g})"
+            return False, info
+
+        # --- الدرجة المركبة EQS (0-100): مطابقة + وفرة مدى + تداخل تأكيدات ---
+        fit_norm = 20.0 if fit_score is None else min(40.0, (float(fit_score) / 100.0) * 40.0)
+        exc_ab = 15.0
+        if exc is not None and min_exc:
+            exc_ab = 30.0 * min(1.0, exc / (1.8 * min_exc))
+        vol_ok = False
+        if 'volume' in df.columns and len(df) >= 21:
+            v = df['volume'].astype(float)
+            if pd.notna(v.iloc[-1]):
+                vol_ok = float(v.iloc[-1]) > float(v.iloc[-21:-1].mean())
+        er_ok = bool((regime_info or {}).get('er') is not None and regime_info['er'] >= 0.20)
+        dir_ok = bool(close > open_px)
+        conf = (10.0 if vol_ok else 0.0) + (10.0 if er_ok else 0.0) + (10.0 if dir_ok else 0.0)
+        eqs = fit_norm + exc_ab + conf
+        info.update({'score': round(eqs, 1), 'conf': {'vol': vol_ok, 'er': er_ok, 'dir': dir_ok}})
+        min_eqs = prof.get('min_eqs')
+        if min_eqs is not None and eqs < float(min_eqs):
+            info['reason_ar'] = f"درجة الجودة {eqs:.0f} دون {min_eqs:g} (مطابقة {fit_norm:.0f} + مدى {exc_ab:.0f} + تأكيدات {conf:.0f})"
+            return False, info
+        return True, info
+    except Exception as eqg_err:
+        logger.warning(f"⚠️ [EQG] فشل التقييم ({eqg_err}) — تمرير هادئ (لا اختناق)")
+        info['error'] = str(eqg_err)
+        return True, info
+
+
 class EnhancedTradingStrategy:
     def __init__(self, symbol: str):
         self.symbol = symbol
@@ -8390,6 +8550,8 @@ def main_loop_enhanced():
                         signal_source, signal_fit_score = 'strategy_trigger', None
                         # [V9.28.0] هل هذه صفقة بناء دليل (فترة اختبار الخلية الباردة)؟
                         signal_is_probation: bool = False
+                        # [V9.35.0] معلومات بوابة جودة الدخول لهذه الإشارة (توثق في التفاصيل)
+                        signal_eqg_info: Optional[Dict[str, Any]] = None
                         # [V9.23.0] تفاصيل دليل الإشارة المقبولة (تُوثق في التفاصيل واللوحة)
                         signal_evidence_info: Optional[Dict[str, Any]] = None
                         with _scan_stats_lock: _strategy_scan_stats[name]['checks'] += 1
@@ -8421,6 +8583,14 @@ def main_loop_enhanced():
                         else:
                             setup_ok, setup_ev = True, {}
                         if check_func(df_with_indicators):
+                            # [V9.35.0] بوابة جودة الدخول (EQG) قبل بوابة الأدلة: الجودة أولًا —
+                            # فلا تُهدر بناءات الدليل على بيئات منطقة الرسوم (7/13 قمم < 0.62%)
+                            ok_q, q_info = entry_quality_gate(df_with_indicators, name, regime_info, fit_score)
+                            if not ok_q:
+                                _count_strategy_filter_reject(name, q_info.get('reason_ar', 'جودة الدخول غير كافية'))
+                                log_rejection(symbol, "بوابة جودة الدخول رفضت إشارة استراتيجية", {'strategy': name, **q_info})
+                                continue
+                            signal_eqg_info = q_info
                             # [V9.23.0] بوابة الأدلة على المُطلقات أيضًا — لا إشارة بلا برهان
                             ok_ev, ev_info = evidence_gate_pass(name, (regime_info or {}).get('regime'))
                             if not ok_ev:
@@ -8455,6 +8625,13 @@ def main_loop_enhanced():
                                     with _scan_stats_lock: _recommendation_stats['cooldown_skipped'] += 1
                                     logger.info(f"⏳ [{symbol}] ضمن تهدئة ما بعد الإغلاق — لا توصية جديدة الآن")
                                 else:
+                                    # [V9.35.0] EQG قبل بوابة الأدلة أيضًا — التوصية جودتها قبل دليلها
+                                    ok_q, q_info = entry_quality_gate(df_with_indicators, name, regime_info, rec_score)
+                                    if not ok_q:
+                                        _count_strategy_filter_reject(name, q_info.get('reason_ar', 'جودة الدخول غير كافية'))
+                                        log_rejection(symbol, "بوابة جودة الدخول رفضت التوصية", {'strategy': name, **q_info})
+                                        continue
+                                    signal_eqg_info = q_info
                                     # [V9.23.0] بوابة الأدلة: لا توصية بلا برهان ربحي تاريخي للخلية
                                     ok_ev, rec_evidence_info = evidence_gate_pass(name, (regime_info or {}).get('regime'))
                                     if not ok_ev:
@@ -8549,6 +8726,11 @@ def main_loop_enhanced():
                         # [V9.23.0] توثيق دليل الادعاء الربحي مع الإشارة (لوحة/تليجرام/تحليل لاحق)
                         if signal_evidence_info is not None:
                             new_signal['signal_details']['evidence'] = signal_evidence_info
+                        # [V9.35.0] توثيق جودة الدخول مع الإشارة (لوحة/تحليل لاحق)
+                        if signal_eqg_info is not None:
+                            new_signal['signal_details']['entry_quality'] = {
+                                k: signal_eqg_info.get(k)
+                                for k in ('score', 'exc_pct', 'ext_atr', 'bounce_atr', 'body_atr', 'conf')}
                         # [V9.28.0] علم بناء الدليل — يُحفظ في قاعدة البيانات فيبقى عبر إعادة التشغيل
                         new_signal['signal_details']['evidence_building'] = bool(signal_is_probation)
                         if regime_info:
