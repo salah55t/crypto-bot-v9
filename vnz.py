@@ -49,7 +49,7 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-APP_VERSION: str = 'V9.37.0'  # [V9.21.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
+APP_VERSION: str = 'V9.38.0'  # [V9.38.0] زر تصفير الإحصائيات في اللوحة (DB + Redis + الذاكرة) مع أرشفة أمان  # [V9.21.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
 logger = logging.getLogger(f'CryptoBot{APP_VERSION}')
 
 # زمن إقلاع العملية لحساب مدة التشغيل في لوحة التحكم
@@ -5165,6 +5165,13 @@ def get_dashboard_html():
                     </div>
                     <div id="settings-feedback" class="mt-4 text-center"></div>
                 </div>
+                <!-- [V9.38.0] منطقة الخطر: زر تصفير الإحصائيات (طلب المستخدم) -->
+                <div class="card p-6 mt-6 border border-red-900/50">
+                    <h4 class="text-lg font-bold mb-2 text-accent-red">⚠️ منطقة الخطر — تصفير الإحصائيات</h4>
+                    <p class="text-xs text-text-secondary leading-6 mb-4">يأرشف ثم يحذف نهائيًا: كل الصفقات المغلقة (سجل الأرباح ومنحنى الرصيد وأداء الاستراتيجيات)، الإشعارات، حالة حاكم المخاطر وحاكم تقاعد الاستراتيجيات، وأقفال الحماية — ثم يمسح كاش أسعار Redis (يُعاد بناؤه فورًا من البث الحي). الأرشفة تبقى في قاعدة البيانات (bot_state) للرجوع إليها يدويًا. لا يعمل أثناء وجود صفقات مفتوحة.</p>
+                    <button onclick="resetStats()" class="save-btn" style="background:linear-gradient(135deg,#dc2626,#7f1d1d)">🗑️ تصفير كل الإحصائيات والبدء من جديد</button>
+                    <div id="reset-feedback" class="mt-3 text-center text-xs"></div>
+                </div>
             </div>
             <div id="notifications-tab" class="tab-content hidden"><div id="notifications-list" class="card p-4 max-h-[60vh] overflow-y-auto space-y-2"></div></div>
             <div id="rejections-tab" class="tab-content hidden"><div id="strategy-pairs" class="mb-3"></div><div id="rejections-summary" class="mb-3"></div><div id="rejections-list" class="card p-4 max-h-[55vh] overflow-y-auto space-y-2"></div></div>
@@ -5580,6 +5587,26 @@ function manualClose(signalId, symbol) {
     });
 }
 function toggleTrading() { fetch('/api/trading/toggle', { method: 'POST' }).then(() => updateMarketStatus()); }
+
+// [V9.38.0] تصفير الإحصائيات: تأكيد مزدوج (مودال) ثم POST /api/stats/reset مع confirm=RESET
+// ثم تحديث فوري لكل بطاقات اللوحة (الإحصاءات/الأداء/المنحنى/الحالة)
+function resetStats() {
+    showConfirmation('تصفير كل الإحصائيات', 'سيتم أرشفة ثم حذف كل الصفقات والإشعارات وحالة الأحكام نهائيًا والبدء من جديد. الإجراء لا يُتراجع من اللوحة. متابعة؟', () => {
+        const fb = document.getElementById('reset-feedback');
+        if (fb) { fb.textContent = '⏳ جارٍ الأرشفة والتصفير...'; fb.className = 'mt-3 text-center text-xs text-accent-yellow'; }
+        fetch('/api/stats/reset', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ confirm: 'RESET' }) })
+            .then(r => r.json().then(d => ({ ok: r.ok, d })).catch(() => ({ ok: r.ok, d: {} })))
+            .then(({ ok, d }) => {
+                if (ok) {
+                    if (fb) { fb.textContent = `✅ ${d.message || 'تم التصفير'} — أرشفة ${(d.archived_trades || 0)} صفقة في ${d.archive_key || 'bot_state'}`; fb.className = 'mt-3 text-center text-xs text-accent-green'; }
+                    updateStats(); updateStrategyPnl(); updatePnlChart(); updateMarketStatus();
+                } else {
+                    if (fb) { fb.textContent = `❌ ${d.error || 'فشل التصفير'}`; fb.className = 'mt-3 text-center text-xs text-accent-red'; }
+                }
+            })
+            .catch(() => { if (fb) { fb.textContent = '❌ خطأ شبكة أثناء التصفير'; fb.className = 'mt-3 text-center text-xs text-accent-red'; } });
+    });
+}
 
 // [تحسين V9.9] مراقب حالة النظام الحي: وزن الطلبات، الحظر، قاطع الحماية
 function fmtUptime(sec){ const d=Math.floor(sec/86400), h=Math.floor((sec%86400)/3600), m=Math.floor((sec%3600)/60), s=sec%60; return `${d}d ${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`; }
@@ -6360,6 +6387,106 @@ def toggle_trading_status():
         status_msg = "مُفعّل" if is_trading_enabled else "مُعطّل"
         log_and_notify('warning', f"🚨 تم تغيير حالة التداول الحقيقي إلى: {status_msg}", "TRADING_STATUS_CHANGE")
         return jsonify({"message": f"Trading status set to {status_msg}"})
+
+# --- [V9.38.0] تصفير الإحصائيات — زر في اللوحة (طلب المستخدم: "اريد اضافة زر في لوحة
+# التحكم لتصفير الاحصائيات من قاعدة البيانات وريديس والبدء من جديد") ---
+@app.route('/api/stats/reset', methods=['POST'])
+def api_stats_reset():
+    """تصفير كامل للإحصائيات والبدء من جديد. أمان ثلاثي الطبقات:
+    (1) confirm='RESET' إلزامي من الواجهة — نداء بلا تأكيد يُرفض 400،
+    (2) حارس صفقات مفتوحة — رفض 409 إن وُجدت مراكز حية (لا تصفير أثناء تداول)،
+    (3) أرشفة JSON كاملة (صفقات مغلقة + آخر 200 إشعار) في bot_state قبل أي حذف،
+    والكل داخل معاملة واحدة: أي فشل = rollback = صفر فقدان جزئي.
+    النطاق: جدول signals + notifications + مفاتيح bot_state الحاكمة
+    (risk_governor / strategy_retirement) + كاش الذاكرة (صفقات مفتوحة/إشعارات/
+    أقفال الحماية وسجل الإغلاقات/حاكم المخاطر/تقاعد الاستراتيجيات) + مفتاح أسعار
+    Redis (تشغيلي بحت — يعاد بناؤه فوريًا من مركز WebSocket خلال ثوانٍ).
+    لا يُمس: مفاتيح الأرشفة stats_archive_* والإعدادات وقائمة الاستراتيجيات."""
+    global _risk_gov_loaded, _strategy_retire_loaded
+    try:
+        data = request.get_json(silent=True) or {}
+        if str(data.get('confirm', '')).strip().upper() != 'RESET':
+            return jsonify({"error": "تأكيد مفقود — يجب إرسال confirm='RESET'"}), 400
+        if not check_db_connection() or not conn:
+            return jsonify({"error": "DB connection failed"}), 500
+        # (1) حارس الصفقات المفتوحة — لا تصفير أثناء مراكز حية
+        with db_conn_lock, conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS c FROM signals WHERE status IN ('open', 'updated');")
+            open_cnt = int(cur.fetchone().get('c', 0) or 0)
+        if open_cnt > 0:
+            return jsonify({"error": f"توجد {open_cnt} صفقة مفتوحة — أغلقها أولاً قبل التصفير"}), 409
+        with db_conn_lock, conn.cursor() as cur:
+            # (2) أرشفة الأمان داخل bot_state قبل أي حذف
+            cur.execute("SELECT * FROM signals WHERE status = 'closed' ORDER BY id;")
+            trades_rows = cur.fetchall()
+            cur.execute("SELECT * FROM notifications ORDER BY timestamp DESC LIMIT 200;")
+            notif_rows = cur.fetchall()
+            archive_key = f"stats_archive_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+            archive_payload = json.dumps({
+                'created_at': datetime.now(timezone.utc).isoformat(),
+                'app_version': APP_VERSION,
+                'closed_trades': trades_rows,
+                'recent_notifications': notif_rows,
+            }, default=str)
+            cur.execute(
+                "INSERT INTO bot_state (key, value, updated_at) VALUES (%s, %s::jsonb, NOW()) "
+                "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW();",
+                (archive_key, archive_payload))
+            # (3) الحذف الفعلي — معاملة واحدة (فشل أي خطوة = rollback كامل)
+            cur.execute("DELETE FROM signals;")
+            del_signals = cur.rowcount
+            cur.execute("DELETE FROM notifications;")
+            del_notifs = cur.rowcount
+            cur.execute("DELETE FROM bot_state WHERE key IN ('risk_governor', 'strategy_retirement');")
+            del_state = cur.rowcount
+            conn.commit()
+        # (4) Redis: مسح كاش الأسعار (تشغيلي — يعيد مركز البث بناءه خلال ثوانٍ)
+        redis_cleared = False
+        try:
+            if redis_client is not None:
+                redis_client.delete(REDIS_PRICES_HASH_NAME)
+                redis_cleared = True
+        except Exception as re_err:
+            logger.warning(f"[تصفير الإحصائيات] تعذر مسح أسعار Redis: {re_err}")
+        # (5) تنظيف كاش الذاكرة والأنظمة الحاكمة
+        with signal_cache_lock:
+            open_signals_cache.clear()
+        with notifications_lock:
+            notifications_cache.clear()
+        with _protection_lock:
+            _protection_locks.clear()
+            _protection_close_log.clear()
+        with _risk_gov_lock:
+            _risk_gov_state.clear()
+            _risk_gov_state.update({
+                'date': datetime.now(timezone.utc).strftime('%Y-%m-%d'),
+                'daily_realized': 0.0, 'global_peak': 0.0,
+                'global_profit_locked': False, 'global_hwm_locked': False, 'strat': {},
+            })
+            _risk_gov_loaded = True  # منع إعادة تحميل حالة قديمة من bot_state
+        with _strategy_retire_lock:
+            _strategy_retire_state.clear()
+            _strategy_retire_loaded = True
+        msg = (f"🧹 تم تصفير كل الإحصائيات والبدء من جديد — حُذفت {del_signals} صفقة و"
+               f"{del_notifs} إشعار و{del_state} مفاتيح حالة حاكمة، وأُرشفت {len(trades_rows)} "
+               f"صفقة في bot_state ({archive_key}).")
+        log_and_notify('warning', msg, 'STATS_RESET')
+        logger.warning(f"[تصفير الإحصائيات] signals={del_signals} notifications={del_notifs} "
+                       f"bot_state={del_state} redis={redis_cleared} archive={archive_key}")
+        return jsonify({
+            "message": "تم التصفير والبدء من جديد",
+            "deleted_signals": del_signals, "deleted_notifications": del_notifs,
+            "deleted_state_keys": del_state, "redis_prices_cleared": redis_cleared,
+            "archive_key": archive_key, "archived_trades": len(trades_rows),
+        })
+    except Exception as e:
+        try:
+            with db_conn_lock:
+                conn.rollback()
+        except Exception:
+            pass
+        logger.error(f"❌ [تصفير الإحصائيات] خطأ: {e}", exc_info=True)
+        return jsonify({"error": str(e)[:200]}), 500
 
 @app.route('/api/settings/update', methods=['POST'])
 def update_settings():
