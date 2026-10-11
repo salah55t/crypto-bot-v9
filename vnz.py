@@ -49,7 +49,7 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-APP_VERSION: str = 'V9.38.0'  # [V9.38.0] زر تصفير الإحصائيات في اللوحة (DB + Redis + الذاكرة) مع أرشفة أمان  # [V9.21.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
+APP_VERSION: str = 'V9.39.0'  # [V9.39.0] اقتباس Elliott Waves: استراتيجية Elliott_Impulse (زيجزاج + قواعد الدافع الثلاث + منطقة موجة 4)  # [V9.21.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
 logger = logging.getLogger(f'CryptoBot{APP_VERSION}')
 
 # زمن إقلاع العملية لحساب مدة التشغيل في لوحة التحكم
@@ -165,6 +165,8 @@ STRATEGY_FILTER_PROFILES: Dict[str, Dict[str, Optional[float]]] = {
     'FT_Quickie':                 {'min_adx': None, 'max_adx': None, 'min_atr_pct': 0.25, 'max_atr_pct': 4.0, 'min_roc': None},
     # الزخم الأصلي يشترط ADX>25 في الكانوني ذاته — الملف يطابق شرطه
     'FT_ADXMomentum':             {'min_adx': 25.0, 'max_adx': None, 'min_atr_pct': 0.40, 'max_atr_pct': 6.0, 'min_roc': None},
+    # [V9.39.0] Elliott Impulse — الدافع يُشترى في اتجاه قائم (ADX≥20) بلا سكاكين
+    'Elliott_Impulse':            {'min_adx': 20.0, 'max_adx': None, 'min_atr_pct': 0.35, 'max_atr_pct': 5.0, 'min_roc': None},
 }
 # احتياط لأي استراتيجية مستقبلية غير مدرجة: بوابة عقلانية واسعة فقط
 DEFAULT_STRATEGY_FILTER_PROFILE: Dict[str, Optional[float]] = {
@@ -276,6 +278,8 @@ STRATEGY_PAIR_PROFILES: Dict[str, Dict[str, Any]] = {
     'FT_Quickie':                 {'regimes': ('range', 'trend_down'), 'secondary_regimes': ('trend_up', 'transitional'), 'adx': (None, None, None), 'atr_pct': (0.25, 4.0), 'range_bonus': True},
     # زخم freqtrade الأصلي (ADX>25 + +DI>-DI + MOM>0) — اتجاه صاعد قائم
     'FT_ADXMomentum':             {'regimes': ('trend_up',), 'adx': (20.0, 30.0, None), 'atr_pct': (0.40, 6.0), 'struct_up_bonus': True, 'pos_roc_bonus': True},
+    # [V9.39.0] Elliott Impulse — موجة 4 تُشترى في الصاعد القائم (انتقالي كثانوي: دافع يولد بعد تهدئة)
+    'Elliott_Impulse':            {'regimes': ('trend_up',), 'secondary_regimes': ('transitional',), 'adx': (18.0, 30.0, None), 'atr_pct': (0.35, 5.0), 'struct_up_bonus': True, 'pos_roc_bonus': True},
 }
 
 # --- [V9.24.0] خريطة السوق العام → الاستراتيجيات المسموحة (حتمية لا تكهن) ---
@@ -292,8 +296,8 @@ MARKET_STATE_STRATEGY_ALLOW: Dict[str, Optional[Tuple[str, ...]]] = {
     'DOWNTREND':        ('SR_BREAKOUT',) + FT_REVERSAL_KEYS,
     'RANGING':          ('SR_BREAKOUT', 'EMA_RSI', 'PULLBACK') + FT_REVERSAL_KEYS,
     'UNCERTAIN':        ('SR_BREAKOUT', 'EMA_RSI', 'PULLBACK', 'BULLISH_MOMENTUM') + FT_REVERSAL_KEYS + FT_TREND_KEYS,
-    'UPTREND':          ('SR_BREAKOUT', 'EMA_RSI', 'PULLBACK', 'BULLISH_MOMENTUM') + FT_REVERSAL_KEYS + FT_TREND_KEYS,
-    'STRONG_UPTREND':   ('SR_BREAKOUT', 'EMA_RSI', 'PULLBACK', 'BULLISH_MOMENTUM') + FT_REVERSAL_KEYS + FT_TREND_KEYS,
+    'UPTREND':          ('SR_BREAKOUT', 'EMA_RSI', 'PULLBACK', 'BULLISH_MOMENTUM', 'ELLIOTT') + FT_REVERSAL_KEYS + FT_TREND_KEYS,
+    'STRONG_UPTREND':   ('SR_BREAKOUT', 'EMA_RSI', 'PULLBACK', 'BULLISH_MOMENTUM', 'ELLIOTT') + FT_REVERSAL_KEYS + FT_TREND_KEYS,
 }
 # [V9.37.0] ثوابت كاشفي القاع/الانضغاط (BOTTOM_* و SQUEEZE_BBWP_MAX) حُذفت مع حذف
 # الاستراتيجيتين الارتداديتين وكاشفيهما detect_bottom_bounce_setup/detect_squeeze_setup.
@@ -582,6 +586,25 @@ else:
     DISABLED_STRATEGY_KEYS = (_parse_disabled_strategies(_raw_disabled_env) if _raw_disabled_env
                               else list(STRATEGY_DISABLED_DEFAULT))
 
+# --- [V9.39.0] استراتيجية Elliott Impulse — اقتباس من Elliott_Waves_Algo_TradingBot
+# (github.com/dtwijesekara/Elliott_Waves_Algo_TradingBot — MIT). الفكرة المقتبسة:
+# معاملة عدّ الموجات كمسألة تحقق قواعد حتمية لا رسمًا يدويًا: شموع → محاور ZigZag
+# بنسبة انعكاس → نافذة المحاور تُختبر على قواعد الدافع الثلاث الصارمة → الدخول في
+# منطقة التراجع المفتاحية (موجة 4: 0.236–0.5 من W3 — ص 10-11 من ملاحظات المصدر).
+# كل القيم env-configurable؛ ELLIOTT_ENABLED=false يعطلها كليًا (تُدرج في التعطيل).
+ELLIOTT_ENABLED: bool = config('ELLIOTT_ENABLED', default=True, cast=bool)
+# عتبة انعكاس الزيجزاج ٪ — جدول معايرة المصدر لـ 15m: 0.4-0.8 (مشتعلة أكثر نُرفعها 1.0)
+ELLIOTT_ZZ_DEVIATION_PCT: float = config('ELLIOTT_ZZ_DEVIATION_PCT', default=1.0, cast=float)
+# قاعدة 2 جزئيًا (بلا W5 حيًا): W3 ≥ النسبة × W1 + قمة W3 تكسر قمة W1
+ELLIOTT_MIN_W3_W1_RATIO: float = config('ELLIOTT_MIN_W3_W1_RATIO', default=1.0, cast=float)
+# منطقة موجة 4 المفتاحية (FibConformance.wave4_in_zone في المصدر: 0.236–0.5)
+ELLIOTT_W4_ZONE_MIN: float = config('ELLIOTT_W4_ZONE_MIN', default=0.236, cast=float)
+ELLIOTT_W4_ZONE_MAX: float = config('ELLIOTT_W4_ZONE_MAX', default=0.50, cast=float)
+# طزاجة البنية: قمة W3 يجب أن تكون حديثة (شموع) — لا دافع عجوز
+ELLIOTT_MAX_W4_BARS: int = config('ELLIOTT_MAX_W4_BARS', default=40, cast=int)
+if not ELLIOTT_ENABLED and 'ELLIOTT' not in DISABLED_STRATEGY_KEYS:
+    DISABLED_STRATEGY_KEYS.append('ELLIOTT')
+
 # حاكم تقاعد الاستراتيجيات: إحصاء حي من DB (صفقات مغلقة لكل strategy_name) وتعليق
 # الاستراتيجية من الفتح الجديد عند ثبات سوء الأداء — الصفقات المفتوحة تُدار طبيعيًا،
 # والإحصاء يعاد عند كل إغلاق + الإقلاع (يصمد في bot_state). القيم env-configurable.
@@ -637,6 +660,8 @@ STRATEGY_TIME_LIMIT_DEFAULTS: Dict[str, int] = {
     'EMA_RSI_Cross': 300,
     'Bullish_Momentum': 300,
     'Pullback_MACD': 360,
+    # [V9.39.0] Elliott Impulse — نفس سقف عائلة التقاطعات الاتجاهية
+    'Elliott_Impulse': 300,
 }
 def _load_strategy_time_limits() -> Dict[str, int]:
     try:
@@ -2777,6 +2802,13 @@ def _nominee_score_for(key: str, m: Dict[str, float]) -> Tuple[float, str]:
         retr = max(0.0, (1.0 - abs(pos - 0.45) / 0.55)) * 100.0
         score = 0.35 * rising + 0.40 * retr + 0.25 * liq
         why = f"صاعدة على 24س ({chg:+.1f}%) مع تراجع لمنتصف النطاق — شراء التراجع في الصاعد"
+    elif key == 'ELLIOTT':
+        # [V9.39.0] بصمة موجة 4: يوم صاعد + السعر راجع للنصف الأوسط من نطاق 24س
+        # (منطقة استقبال التراجع بعد دافع) — أنقى من PULLBACK بثقل سيولة أعلى
+        rising = _clamp_0_100(chg, 0.0, 10.0)
+        retr = max(0.0, 1.0 - abs(pos - 0.5) / 0.5) * 100.0
+        score = 0.35 * rising + 0.35 * retr + 0.30 * liq
+        why = f"صاعدة {chg:+.1f}% على 24س مع تراجع إلى {pos * 100:.0f}% من النطاق — منطقة موجة 4 (اقتباس إليوت)"
     else:
         # استراتيجية مستقبلية بلا بصمة خاصة: حيوية عامة + سيولة
         score = 0.50 * liq + 0.30 * _clamp_0_100(abs(chg), 0.0, 10.0) + 0.20 * _clamp_0_100(rng, 1.5, 12.0)
@@ -3512,7 +3544,185 @@ STRATEGY_SETUP_SCANNERS: Dict[str, Any] = {
     # [V9.29.0] استراتيجيات freqtrade الأصلية: بلا كاشف تجهيز إضافي — نهج freqtrade
     # يجعل شروط populate_entry_trend هي البوابة ذاتها (None = تجاوز التجهيز الشرطي)
     **{key: None for key in FT_REVERSAL_KEYS + FT_TREND_KEYS},
+    # [V9.39.0] Elliott Impulse: بلا كاشف تجهيز إضافي — بنية الزيجزاج والقواعد الثلاث
+    # هي البوابة ذاتها داخل دالة الفحص (نمط عائلة freqtrade)
+    'ELLIOTT': None,
 }
+
+
+# ============================================================
+# [V9.39.0] استراتيجية Elliott_Impulse — اقتباس من Elliott_Waves_Algo_TradingBot
+# (github.com/dtwijesekara/Elliott_Waves_Algo_TradingBot — MIT)
+# الفكرة المقتبسة: عدّ الموجات كمسألة تحقق قواعد لا كرسم يدوي — الشموع تُقلَّص
+# لمحاور ZigZag بنسبة انعكاس (آلة حالة ثلاثية الأطوار من pattern_detector.py)،
+# وكل نافذة محاور تُختبر على قواعد الدافع الصارمة الثلاث (wave_validator.py):
+#   قاعدة 1: موجة 2 لا تكسر أصل الموجة 1 (صعودًا: P2 > P0)
+#   قاعدة 2: الموجة 3 ليست الأقصر — حيًا (بلا W5 مؤكدة) تُقاس جزئيًا:
+#            W3 ≥ ELLIOTT_MIN_W3_W1_RATIO × W1 + قمة W3 تكسر قمة W1
+#   قاعدة 3: موجة 4 لا تتداخل مع أرضية الموجة 1 (P4 > P1)
+# والدخول عند "أفضل نقاط" المصدر (ص 9-11): ارتداد من داخل منطقة موجة 4 المفتاحية
+# (تراجع 0.236–0.5 من W3) — لا صيد سكين: القاع يجب أن يتأكد بانعكاس ≥ عتبة
+# الزيجزاج ثم شمعة إغلاق صاعدة (نفس درس DipAnalyser V9.34).
+# فروق موضعية عن المصدر (موثقة): بوتنا شراء فقط، الدخول سوقي عند إغلاق شمعة،
+# والوقف/الهدف من محرك البيت (ATR مقيّد بسقف MAX_SL_DISTANCE_PCT) لا من P0
+# البنيوي — المسافة إلى P0 من منطقة W4 تتجاوز سقف الوقف غالبًا.
+# ============================================================
+
+def _zigzag_pivots(closes: List[float], highs: List[float], lows: List[float],
+                   deviation_pct: float) -> List[Tuple[int, float, str]]:
+    """آلة حالة ZigZag بنسبة انعكاس (اقتباس _detect_pivots_zigzag من المصدر).
+    محاور حقيقية بأسعار High/Low الفعلية لا الإغلاق، والمحور الأخير غير المؤكد
+    يُرسم بعلامة *_unconf (يتحدث حتى التأكيد — كما في المصدر)."""
+    n = len(closes)
+    if n < 10:
+        return []
+    thr = max(0.05, float(deviation_pct)) / 100.0
+    raw: List[Tuple[int, float, str]] = []   # (index, price, type)
+    high_idx = low_idx = 0
+    direction = 0   # 0=غير محسوم 1=صاعد -1=هابط
+    for i in range(1, n):
+        c = closes[i]
+        if direction == 0:
+            if c > closes[high_idx]:
+                high_idx = i
+            if c < closes[low_idx]:
+                low_idx = i
+            base_low = closes[low_idx] if closes[low_idx] > 0 else 1e-12
+            base_high = closes[high_idx] if closes[high_idx] > 0 else 1e-12
+            move_up = (c - base_low) / base_low
+            move_down = (base_high - c) / base_high
+            if move_up >= thr:
+                raw.append((low_idx, float(lows[low_idx]), 'trough'))
+                direction, high_idx = 1, i
+            elif move_down >= thr:
+                raw.append((high_idx, float(highs[high_idx]), 'peak'))
+                direction, low_idx = -1, i
+        elif direction == 1:
+            if c >= closes[high_idx]:
+                high_idx = i   # تمديد القمة الحالية (غير مؤكدة بعد)
+            else:
+                base_high = closes[high_idx] if closes[high_idx] > 0 else 1e-12
+                if (base_high - c) / base_high >= thr:
+                    raw.append((high_idx, float(highs[high_idx]), 'peak'))
+                    direction, low_idx = -1, i
+        else:
+            if c <= closes[low_idx]:
+                low_idx = i
+            else:
+                base_low = closes[low_idx] if closes[low_idx] > 0 else 1e-12
+                if (c - base_low) / base_low >= thr:
+                    raw.append((low_idx, float(lows[low_idx]), 'trough'))
+                    direction, high_idx = 1, i
+    # إغلاق المحور المفتوح الأخير (مرشح التأكيد) — يحتاجه الكاشف لتقييم آخر موجة
+    if direction == 1:
+        raw.append((high_idx, float(highs[high_idx]), 'peak_unconf'))
+    elif direction == -1:
+        raw.append((low_idx, float(lows[low_idx]), 'trough_unconf'))
+    # فرض التناوب الصارم: متتاليات من النوع نفسه تُدمج في أقصاها + فصل زمني أدنى
+    # (min_wave_bars=2 في المصدر) — المحاور المتلاصقة زمنيًا ضجيج
+    out: List[Tuple[int, float, str]] = []
+    for p in raw:
+        if out and p[2].startswith('peak') == out[-1][2].startswith('peak'):
+            if (p[2].startswith('peak') and p[1] >= out[-1][1]) or \
+               (p[2].startswith('trough') and p[1] <= out[-1][1]):
+                out[-1] = p
+            continue
+        if out and (p[0] - out[-1][0]) < 2:
+            continue  # محور متقارب زمنيًا مع نوع معاكس — يُسقط لصالح الأقدم الأوسع
+        out.append(p)
+    return out
+
+
+def _elliott_w4_setup_info(df: pd.DataFrame) -> Tuple[bool, Dict[str, Any]]:
+    """فحص بنية الدافع الصاعد حيًا على 15m: P0→P3 صالح بقواعد إليوت الثلاث +
+    موجة 4 مؤكدة الارتداد داخل المنطقة المفتاحية + شمعة دخول صاعدة سليمة.
+    يعيد (نجاح، أدلة عربية رقمية) — حتمي بالكامل (نفس الشموع ⇒ نفس القرار)."""
+    ev: Dict[str, Any] = {}
+    try:
+        closes = df['close'].astype(float).tolist()
+        highs = df['high'].astype(float).tolist()
+        lows = df['low'].astype(float).tolist()
+        n = len(closes)
+        if n < 60:
+            ev['reason'] = f'شموع غير كافية للزيجزاج ({n} < 60)'
+            return False, ev
+        pivots = _zigzag_pivots(closes, highs, lows, ELLIOTT_ZZ_DEVIATION_PCT)
+        if len(pivots) < 6:
+            ev['reason'] = f'محاور غير كافية لبنية الدافع ({len(pivots)} < 6)'
+            return False, ev
+        *confirmed, tail = pivots
+        # حالة الدخول الوحيدة المقبولة: قاع موجة 4 تأكد بانعكاس ≥ عتبة الزيجزاج
+        # (الذيل peak_unconf = السعر يصعد من القاع) — لا دخول أثناء هبوط حي
+        if tail[2] != 'peak_unconf':
+            ev['reason'] = 'لا ارتداد مؤكد من قاع موجة 4 (الاتجاه اللحظي ليس صاعدًا)'
+            return False, ev
+        if len(confirmed) < 5:
+            ev['reason'] = f'محاور مؤكدة غير كافية ({len(confirmed)} < 5)'
+            return False, ev
+        p4_idx, p4, _t = confirmed[-1]
+        p3_idx, p3, _t = confirmed[-2]
+        p2_idx, p2, _t = confirmed[-3]
+        p1_idx, p1, _t = confirmed[-4]
+        p0_idx, p0, _t = confirmed[-5]
+        seq = [x[2] for x in confirmed[-5:]]
+        if seq != ['trough', 'peak', 'trough', 'peak', 'trough']:
+            ev['reason'] = f'تسلسل المحاور ليس دافعًا صاعدًا ({seq})'
+            return False, ev
+        w1 = p1 - p0
+        w3 = p3 - p2
+        if w1 <= 0 or w3 <= 0:
+            ev['reason'] = 'أطوال موجات غير صالحة'
+            return False, ev
+        if p2 <= p0:
+            ev['reason'] = (f"قاعدة 1 مكسورة: قاع W2 ({p2:.6g}) ≤ أصل W1 ({p0:.6g})")
+            return False, ev
+        if p3 <= p1:
+            ev['reason'] = (f"قاعدة 2 مكسورة: قمة W3 ({p3:.6g}) لم تكسر قمة W1 ({p1:.6g})")
+            return False, ev
+        if w3 < ELLIOTT_MIN_W3_W1_RATIO * w1:
+            ev['reason'] = (f"قاعدة 2 مكسورة: طول W3 ({w3:.6g}) < "
+                            f"{ELLIOTT_MIN_W3_W1_RATIO}×W1 ({w1:.6g})")
+            return False, ev
+        if p4 <= p1:
+            ev['reason'] = (f"قاعدة 3 مكسورة: قاع W4 ({p4:.6g}) ≤ قمة W1 ({p1:.6g}) — تداخل")
+            return False, ev
+        retrace = (p3 - p4) / w3
+        if not (ELLIOTT_W4_ZONE_MIN <= retrace <= ELLIOTT_W4_ZONE_MAX):
+            ev['reason'] = (f"تراجع W4 = {retrace * 100:.1f}% خارج المنطقة المفتاحية "
+                            f"[{ELLIOTT_W4_ZONE_MIN * 100:.1f}–{ELLIOTT_W4_ZONE_MAX * 100:.1f}%]")
+            return False, ev
+        if (n - 1 - p3_idx) > ELLIOTT_MAX_W4_BARS:
+            ev['reason'] = f'بنية عجوز: قمة W3 قبل {n - 1 - p3_idx} شمعة (> {ELLIOTT_MAX_W4_BARS})'
+            return False, ev
+        last_o = float(df['open'].iloc[-1])
+        last_c = closes[-1]
+        if last_c <= last_o:
+            ev['reason'] = 'شمعة الإغلاق الأخيرة ليست صاعدة (لا تأكيد ارتداد)'
+            return False, ev
+        if not (p4 < last_c < p3):
+            ev['reason'] = (f"الإغلاق ({last_c:.6g}) خارج نطاق الدخول الآمن "
+                            f"({p4:.6g} < close < قمة W3 {p3:.6g})")
+            return False, ev
+        ev.update({'w1': round(w1, 8), 'w3': round(w3, 8),
+                   'w3_w1': round(w3 / w1, 3), 'w4_retrace_pct': round(retrace * 100, 1),
+                   'p0': p0, 'p1': p1, 'p2': p2, 'p3': p3, 'p4': p4,
+                   'bars_since_p3': n - 1 - p3_idx})
+        return True, ev
+    except Exception as e:
+        ev['reason'] = f'خطأ: {e}'
+        return False, ev
+
+
+def check_elliott_impulse_strategy(df: pd.DataFrame) -> bool:
+    """[V9.39.0] Elliott Impulse — اقتباس: دخول ارتداد موجة 4 بعد دافع صالح
+    بقواعد إليوت الثلاث. شراء فقط، وشرط الزناد شمعة إغلاق صاعدة داخل النطاق."""
+    ok, ev = _elliott_w4_setup_info(df)
+    if ok:
+        logger.info(f"  -> [{df.name}] ✅ إشارة Elliott Impulse — W3/W1={ev.get('w3_w1')} "
+                    f"وتراجع W4={ev.get('w4_retrace_pct')}% داخل المنطقة المفتاحية.")
+        return True
+    logger.debug(f"  -> [{df.name}] Elliott Impulse: {ev.get('reason', '')}")
+    return False
 
 
 # --- [تحسين] دوال منطق الاستراتيجيات (تم تحسينها) ---
@@ -3941,6 +4151,9 @@ ENTRY_QUALITY_PROFILES: Dict[str, Dict[str, Optional[float]]] = {
     'FT_EMASkipPump':             {'min_excursion_pct': 0.55, 'max_ext_atr': None, 'max_bounce_atr': 1.5, 'max_body_atr': 1.5, 'min_eqs': 50},
     'FT_Quickie':                 {'min_excursion_pct': 0.55, 'max_ext_atr': None, 'max_bounce_atr': 1.5, 'max_body_atr': 2.0, 'min_eqs': 50},
     'FT_ADXMomentum':             {'min_excursion_pct': 0.70, 'max_ext_atr': 2.5, 'max_bounce_atr': None, 'max_body_atr': 2.5, 'min_eqs': 55},
+    # [V9.39.0] Elliott Impulse — دخول ارتدادي-اتجاهي: سقف ارتداد 2×ATR (الارتداد
+    # هو الأطروحة لكن لا مطاردة) وسقف ملاحقة 2×ATR (الإغلاق تحت قمة W3 أصلاً)
+    'Elliott_Impulse':            {'min_excursion_pct': 0.60, 'max_ext_atr': 2.0, 'max_bounce_atr': 2.0, 'max_body_atr': 2.0, 'min_eqs': 55},
 }
 DEFAULT_ENTRY_QUALITY_PROFILE: Dict[str, Optional[float]] = {
     'min_excursion_pct': 0.60, 'max_ext_atr': 3.0, 'max_bounce_atr': 1.5, 'max_body_atr': 2.0, 'min_eqs': 55}
@@ -6273,6 +6486,9 @@ def api_strategy_candidates():
                     for _ft_name, _ft_spec in FREQTRADE_STRATEGIES.items():
                         if FT_STRATEGY_ENABLED.get(_ft_name, True):
                             display_names[_ft_spec['key']] = _ft_name
+            # [V9.39.0] Elliott Impulse في دائرة الترشيح المعروضة (بلا مفتاح USE —
+            # التعطيل عبر ELLIOTT_ENABLED=false يدرجه في DISABLED_STRATEGY_KEYS)
+            display_names['ELLIOTT'] = 'Elliott_Impulse'
         except Exception:
             display_names = {}
         out = {}
@@ -7629,6 +7845,8 @@ def _evidence_strategy_table() -> List[Tuple[str, Any, str]]:
         ('FT_EMASKIPPUMP', ft_entry_emaskippump, 'FT_EMASkipPump'),
         ('FT_QUICKIE', ft_entry_quickie, 'FT_Quickie'),
         ('FT_ADXMOMENTUM', ft_entry_adxmomentum, 'FT_ADXMomentum'),
+        # [V9.39.0] Elliott Impulse — اقتباس Elliott Waves: دافع صالح + ارتداد موجة 4
+        ('ELLIOTT', check_elliott_impulse_strategy, 'Elliott_Impulse'),
     ] if k not in DISABLED_STRATEGY_KEYS]
 
 
