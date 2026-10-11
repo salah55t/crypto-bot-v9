@@ -49,7 +49,7 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-APP_VERSION: str = 'V9.36.0'  # [V9.21.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
+APP_VERSION: str = 'V9.37.0'  # [V9.21.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
 logger = logging.getLogger(f'CryptoBot{APP_VERSION}')
 
 # زمن إقلاع العملية لحساب مدة التشغيل في لوحة التحكم
@@ -111,31 +111,18 @@ MIN_PROFIT_PERCENT: float = 0.8
 USE_ML_STRATEGY: bool = False
 ml_strategy_lock = Lock()
 
-USE_BB_STOCH_STRATEGY: bool = True
-bb_stoch_strategy_lock = Lock()
-
-# [V9.27.0] اقتباسان من استراتيجيات freqtrade المجتمعية — مثبتان بالباك تيست (24 رمزًا × 30 يومًا × 15م):
-#   1) فلتر الجسم الضاغط (من BinHV45): الإغلاق قريب من القاع (ضمن 25% من نصف النطاق السفلي للبولنجر)
-#      أي شمعة لا تزال تضغط نحو الأسفل — ليست شمعة ارتدت بالفعل بذيل طويل.
-#      الأثر المقاس: PF 1.007 → 1.887 | التوقع +0.007% → +0.539%/صفقة | مجموع +1.4% → +30.2%
-#   2) حارس المضخة (من ClucMay72018/EMASkipPump): رفض شموع المضخة/السكين (حجم > 20× متوسط 30)
-#      — تأمين مجاني على العينة (لم يرفض أي صفقة صالحة) يحمي من الشموع المتلاعب بها.
-#   المرفوض بالدليل: TD Sequential ≥9 (لا يحسّن)، فيشر RSI (يضر)، العمق close<0.985×BB
-#   (يتنافى مع تقاطع الستوك — مجموعة فارغة)، قفل التعادل BE05 على الاستراتيجيات الأخرى (يضر).
-BB_STOCH_TAIL_MAX_RATIO: float = 0.25
-BB_STOCH_PUMP_VOLUME_MULT: float = 20.0
-
-USE_MACD_EMA_STRATEGY: bool = True
-macd_ema_strategy_lock = Lock()
-
+# [V9.37.0] تنظيف بنيوي بطلب المستخدم ("تصفية الكود وتنضيفه وحذف الاستراتيجيات ذات
+# الأداء السيئ"): حُذفت من الكود كله الاستراتيجيات المثبتة سوء الأداء — دوالها وكواشفها
+# وبروفايلات فلترتها وواجهاتها:
+#   MACD_EMA_Crossover (n=7، PF 0.012، WR 14.3%، -0.58$) | BB_Stoch_Reversal (ميتة بنيويًا
+#   100% رفض فلتر، تقاعد V9.34) | BB_Squeeze_Breakout (n=17، PF 0.025، WR 11.8%، -1.20$)
+#   | FT_BbandRsi (n=2، PF 0، -0.38$، نزف MAGIC -9.22%) | FT_Bandtastic (n=2، PF 0، -0.20$)
+# الباقون: BinHCluc (PF 4.02) وSR_Breakout (1.265) وQuickie (5.94) + غير المثبتات بعد.
 USE_EMA_RSI_STRATEGY: bool = True
 ema_rsi_strategy_lock = Lock()
 
 USE_PULLBACK_STRATEGY: bool = True
 pullback_strategy_lock = Lock()
-
-USE_BB_SQUEEZE_STRATEGY: bool = True
-bb_squeeze_strategy_lock = Lock()
 
 USE_BULLISH_MOMENTUM_STRATEGY: bool = True
 bullish_momentum_strategy_lock = Lock()
@@ -164,28 +151,18 @@ HTF_CONFIRMATION_CACHE_TTL: int = config('HTF_CONFIRMATION_CACHE_TTL', default=9
 # require_above_ema50: معيار Connors البنيوي لصفقات شراء التراجعات. None = بلا حد.
 STRATEGY_FILTER_PROFILES: Dict[str, Dict[str, Optional[float]]] = {
     # التقاطعات الاتجاهية — Wilder: بلا تداول تقاطعات في غياب الاتجاه (ADX≥20)
-    'MACD_EMA_Crossover':         {'min_adx': 20.0, 'max_adx': None, 'min_atr_pct': 0.30, 'max_atr_pct': 5.0, 'min_roc': None},
     'EMA_RSI_Cross':              {'min_adx': 20.0, 'max_adx': None, 'min_atr_pct': 0.30, 'max_atr_pct': 5.0, 'min_roc': None},
     # Pullback — Raschke: الارتداد يُشترى في اتجاه مثبت فقط (ADX≥25)
     'Pullback_MACD':              {'min_adx': 25.0, 'max_adx': None, 'min_atr_pct': 0.30, 'max_atr_pct': 5.0, 'min_roc': None},
     # الزخم — [V9.17.0] ROC≥0.6%: مطابقة الأزواج تختار قادة الزخم أصلًا،
     # فتكفي الأرضية بإيقاع أقل صرامة من 1% التي رفضت 155 محاولة حية
     'Bullish_Momentum':           {'min_adx': 25.0, 'max_adx': None, 'min_atr_pct': 0.50, 'max_atr_pct': 6.0, 'min_roc': 0.6},
-    # الارتدادية — Connors المرن [V9.17.0]: شراء التراجعات قرب EMA50 أو فوقها (ضمن سماحية
-    # ATR واحدة). الصرامة المطلقة القديمة (close>EMA50) رفضت 431 محاولة (67%) بلا نجاح واحد،
-    # مع أن شراء الغرقى المقصود في الاستراتيجية يقع شرعًا تحت المتوسط بهامش ضئيل
-    'BB_Stoch_Reversal_Enhanced': {'min_adx': None, 'max_adx': None, 'min_atr_pct': 0.25, 'max_atr_pct': 4.0, 'min_roc': None, 'ema50_tol_atr': 1.0},
-    # الاختراقية — Carter: الانضغاط هو الفلتر ذاته، بلا قيود نظامية ADX إطلاقًا
-    # (سقف ADX كان يمنع نمط الاستمرار الاحترافي في الاتجاهات القوية — 72 رفضًا حيًا)
-    'BB_Squeeze_Breakout':        {'min_adx': None, 'max_adx': None, 'min_atr_pct': None, 'max_atr_pct': 5.0, 'min_roc': None},
     'SR_Breakout_Enhanced':       {'min_adx': None, 'max_adx': None, 'min_atr_pct': None, 'max_atr_pct': 5.0, 'min_roc': None},
     # --- [V9.29.0] استراتيجيات freqtrade الأصلية — بوابة عقلانية فقط: شروط الدخول
     # الكانونية هي الفلتر ذاته في نهج freqtrade (بلا طبقات إضافية فوقها)
-    'FT_BbandRsi':                {'min_adx': None, 'max_adx': None, 'min_atr_pct': 0.25, 'max_atr_pct': 4.0, 'min_roc': None},
     'FT_CombinedBinHAndCluc':     {'min_adx': None, 'max_adx': None, 'min_atr_pct': 0.25, 'max_atr_pct': 4.0, 'min_roc': None},
     'FT_EMASkipPump':             {'min_adx': None, 'max_adx': None, 'min_atr_pct': 0.25, 'max_atr_pct': 4.0, 'min_roc': None},
     'FT_Quickie':                 {'min_adx': None, 'max_adx': None, 'min_atr_pct': 0.25, 'max_atr_pct': 4.0, 'min_roc': None},
-    'FT_Bandtastic':              {'min_adx': None, 'max_adx': None, 'min_atr_pct': 0.25, 'max_atr_pct': 4.0, 'min_roc': None},
     # الزخم الأصلي يشترط ADX>25 في الكانوني ذاته — الملف يطابق شرطه
     'FT_ADXMomentum':             {'min_adx': 25.0, 'max_adx': None, 'min_atr_pct': 0.40, 'max_atr_pct': 6.0, 'min_roc': None},
 }
@@ -272,9 +249,9 @@ FT_STRATEGIES_ENABLED: bool = os.environ.get('FT_STRATEGIES_ENABLED', 'true').st
 # مفتاح تفعيل/تعطيل لكل استراتيجية (يُقرأ تحت القفل من خيوط المسح والويب)
 FT_STRATEGY_ENABLED: Dict[str, bool] = {}
 ft_strategies_lock = Lock()
-# عائلة الارتداد (تُعامل مع خريطة السوق كعائلة BB_STOCH — قاع-صيد أصيل في الهبوط)
+# عائلة الارتداد (قاع-صيد أصيل في الهبوط — شراؤها فوق الحد السفلي هو فكرتها)
 # و FT_ADXMOMENTUM استمرارية زخم (كعائلة BULLISH_MOMENTUM — تتطلب ثبات الصاعد)
-FT_REVERSAL_KEYS: Tuple[str, ...] = ('FT_BBANDRSI', 'FT_BINHCLUC', 'FT_EMASKIPPUMP', 'FT_QUICKIE', 'FT_BANDTASTIC')
+FT_REVERSAL_KEYS: Tuple[str, ...] = ('FT_BINHCLUC', 'FT_EMASKIPPUMP', 'FT_QUICKIE')  # [V9.37.0] بعد حذف BbandRsi/Bandtastic
 FT_TREND_KEYS: Tuple[str, ...] = ('FT_ADXMOMENTUM',)
 # TTL كاش مؤشرات إشارة الخروج في حلقة الإدارة (نمط get_cached_atr)
 FT_EXIT_IND_TTL_SEC: int = int(os.environ.get('FT_EXIT_IND_TTL_SEC', '60'))
@@ -287,29 +264,16 @@ REGIME_AR: Dict[str, str] = {
 # adx = (حد_أدنى, مثالي, سقف): سلم صعود 0→25 للتوجهية، أو سقف يتحلل فوقه ×2/وحدة للنطاقية
 STRATEGY_PAIR_PROFILES: Dict[str, Dict[str, Any]] = {
     # التقاطعات الاتجاهية: اتجاه صاعد قائم بهيكل EMA سليم
-    'MACD_EMA_Crossover':         {'regimes': ('trend_up',),        'adx': (18.0, 28.0, None), 'atr_pct': (0.30, 5.0), 'struct_up_bonus': True, 'pos_roc_bonus': True},
     'EMA_RSI_Cross':              {'regimes': ('trend_up',),        'adx': (18.0, 28.0, None), 'atr_pct': (0.30, 5.0), 'struct_up_bonus': True, 'pos_roc_bonus': True},
     # Pullback — Raschke: اتجاه مثبت بأعمق من التقاطعات
     'Pullback_MACD':              {'regimes': ('trend_up',),        'adx': (22.0, 32.0, None), 'atr_pct': (0.30, 5.0), 'struct_up_bonus': True, 'pos_roc_bonus': True},
     # الزخم: قادة الحركة الصاعدة — زخم سالب نقض قاسٍ (لا سكين ساقطة)
     'Bullish_Momentum':           {'regimes': ('trend_up',),        'adx': (20.0, 30.0, None), 'atr_pct': (0.40, 6.0), 'struct_up_bonus': True, 'pos_roc_bonus': True, 'require_pos_roc': True},
-    # الارتدادية — Connors [V9.24.0]: النطاق جوهرها، والتراجعات في الصاعد ائتمان ثانوي،
-    # والهابط مقبول شرط كاشف القاع+الارتداد (detect_bottom_bounce_setup) يصادق بشروطه
-    # المشددة (تشبع أعمق RSI<30 + قاع ≤0.8×ATR + شمعة ارتداد) — المنع المطلق كان يُعطّل
-    # استراتيجية القاع في السوق الوحيد الذي تكون فيه هي الفكرة الصحيحة (820 فحص/0 إشارة)
-    'BB_Stoch_Reversal_Enhanced': {'regimes': ('range', 'trend_down'), 'secondary_regimes': ('trend_up', 'transitional'), 'adx': (None, None, None), 'atr_pct': (0.25, 4.0), 'range_bonus': True, 'near_ema50': True},
-    # الاختراقية — Carter [V9.24.0+BT]: الانضغاط جوهرها، والاتجاه الصاعد ائتمان ثانوي.
-    # (range أُزيلت من الثانوية بالباك تيست: كل صفقات الاختراق في رموز مترنمة (flips≥5)
-    # كانت انفجارات زائفة — 4/4 خاسرة، الاختراق يحتاج انضغاطًا حقيقيًا لا رملًا)
-    'BB_Squeeze_Breakout':        {'regimes': ('squeeze',), 'secondary_regimes': ('trend_up',), 'adx': (None, None, 35.0), 'atr_pct': (None, 5.0), 'low_bbwp_bonus': True},
     'SR_Breakout_Enhanced':       {'regimes': ('range', 'squeeze'), 'secondary_regimes': ('trend_up',), 'adx': (None, None, 34.0), 'atr_pct': (None, 5.0), 'low_bbwp_bonus': True},
     # --- [V9.29.0] استراتيجيات freqtrade الأصلية: عائلة الارتداد تشتري فوق الحد السفلي
-    # — جوهرها النطاق/الهابط، ودليل V9.24 لنمط BB_STOCH ينطبق عليها حرفيًا
-    'FT_BbandRsi':                {'regimes': ('range', 'trend_down'), 'secondary_regimes': ('trend_up', 'transitional'), 'adx': (None, None, None), 'atr_pct': (0.25, 4.0), 'range_bonus': True},
     'FT_CombinedBinHAndCluc':     {'regimes': ('range', 'trend_down'), 'secondary_regimes': ('trend_up', 'transitional'), 'adx': (None, None, None), 'atr_pct': (0.25, 4.0), 'range_bonus': True},
     'FT_EMASkipPump':             {'regimes': ('range', 'trend_down'), 'secondary_regimes': ('trend_up', 'transitional'), 'adx': (None, None, None), 'atr_pct': (0.25, 4.0), 'range_bonus': True},
     'FT_Quickie':                 {'regimes': ('range', 'trend_down'), 'secondary_regimes': ('trend_up', 'transitional'), 'adx': (None, None, None), 'atr_pct': (0.25, 4.0), 'range_bonus': True},
-    'FT_Bandtastic':              {'regimes': ('range', 'trend_down'), 'secondary_regimes': ('trend_up', 'transitional'), 'adx': (None, None, None), 'atr_pct': (0.25, 4.0), 'range_bonus': True},
     # زخم freqtrade الأصلي (ADX>25 + +DI>-DI + MOM>0) — اتجاه صاعد قائم
     'FT_ADXMomentum':             {'regimes': ('trend_up',), 'adx': (20.0, 30.0, None), 'atr_pct': (0.40, 6.0), 'struct_up_bonus': True, 'pos_roc_bonus': True},
 }
@@ -320,33 +284,25 @@ STRATEGY_PAIR_PROFILES: Dict[str, Dict[str, Any]] = {
 # 10 توصيات BB_Squeeze في STRONG_DOWNTREND كلها stop_loss) — بل قاع-صيد الارتداد واختراق الدعوم.
 # المفاتيح نفسها المستخدمة في حلقة المسح. القيمة None = بلا تقييد (سقوط آمن عند حالة غير معروفة).
 # [V9.29.0] استراتيجيات freqtrade الأصلية انضمت لخريطة السوق: عائلة الارتداد (FT_REVERSAL)
-# مع BB_STOCH في كل الحالات (قاع-صيد أصيل — الشراء فوق الحد السفلي هو فكرتها)،
+# قاع-صيد أصيل في كل الحالات (الشراء فوق الحد السفلي هو فكرتها)،
 # و FT_ADXMOMENTUM مع الزخم الاستمراري (لا شراء زخم ضد الاتجاه).
+# [V9.37.0] مفاتيح BB_STOCH/BB_SQUEEZE/MACD_EMA حُذفت مع استراتيجياتها.
 MARKET_STATE_STRATEGY_ALLOW: Dict[str, Optional[Tuple[str, ...]]] = {
-    'STRONG_DOWNTREND': ('BB_STOCH', 'SR_BREAKOUT') + FT_REVERSAL_KEYS,
-    'DOWNTREND':        ('BB_STOCH', 'SR_BREAKOUT', 'BB_SQUEEZE') + FT_REVERSAL_KEYS,
-    'RANGING':          ('BB_STOCH', 'SR_BREAKOUT', 'BB_SQUEEZE', 'MACD_EMA', 'EMA_RSI', 'PULLBACK') + FT_REVERSAL_KEYS,
-    'UNCERTAIN':        ('BB_STOCH', 'SR_BREAKOUT', 'BB_SQUEEZE', 'MACD_EMA', 'EMA_RSI', 'PULLBACK', 'BULLISH_MOMENTUM') + FT_REVERSAL_KEYS + FT_TREND_KEYS,
-    'UPTREND':          ('BB_STOCH', 'SR_BREAKOUT', 'BB_SQUEEZE', 'MACD_EMA', 'EMA_RSI', 'PULLBACK', 'BULLISH_MOMENTUM') + FT_REVERSAL_KEYS + FT_TREND_KEYS,
-    'STRONG_UPTREND':   ('BB_STOCH', 'SR_BREAKOUT', 'BB_SQUEEZE', 'MACD_EMA', 'EMA_RSI', 'PULLBACK', 'BULLISH_MOMENTUM') + FT_REVERSAL_KEYS + FT_TREND_KEYS,
+    'STRONG_DOWNTREND': ('SR_BREAKOUT',) + FT_REVERSAL_KEYS,
+    'DOWNTREND':        ('SR_BREAKOUT',) + FT_REVERSAL_KEYS,
+    'RANGING':          ('SR_BREAKOUT', 'EMA_RSI', 'PULLBACK') + FT_REVERSAL_KEYS,
+    'UNCERTAIN':        ('SR_BREAKOUT', 'EMA_RSI', 'PULLBACK', 'BULLISH_MOMENTUM') + FT_REVERSAL_KEYS + FT_TREND_KEYS,
+    'UPTREND':          ('SR_BREAKOUT', 'EMA_RSI', 'PULLBACK', 'BULLISH_MOMENTUM') + FT_REVERSAL_KEYS + FT_TREND_KEYS,
+    'STRONG_UPTREND':   ('SR_BREAKOUT', 'EMA_RSI', 'PULLBACK', 'BULLISH_MOMENTUM') + FT_REVERSAL_KEYS + FT_TREND_KEYS,
 }
-# ثوابت كاشف القاع والارتداد الحتمي [V9.24.0] — طلب المستخدم: "عملات في قاع سعرها
-# أعطت مؤشرات على ارتدادها تفحص هذه الرموز باستراتيجية الارتداد".
-# في الهبوط الحاد تشتد الصرامة (تشبع أعمق + قاع أقرب) لأن السكين الساقطة تكرر القيعان.
-BOTTOM_WINDOW_BARS: int = 96                  # قاع 24 ساعة على فريم 15م
-BOTTOM_DIST_LOW_ATR: float = 1.2              # القاع: السعر ضمن 1.2×ATR من أدنى قاع النافذة
-BOTTOM_DIST_LOW_ATR_DOWNTREND: float = 0.8    # وفي الهبوط: أقرب للقاع (≤0.8×ATR)
-BOTTOM_RSI_MAX_RANGE: float = 35.0            # تشبع بيعي في السوق العادي
-BOTTOM_RSI_MAX_DOWNTREND: float = 30.0        # تشبع أعمق إلزامي في الهبوط الحاد
-BOTTOM_STOCH_MAX: float = 40.0                # ستوكاستك RSI في المنطقة السفلية بدوران صاعد
-BOTTOM_WICK_MIN_RATIO: float = 0.45           # ذيل سفلي ≥45% من مدى الشمعة = دليل رفض بيع
-SQUEEZE_BBWP_MAX: float = 0.30                # انضغاط فعلي: عرض بولنجر في أدنى 30% من تاريخه الحديث
+# [V9.37.0] ثوابت كاشفي القاع/الانضغاط (BOTTOM_* و SQUEEZE_BBWP_MAX) حُذفت مع حذف
+# الاستراتيجيتين الارتداديتين وكاشفيهما detect_bottom_bounce_setup/detect_squeeze_setup.
 # [V9.24.0] فلتر ثبات الريم العام للاستراتيجيات الاستمرارية (مستوحى من الباك تيست):
 # في السوق المنشاري يتنقل الريم بين UPTREND و DOWNTREND بسرعة — شراء الزخم/الاختراق
 # في ارتداد دببة "قوي صاعد" كان يخسر -0.33%/صفقة. القاعدة: لا استراتيجيات استمرارية
 # إلا بعد ثبات عائلة الريم الصاعد MARKET_REGIME_PERSIST_MIN دقيقة متصلة (الحتمية لا التكهن).
 MARKET_REGIME_PERSIST_MIN: int = int(os.environ.get('MARKET_REGIME_PERSIST_MIN', '480'))  # 8 ساعات
-TREND_CONTINUATION_KEYS: Tuple[str, ...] = ('MACD_EMA', 'EMA_RSI', 'PULLBACK', 'BULLISH_MOMENTUM', 'BB_SQUEEZE') + FT_TREND_KEYS  # [V9.29.0] + FT_ADXMOMENTUM
+TREND_CONTINUATION_KEYS: Tuple[str, ...] = ('EMA_RSI', 'PULLBACK', 'BULLISH_MOMENTUM') + FT_TREND_KEYS  # [V9.37.0] بعد حذف MACD_EMA/BB_SQUEEZE
 # سجل تاريخ الريم العام للحية (تُملأ في determine_market_state_enhanced) لحساب الثبات
 MARKET_REGIME_HISTORY: deque = deque(maxlen=400)   # ~20 ساعة بعينات كل 3 دقائق
 
@@ -578,8 +534,8 @@ FT_EXIT_SKIP_MAX_MIN: float = config('FT_EXIT_SKIP_MAX_MIN', default=90.0, cast=
 # أ) الإزالة البنيوية المثبتة: BB_Stoch_Reversal ميتة بنيويًا — تناقض داخلي بين شرط دخولها
 #    (لمس BB السفلي بذيل ضاغط = السعر 2-4×ATR تحت EMA50 في الهبوط) وفلترها Connors
 #    (قبول ضمن 1×ATR من EMA50): 431 رفضًا ثم 155 ثم 156/156 فحصًا معطّلًا بلا نجاح واحد
-#    عبر حياتها المفلترة كلها، وشخصيتها (قاع-صيد الارتداد) تغطيها عائلة FT العكسية الخمس
-#    الأصلية بأداء حي أفضل (Bandtastic خلية PF 3.99، BinHCluc ربح فعلي). إزالتها توفّر
+#    عبر حياتها المفلترة كلها، وشخصيتها (قاع-صيد الارتداد) تغطيها عائلة FT العكسية
+#    الأصلية بأداء حي أفضل (BinHCluc ربح فعلي PF 4.02). إزالتها توفّر
 #    156 فحصًا/دورة (~12% من ميزانية المسح) وبند فلترة وبند أدلة وبند واجهة بلا مقابل.
 # ب) التقاعد الآلي بالبيانات: أي استراتيجية أخرى تثبت ضعفها حيًا تُعلَّق تلقائيًا (انظر
 #    حاكم تقاعد الاستراتيجيات أدناه) — الإزالة بالبرهان لا بالتخمين (فلسفة بوابة الأدلة ذاتها).
@@ -587,14 +543,25 @@ FT_EXIT_SKIP_MAX_MIN: float = config('FT_EXIT_SKIP_MAX_MIN', default=90.0, cast=
 #    Evaluator/Util/trend_analysis.py (قبول 0.9-0.95 بتأخير 1-2) — السكين الذي ما زال
 #    يصنع قيعانًا جديدة يُرفض؛ الدخول فقط بعد تشكل القاع وبدء الارتداد.
 # القوائم قابلة للضبط عبر البيئة؛ "off" يعيد كل شيء لوضع ما قبل V9.34.
-# [V9.36.0] + MACD_EMA: n=7 وPF 0.012 وWR 14.3% و-0.58$ (RLC -6.64/MINA -4.62) —
-# حاكم التقاعد ينتظر n≥12 لكن إحصاءها قاطع عند 7 (المكاسب 1.2% من الخسائر) — تعطيل فوري
-STRATEGY_DISABLED_DEFAULT = ['BB_STOCH', 'MACD_EMA']
+# [V9.36.0] + MACD_EMA: n=7 وPF 0.012 وWR 14.3% و-0.58$ (RLC -6.64/MINA -4.62)
+# [V9.37.0] الحذف البنيوي الكامل بطلب المستخدم ("تصفية الكود وتنضيفه وحذف الاستراتيجيات
+# ذات الأداء السيئ"): الخمس مفاتيح أدناه استراتيجيات محذوفة من الكود كله (دوال/كواشف/
+# بروفايلات/واجهات) — المفاتيح تبقى حصرًا لوسم إحصائياتها التاريخية في DB بحالة
+# 'retired' في /api/strategy_pnl:
+#   BB_STOCH      ميتة بنيويًا (100% رفض فلتر) — تقاعد V9.34
+#   MACD_EMA      n=7  PF 0.012  WR 14.3%  -0.58$
+#   BB_SQUEEZE    n=17 PF 0.025  WR 11.8%  -1.20$ (أسوأ محصلة)
+#   FT_BBANDRSI   n=2  PF 0.0  -0.38$ (نزف MAGIC -9.22% قبل نشر EQG)
+#   FT_BANDTASTIC n=2  PF 0.0  -0.20$
+STRATEGY_DISABLED_DEFAULT = ['BB_STOCH', 'MACD_EMA', 'BB_SQUEEZE', 'FT_BBANDRSI', 'FT_BANDTASTIC']
 
 # خريطة مفتاح التعطيل → اسم العرض (للحالة 'retired' في /api/strategy_pnl والتوثيق الموحد)
 STRATEGY_KEY_TO_DISPLAY: Dict[str, str] = {
     'BB_STOCH': 'BB_Stoch_Reversal_Enhanced',
     'MACD_EMA': 'MACD_EMA_Crossover',
+    'BB_SQUEEZE': 'BB_Squeeze_Breakout',
+    'FT_BBANDRSI': 'FT_BbandRsi',
+    'FT_BANDTASTIC': 'FT_Bandtastic',
 }
 
 def _parse_disabled_strategies(raw: str) -> List[str]:
@@ -663,15 +630,12 @@ if _raw_ladder_env.lower() in ('off', 'disabled', '0', 'none', ''):
     PROFIT_LOCK_LADDER: List[Tuple[float, float]] = []
 else:
     PROFIT_LOCK_LADDER = _parse_profit_lock_ladder(_raw_ladder_env) or _parse_profit_lock_ladder(_LADDER_DEFAULT_RAW)
-# الحاجز الزمني لكل استراتيجية بالدقائق (الاستراتيجيات الأصليات السبع — 0 يعطّل)
+# الحاجز الزمني لكل استراتيجية بالدقائق (الباقية بعد تنظيف V9.37 — 0 يعطّل)
 # فلسفة: الاختراق يجب أن يعمل سريعًا (3-4س)، الاتجاهي يُعطى 5س، الارتدادي نطاق أوسع (6س)
 STRATEGY_TIME_LIMIT_DEFAULTS: Dict[str, int] = {
     'SR_Breakout_Enhanced': 180,
-    'BB_Squeeze_Breakout': 240,
-    'MACD_EMA_Crossover': 300,
     'EMA_RSI_Cross': 300,
     'Bullish_Momentum': 300,
-    'BB_Stoch_Reversal_Enhanced': 360,
     'Pullback_MACD': 360,
 }
 def _load_strategy_time_limits() -> Dict[str, int]:
@@ -2373,20 +2337,14 @@ REJECTION_REASONS_AR = {
     "HTF Trend Confirmation Failed": "فشل تأكيد الترند على الفريم الأعلى",
     "Short-Term Momentum Filter Failed": "فشل فلتر الزخم قصير الأجل",
     "Bullish Momentum Strategy Conditions Not Met": "شروط استراتيجية الزخم الصعودي لم تتحقق",
-    "BB_Stoch Strategy Conditions Not Met": "شروط استراتيجية BB+Stoch لم تتحقق",
-    "MACD_EMA Strategy Conditions Not Met": "شروط استراتيجية MACD+EMA لم تتحقق",
     "EMA_RSI Strategy Conditions Not Met": "شروط استراتيجية EMA+RSI لم تتحقق",
     "Pullback Strategy Conditions Not Met": "شروط استراتيجية Pullback لم تتحقق",
-    "BB Squeeze Strategy Conditions Not Met": "شروط استراتيجية BB Squeeze لم تتحقق",
     "SR Breakout Strategy Conditions Not Met": "شروط استراتيجية اختراق الدعم/المقاومة لم تتحقق",
     # [V9.29.0] استراتيجيات freqtrade الأصلية
-    "FT_BbandRsi Strategy Conditions Not Met": "شروط freqtrade BbandRsi (RSI<30 فوق الحد السفلي) لم تتحقق",
     "FT_CombinedBinHAndCluc Strategy Conditions Not Met": "شروط freqtrade BinH+Cluc لم تتحقق",
     "FT_EMASkipPump Strategy Conditions Not Met": "شروط freqtrade EMASkipPump لم تتحقق",
     "FT_Quickie Strategy Conditions Not Met": "شروط freqtrade Quickie لم تتحقق",
     "FT_ADXMomentum Strategy Conditions Not Met": "شروط freqtrade ADXMomentum لم تتحقق",
-    "FT_Bandtastic Strategy Conditions Not Met": "شروط freqtrade Bandtastic لم تتحقق",
-    "Price Peak Avoidance": "تجنب الدخول عند قمة آخر 24 ساعة (استراتيجية ارتدادية)",
     "Daily Loss Limit": "قاطع الحماية: تم إيقاف فتح صفقات جديدة بسبب تجاوز حد الخسارة اليومي",
     "Leader Behavior Veto": "سلوك القائد معاكس: القائد هابط والعملة تابعة له",
     "Market Sanity Filter Failed": "بوابة العقلانية: سوق ميت أو فوضوي بدرجة قصوى",
@@ -2768,10 +2726,9 @@ def refresh_universe_if_needed(force: bool = False) -> None:
 # المنهج (حتمي لا تكهن): لكل استراتيجية بصمة ظروف رقمية من مقاييس التكه المجاني
 # (موقع السعر في مدى 24س + اتجاه الحركة + ضيق المدى + رتبة السيولة داخل الدائرة)،
 # بها تُرتب كل عملات الدائرة الواسعة (120) وتُختار الأعلى عشر لتفحصها هي فقط:
-#   BB_STOCH (الارتداد):     عند القاع + هابط اليوم (بلا سكين متطرفة) + مدى يسمح بالارتداد
-#   BB_SQUEEZE (الانضغاط):   مدى 24س ضيق + سعر في منتصف النطاق (زنبرك ملفوف)
+#   عائلة FT الارتدادية:     عند القاع + هابط اليوم (بلا سكين متطرفة) + مدى يسمح بالارتداد
 #   SR_BREAKOUT:             عند القمة + صاعد اليوم (يختبر مقاومة محددة)
-#   MACD_EMA / EMA_RSI:      صاعدة اليوم + في النصف العلوي من النطاق (هيكل صاعد)
+#   EMA_RSI:                 صاعدة اليوم + في النصف العلوي من النطاق (هيكل صاعد)
 #   BULLISH_MOMENTUM:        زخم صاعد قوي + قرب القمة (استمرارية)
 #   PULLBACK (التراجع):      صاعدة على 24س + تراجعت لمنتصف النطاق (شراء الغور في الصاعد)
 # ============================================================
@@ -2790,22 +2747,12 @@ def _nominee_score_for(key: str, m: Dict[str, float]) -> Tuple[float, str]:
     chg = float(m.get('chg_signed', 0.0))
     rng = float(m.get('range_pct', 0.0))
     liq = float(m.get('qvol_rank', 50.0))
-    if key == 'BB_STOCH' or key in FT_REVERSAL_KEYS:
+    if key in FT_REVERSAL_KEYS:
         bottom = (1.0 - pos) * 100.0
         fell = _clamp_0_100(-chg, 0.0, 15.0)      # هبوط اليوم = وقود الارتداد (سقف 15% لاستبعاد السكاكين)
         room = _clamp_0_100(rng, 0.0, 10.0)        # مدى كافٍ للارتداد داخل اليوم
         score = 0.40 * bottom + 0.25 * fell + 0.20 * liq + 0.15 * room
-        why = f"قرب قاع 24س ({bottom:.0f}% من المسافة إليه) بتغير {chg:+.1f}% — قاع صيد الارتداد"
-        if key != 'BB_STOCH':
-            why += " (عائلة freqtrade الأصلية)"
-    elif key == 'BB_SQUEEZE':
-        tight = 100.0 - _clamp_0_100(rng, 0.0, 8.0)
-        mid = max(0.0, (1.0 - abs(pos - 0.5) * 2.0)) * 100.0
-        score = 0.45 * tight + 0.30 * mid + 0.25 * liq
-        # [V9.25.0] صك حي: يوم متحرك بالفعل (±10%) ليس انضغاطًا — الانضغاط حبس قبل الانفجار
-        if abs(chg) > 10.0:
-            score -= 15.0
-        why = f"مدى 24س {rng:.1f}% (انضغاط) والسعر في منتصف النطاق — زنبرك ملفوف"
+        why = f"قرب قاع 24س ({bottom:.0f}% من المسافة إليه) بتغير {chg:+.1f}% — قاع صيد الارتداد (عائلة freqtrade الأصلية)"
     elif key == 'SR_BREAKOUT':
         near_high = pos * 100.0
         rising = _clamp_0_100(chg, 0.0, 10.0)
@@ -2813,7 +2760,7 @@ def _nominee_score_for(key: str, m: Dict[str, float]) -> Tuple[float, str]:
         # (درس حي: عملة +30% في منتصف النطاق ليست مرشح اختراق مقاومة)
         score = 0.55 * near_high + 0.20 * rising + 0.25 * liq
         why = f"عند {near_high:.0f}% من قمة 24س بتغير {chg:+.1f}% — يختبر مقاومة"
-    elif key in ('MACD_EMA', 'EMA_RSI'):
+    elif key == 'EMA_RSI':
         rising = _clamp_0_100(chg, 0.0, 10.0)
         upper = pos * 100.0
         score = 0.40 * rising + 0.35 * upper + 0.25 * liq
@@ -2969,26 +2916,6 @@ def fetch_historical_data(symbol: str, interval: str, days: int) -> Optional[pd.
         logger.error(f"❌ [جلب البيانات] خطأ في جلب البيانات التاريخية لـ {symbol} ({interval}): {e}")
         return None
 
-def check_price_peak_filter(df: pd.DataFrame, current_price: float) -> bool:
-    """[مفعّل في V9.8] فلتر تجنب الدخول عند القمم لاستراتيجيات الارتداد (Mean-Reversion).
-    يمنع الدخول إذا كان السعر الحالي عند قمة آخر 24 ساعة (96 شمعة على فريم 15 دقيقة)،
-    لأن شراء الارتداد عند القمة له نسبة نجاح منخفضة.
-    ملاحظة: لا يطبق على استراتيجيات الاختراق لأنها تشتري عند القمم بطبيعتها.
-    """
-    try:
-        if len(df) < 96:
-            return True  # بيانات غير كافية، لا نرفض
-        recent_peak_24h = df['high'].iloc[-96:].max()
-        if current_price >= recent_peak_24h * 0.999:
-            log_rejection(getattr(df, 'name', 'UNKNOWN'), "Price Peak Avoidance", {
-                "current_price": current_price, "recent_peak_24h": float(recent_peak_24h)
-            })
-            return False
-        return True
-    except Exception as e:
-        logger.warning(f"⚠️ [فلتر القمم] خطأ غير متوقع: {e}")
-        return True
-
 def calculate_advanced_momentum_features(df: pd.DataFrame) -> pd.DataFrame:
     highest_high = df['high'].rolling(window=14).max()
     lowest_low = df['low'].rolling(window=14).min()
@@ -3142,15 +3069,13 @@ def calculate_all_features(df: pd.DataFrame, btc_df: Optional[pd.DataFrame]) -> 
     df_calc['price_vs_ema50'] = (df_calc['close'] / df_calc['ema_50']) - 1
     df_calc['price_vs_ema200'] = (df_calc['close'] / df_calc['close'].ewm(span=200, adjust=False).mean()) - 1
     # --- [V9.29.0] مؤشرات استراتيجيات freqtrade الأصلية (متجهيًا لكل النافذة) ---
-    # بولنجر على السعر النمطي (20، ±1/±2 انحراف) — qtpylib.bollinger_bands(typical_price)
-    # كما في BbandRsi/Cluc/EMASkipPump/Bandtastic حرفيًا
+    # بولنجر على السعر النمطي (20، ±2 انحراف) — qtpylib.bollinger_bands(typical_price)
+    # كما في Cluc/EMASkipPump حرفيًا
     _ft_typ = (df_calc['high'] + df_calc['low'] + df_calc['close']) / 3.0
     _ft_tp_mid = _ft_typ.rolling(20).mean()
     _ft_tp_std = _ft_typ.rolling(20).std()
     df_calc['ft_tp_mid20'] = _ft_tp_mid
-    df_calc['ft_tp_low1'] = _ft_tp_mid - _ft_tp_std
     df_calc['ft_tp_low2'] = _ft_tp_mid - 2.0 * _ft_tp_std
-    df_calc['ft_tp_up1'] = _ft_tp_mid + _ft_tp_std
     df_calc['ft_tp_up2'] = _ft_tp_mid + 2.0 * _ft_tp_std
     # بولنجر على الإغلاق (20) — Quickie، و(40) — BinHV45 (داخل CombinedBinHAndCluc)
     df_calc['ft_close_mid20'] = df_calc['close'].rolling(20).mean()
@@ -3166,12 +3091,8 @@ def calculate_all_features(df: pd.DataFrame, btc_df: Optional[pd.DataFrame]) -> 
     _ft_e2 = _ft_e1.ewm(span=9, adjust=False).mean()
     _ft_e3 = _ft_e2.ewm(span=9, adjust=False).mean()
     df_calc['ft_tema9'] = (3.0 * _ft_e1) - (3.0 * _ft_e2) + _ft_e3
-    # MOM(14) — ADXMomentum، و MFI(14) — Bandtastic (مجموع التدفق الموجب/السالب كما في TA-Lib)
+    # MOM(14) — ADXMomentum
     df_calc['ft_mom14'] = df_calc['close'] - df_calc['close'].shift(14)
-    _ft_mf_tv = _ft_typ * df_calc['volume']
-    _ft_mf_pos = _ft_mf_tv.where(_ft_typ > _ft_typ.shift(), 0.0).rolling(14).sum()
-    _ft_mf_neg = _ft_mf_tv.where(_ft_typ < _ft_typ.shift(), 0.0).rolling(14).sum()
-    df_calc['ft_mfi14'] = 100.0 - 100.0 / (1.0 + (_ft_mf_pos / _ft_mf_neg.replace(0, np.nan)))
     # EMA5/EMA12 وقاع/قمة 12 — EMASkipPump
     df_calc['ft_ema5'] = df_calc['close'].ewm(span=5, adjust=False).mean()
     df_calc['ft_ema12'] = df_calc['close'].ewm(span=12, adjust=False).mean()
@@ -3551,123 +3472,9 @@ def score_strategy_pair_fit(ri: Optional[Dict[str, Any]], strategy_name: str) ->
 # --- [V9.24.0] كواشف التجهيز الشرطي لكل استراتيجية (Deterministic Setup Scanners) ---
 # الفلسفة الجديدة بطلب المستخدم: لا توصية بلا "تجهيز" حتمي مكتشف على الرمز نفسه —
 # مثال: استراتيجية الارتداد تُفحص فقط على عملات في قاع سعرها أعطت مؤشرات ارتداد فعلية.
-# الكاشف يجيب سؤال "هل ظروف هذه الاستراتيجية متجسدة في هذا الرمز الآن؟" بأرقام صريحة،
-# وتوثق الأدلة الرقمية في تفاصيل الإشارة (مسافة عن القاع، RSI، دوران الستوك، شمعة الارتداد).
-
-def _market_regime_is_downtrend(market_regime: str) -> bool:
-    return 'DOWNTREND' in str(market_regime or '').upper()
-
-
-def detect_bottom_bounce_setup(df: pd.DataFrame, market_regime: str = '') -> Tuple[bool, Dict[str, Any]]:
-    """[V9.24.0] كاشف القاع والارتداد الحتمي — قلب طلب المستخدم.
-    شروط صارمة قابلة للتوثيق:
-      (1) القاع: السعر ضمن bottom_dist×ATR من أدنى قاع آخر 96 شمعة (24 ساعة على 15م)
-      (2) لمس بولنجر السفلي بذيل أو جسم
-      (3) تشبع بيعي RSI: <35 عاديًا، <30 إلزاميًا في الهبوط الحاد (سكين أعمق)
-      (4) ستوكاستك RSI في القاع (K<40) بدوران صاعد (K فوق قيمته السابقة أو فوق D)
-      (5) شمعة ارتداد فعلية: خضراء أو ذيل سفلي ≥45% من مدى الشمعة
-    في الهبوط الحاد تُشترط (1)+(3)+(4)+(5) كلها بلا تنازل، وفي العادي (1)+(3)+(4)+(2 أو 5).
-    تعيد (قرار، أدلة رقمية للتوثيق في اللوحة)."""
-    ev: Dict[str, Any] = {'setup': 'bottom_bounce'}
-    if len(df) < max(110, BOTTOM_WINDOW_BARS + 10):
-        ev['reason'] = 'شموع غير كافية'
-        return False, ev
-    last, prev = df.iloc[-1], df.iloc[-2]
-    try:
-        atr = float(last['atr']) if pd.notna(last['atr']) else 0.0
-        close = float(last['close'])
-    except Exception:
-        return False, ev
-    if not (atr > 0 and close > 0):
-        ev['reason'] = 'ATR/سعر غير صالحين'
-        return False, ev
-    downtrend = _market_regime_is_downtrend(market_regime)
-    dist_cap = BOTTOM_DIST_LOW_ATR_DOWNTREND if downtrend else BOTTOM_DIST_LOW_ATR
-    rsi_cap = BOTTOM_RSI_MAX_DOWNTREND if downtrend else BOTTOM_RSI_MAX_RANGE
-    # (1) القاع
-    window = df.iloc[-BOTTOM_WINDOW_BARS:]
-    low_win = float(window['low'].min())
-    dist_low_atr = (close - low_win) / atr
-    at_bottom = dist_low_atr <= dist_cap
-    ev['dist_low_atr'] = round(dist_low_atr, 2)
-    ev['low_window'] = low_win
-    # (2) لمس بولنجر السفلي
-    bb_lower = float(last['bb_lower']) if ('bb_lower' in last and pd.notna(last['bb_lower'])) else None
-    touched_bb = bool(bb_lower is not None and float(last['low']) <= bb_lower * 1.002)
-    if bb_lower is not None:
-        ev['bb_lower'] = round(bb_lower, 6)
-    ev['touched_bb'] = touched_bb
-    # (3) تشبع بيعي
-    rsi = float(last['rsi']) if ('rsi' in last and pd.notna(last['rsi'])) else 50.0
-    oversold = rsi < rsi_cap
-    ev['rsi'] = round(rsi, 1)
-    # (4) ستوك في القاع بدوران صاعد
-    k = float(last['stoch_rsi_k']) if ('stoch_rsi_k' in last and pd.notna(last['stoch_rsi_k'])) else 100.0
-    d = float(last['stoch_rsi_d']) if ('stoch_rsi_d' in last and pd.notna(last['stoch_rsi_d'])) else 100.0
-    k_prev = float(prev['stoch_rsi_k']) if ('stoch_rsi_k' in prev and pd.notna(prev['stoch_rsi_k'])) else 100.0
-    stoch_low_turn = (k < BOTTOM_STOCH_MAX) and ((k > k_prev) or (k > d))
-    ev['stoch_k'] = round(k, 1)
-    ev['stoch_turn'] = stoch_low_turn
-    # (5) شمعة الارتداد
-    candle_range = max(float(last['high']) - float(last['low']), 1e-12)
-    lower_wick = (min(float(last['open']), close) - float(last['low'])) / candle_range
-    green = close > float(last['open'])
-    bounce_candle = green or (lower_wick >= BOTTOM_WICK_MIN_RATIO)
-    ev['bounce_candle'] = bool(bounce_candle)
-    ev['lower_wick_pct'] = round(lower_wick * 100.0, 1)
-    ev['downtrend_strict'] = downtrend
-    if downtrend:
-        ok = at_bottom and oversold and stoch_low_turn and bounce_candle
-    else:
-        ok = at_bottom and oversold and stoch_low_turn and (touched_bb or bounce_candle)
-    if not ok:
-        ev['reason'] = 'شروط القاع/الارتداد غير مكتملة'
-    return ok, ev
-
-
-def detect_squeeze_setup(df: pd.DataFrame, market_regime: str = '') -> Tuple[bool, Dict[str, Any]]:
-    """[V9.24.0] تجهيز الاختراقية: انضغاط فعلي + نقض هيكلي للهبوط.
-    (أ) الانضغاط: عرض بولنجر الحالي في أدنى SQUEEZE_BBWP_MAX من آخر 220 شمعة (مستبعدين آخر 20)
-    (ب) النقض الهيكلي: لا اختراق صاعد يُشترى ضد هيكل هابط (EMA21<EMA50 مع السعر تحت EMA50)
-        — هذا بالضبط نمط "ارتداد الموتى" الذي خسر به البوت 10 صفقات متتالية في الهبوط الحاد."""
-    ev: Dict[str, Any] = {'setup': 'squeeze'}
-    if len(df) < 240:
-        ev['reason'] = 'شموع غير كافية للانضغاط'
-        return False, ev
-    last = df.iloc[-1]
-    bbw_all = df['bb_width'].astype(float)
-    cur_bbw = float(bbw_all.iloc[-1]) if pd.notna(bbw_all.iloc[-1]) else None
-    if cur_bbw is None:
-        return False, ev
-    hist = bbw_all.iloc[-220:-20]
-    bbwp = float((hist <= cur_bbw).mean()) if len(hist) > 20 else 1.0
-    ev['bbwp'] = round(bbwp, 2)
-    squeezed = bbwp <= SQUEEZE_BBWP_MAX
-    ema50 = float(last['ema_50']) if pd.notna(last['ema_50']) else None
-    ema21 = float(last['ema_21']) if ('ema_21' in last and pd.notna(last['ema_21'])) else None
-    close = float(last['close'])
-    # [V9.24.0 +باك تيست] تشديد: الاختراق الصاعد استمرارية — يشترط هيكل صاعد كامل
-    # (EMA21 فوق EMA50 والسعر فوق EMA50). الإصدار الأول (نقض الهابط الصريح فقط)
-    # خسر -13% في السوق المنشاري: اختراقات زائفة في نطاق رملي بلا اتجاه حقيقي
-    bullish_struct = bool(ema50 is not None and ema21 is not None and ema21 > ema50 and close > ema50)
-    ev['bullish_structure'] = bullish_struct
-    # [V9.24.0+BT] قوة 24 ساعة: الرمز نفسه صاعد على نافذة القاع (96 شمعة) —
-    # اختراق انضغاط في رمز هابط يوميًا = سكين ملتفة لا استمرارية
-    mom_24h = None
-    if len(df) > BOTTOM_WINDOW_BARS:
-        ref_close = float(df['close'].iloc[-BOTTOM_WINDOW_BARS])
-        if ref_close > 0:
-            mom_24h = (close - ref_close) / ref_close * 100.0
-            ev['mom_24h_pct'] = round(mom_24h, 2)
-    rising_24h = bool(mom_24h is not None and mom_24h > 0.0)
-    ev['rising_24h'] = rising_24h
-    ok = squeezed and bullish_struct and rising_24h
-    if not ok:
-        ev['reason'] = ('انضغاط غير فعّال' if not squeezed
-                        else 'هيكل غير صاعد — الاختراق استمرارية لا انعكاس' if not bullish_struct
-                        else 'الرمز هابط على 24 ساعة — لا اختراق ضد الموجة اليومية')
-    return ok, ev
-
+# الكاشف يجيب سؤال "هل ظروف هذه الاستراتيجية متجسدة في هذا الرمز الآن؟" بأرقام صريحة
+# توثق في تفاصيل الإشارة. [V9.37.0] بقي كاشف الهيكل الصاعد حصرًا بعد حذف الاستراتيجيات
+# الارتدادية/الانضغاطية وكاشفيهما.
 
 def detect_trend_structure_setup(df: pd.DataFrame, market_regime: str = '') -> Tuple[bool, Dict[str, Any]]:
     """[V9.24.0] تجهيز الاستراتيجيات الاتجاهية (تقاطعات/زخم/تراجع): هيكل صاعد سليم.
@@ -3698,10 +3505,7 @@ def detect_trend_structure_setup(df: pd.DataFrame, market_regime: str = '') -> T
 
 # خريطة الكواشف: مفتاح الاستراتيجية (كما في حلقة المسح) → دالة التجهيز الشرطي
 STRATEGY_SETUP_SCANNERS: Dict[str, Any] = {
-    'BB_STOCH': detect_bottom_bounce_setup,        # الارتداد: قاع + مؤشرات ارتداد (طلب المستخدم)
-    'BB_SQUEEZE': detect_squeeze_setup,            # الاختراقية: انضغاط + نقض الهيكل الهابط
     'SR_BREAKOUT': None,                            # اختراق الدعوم: الفحص نفسه شرطي (كسر مقاومة محدد سلفًا)
-    'MACD_EMA': detect_trend_structure_setup,
     'EMA_RSI': detect_trend_structure_setup,
     'PULLBACK': detect_trend_structure_setup,
     'BULLISH_MOMENTUM': detect_trend_structure_setup,
@@ -3712,91 +3516,6 @@ STRATEGY_SETUP_SCANNERS: Dict[str, Any] = {
 
 
 # --- [تحسين] دوال منطق الاستراتيجيات (تم تحسينها) ---
-def check_bb_stoch_strategy_enhanced(df: pd.DataFrame) -> bool:
-    """استراتيجية BB+Stoch المحسنة مع فلاتر إضافية.
-
-    [V9.27.0] اقتباسان من freqtrade المجتمعي (مثبتان بالباك تيست):
-    - فلتر الجسم الضاغط (BinHV45): (الإغلاق − القاع) < 0.25 × (الوسط − الحد السفلي للبولنجر)
-      أي شمعة لا تزال تضغط نحو الأسفل وليست شمعة ارتدت بالفعل (ذيل سفلي طويل = الالتقاط متأخر
-      والهدف قد نقص). باك تيست: PF 1.007→1.887 والتوقع ×74.
-    - حارس المضخة (ClucMay72018/EMASkipPump): حجم > 20× متوسط30 = شمعة مضخة/سكين متلاعب بها → رفض.
-    """
-    if len(df) < 35: 
-        return False
-        
-    last, prev = df.iloc[-1], df.iloc[-2]
-    
-    # الشروط الأساسية
-    price_touch_bb = last['low'] <= (last['bb_lower'] * 1.002)
-    stoch_cross_up = prev['stoch_rsi_k'] < prev['stoch_rsi_d'] and last['stoch_rsi_k'] > last['stoch_rsi_d']
-    oversold_area = last['stoch_rsi_k'] < 35 and last['stoch_rsi_d'] < 35
-    
-    # فلاتر إضافية
-    volume_spike = last['volume'] > last['volume_sma_20'] * 1.2
-
-    # [V9.27.0] فلتر الجسم الضاغط (BinHV45): الإغلاق قريب من القاع — شمعة تضغط لا ارتدت
-    band_span = max(float(last['bb_middle']) - float(last['bb_lower']), 1e-12)
-    tail_pressing = (float(last['close']) - float(last['low'])) < (BB_STOCH_TAIL_MAX_RATIO * band_span)
-
-    # [V9.27.0] حارس المضخة (Cluc/EMASkipPump): رفض شموع الحجم المتعالي (مضخة/سكين متلاعب بها)
-    vol_mean30 = last['volume_sma_30'] if 'volume_sma_30' in last else float('nan')
-    not_pump_candle = (not pd.notna(vol_mean30)) or (float(last['volume']) <= float(vol_mean30) * BB_STOCH_PUMP_VOLUME_MULT)
-    # [V9.24.0] إلغاء النقض العالمي للهبوط هنا — منطق الريم انتقل إلى:
-    # كاشف القاع+الارتداد (detect_bottom_bounce_setup) الذي يشتد في الهبوط بدل أن يمنع،
-    # وخريطة السوق العام (MARKET_STATE_STRATEGY_ALLOW) التي تحسم الاستراتيجيات المسموحة.
-    # النتيجة الحية قبل الإلغاء: 820 فحصًا صفرًا إشارةً في STRONG_DOWNTREND — استراتيجية
-    # القاع الوحيدة كانت معطلة في السوق الوحيد الذي تكون فيه هي الفكرة الصحيحة.
-    
-    # فلتر: تجنب الإشارات في النطاق الضيق جدًا
-    bb_width_ok = last['bb_width'] > 0.02
-    
-    # فلتر: السكين الساقطة العمياء (RSI<25 = غرق حقيقي غير قابل للاقتناص)
-    price_not_oversold = last['rsi'] > 25
-    
-    conditions = {
-        "price_touch_bb": price_touch_bb,
-        "stoch_cross_up": stoch_cross_up,
-        "oversold_area": oversold_area,
-        "volume_spike": volume_spike,
-        "bb_width_ok": bb_width_ok,
-        "price_not_oversold": price_not_oversold,
-        "tail_pressing": tail_pressing,      # [V9.27.0] BinHV45
-        "not_pump_candle": not_pump_candle   # [V9.27.0] Cluc/EMASkipPump
-    }
-    
-    if all(conditions.values()):
-        logger.info(f"  -> [{df.name}] ✅ إشارة BB+Stoch (معززة).")
-        return True
-    
-    # تسجيل الشروط الفاشلة للمساعدة في التحليل
-    failed_conditions = {k: v for k, v in conditions.items() if not v}
-    if any(failed_conditions): # نسجل فقط إذا كانت هناك إشارة محتملة لكنها فشلت
-        if price_touch_bb or stoch_cross_up:
-             log_rejection(df.name, "BB_Stoch Strategy Conditions Not Met", {"failed": list(failed_conditions.keys())})
-    return False
-
-def check_macd_ema_strategy(df: pd.DataFrame) -> bool:
-    if len(df) < 3: return False
-    last, prev, prev_prev = df.iloc[-1], df.iloc[-2], df.iloc[-3]
-    
-    # الشروط الحالية
-    macd_cross_up = prev['macd'] < prev['macd_signal'] and last['macd'] > last['macd_signal']
-    price_above_ema = last['close'] > last['ema_21']
-    
-    # إضافة فلتر قوة MACD
-    macd_strength = last['macd_histogram'] > 0 and last['macd_histogram'] > prev['macd_histogram']
-    
-    # إضافة فلتر ADX للتأكد من وجود اتجاه
-    trend_strength = last['adx'] > 20
-    
-    # إضافة فلتر أن يكون MACD كان تحت الصفر قبل العبور
-    macd_position = prev_prev['macd'] < 0
-    
-    if macd_cross_up and price_above_ema and macd_strength and trend_strength and macd_position:
-        logger.info(f"  -> [{df.name}] ✅ إشارة MACD+EMA (مع فلاتر قوة واتجاه).")
-        return True
-    return False
-
 def check_ema_rsi_strategy(df: pd.DataFrame) -> bool:
     if len(df) < 2: return False
     last, prev = df.iloc[-1], df.iloc[-2]
@@ -3815,30 +3534,6 @@ def check_pullback_strategy(df: pd.DataFrame) -> bool:
     macd_cross_up = prev['macd'] < prev['macd_signal'] and last['macd'] > last['macd_signal']
     if uptrend_confirmed and macd_cross_up:
         logger.info(f"  -> [{df.name}] ✅ إشارة استراتيجية Pullback MACD.")
-        return True
-    return False
-
-def check_bb_squeeze_strategy(df: pd.DataFrame) -> bool:
-    if len(df) < 100: return False
-    last = df.iloc[-1]
-    
-    squeeze_threshold = df['bb_width'].rolling(100).quantile(0.20).iloc[-1]
-    is_squeeze = last['bb_width'] < squeeze_threshold
-    
-    breakout = last['close'] > last['bb_upper']
-    volume_confirmed = last['relative_volume'] > 1.25
-    
-    # [V9.24.0] نقض هيكلي دائم: لا اختراق صاعد يُشترى ضد هيكل هابط
-    # (EMA21 تحت EMA50 والسعر تحت EMA50) — نمط "ارتداد الموتى" الذي
-    # خسر به V9.21→V9.23 كل صفقاته العشر في STRONG_DOWNTREND.
-    # كاشف التجهيز detect_squeeze_setup يفرض النقض ذاته في مسار التوصيات،
-    # وهذا هنا يحمي مسار المُطلِقات المباشرة أيضًا.
-    falling_structure = (last['ema_21'] < last['ema_50']) and (last['close'] < last['ema_50'])
-    if falling_structure:
-        return False
-    
-    if is_squeeze and breakout and volume_confirmed:
-        logger.info(f"  -> [{df.name}] ✅ إشارة استراتيجية BB Squeeze Breakout.")
         return True
     return False
 
@@ -4060,28 +3755,7 @@ def _ft_log_near(symbol: str, name: str, conds: Dict[str, bool]) -> None:
         log_rejection(symbol, f"{name} Strategy Conditions Not Met", {"failed": [k for k, v in conds.items() if not v]})
 
 
-# --- 1) FT_BbandRsi (Gert Wohlgemuth — berlinguyinca/BbandRsi.py v3) ---
-def ft_entry_bbandrsi(df: pd.DataFrame) -> bool:
-    """RSI<30 & close < الحد السفلي لبولنجر(20,2) على السعر النمطي."""
-    last, _ = _ft_last(df)
-    if last is None: return False
-    rsi, low2 = last.get('rsi'), last.get('ft_tp_low2')
-    if pd.isna(rsi) or pd.isna(low2): return False
-    touched = float(last['close']) < float(low2)
-    if touched and float(rsi) < 30:
-        return True
-    if touched:
-        _ft_log_near(str(df.name), "FT_BbandRsi", {"rsi_lt_30": float(rsi) < 30})
-    return False
-
-def ft_exit_bbandrsi(df: pd.DataFrame) -> bool:
-    """RSI>70 (الأصلي: رفض الاتجاه فقط عند التشبع العلوي)."""
-    last, _ = _ft_last(df)
-    if last is None: return False
-    return bool(pd.notna(last.get('rsi')) and float(last['rsi']) > 70)
-
-
-# --- 2) FT_CombinedBinHAndCluc (بنية BinHV45 + ClucMay72018 — الملف المدمج الشهير) ---
+# --- 1) FT_CombinedBinHAndCluc (بنية BinHV45 + ClucMay72018 — الملف المدمج الشهير) ---
 def ft_entry_binhcluc(df: pd.DataFrame) -> bool:
     """نمط BinHV45 (بولنجر مغلق 40 بقيم hyperopt الرسمية 0.008/0.0175/0.25) أو
     نمط ClucMay72018 (close<EMA50 & close<0.985×الحد السفلي النمطي & حارس مضخة حجم)."""
@@ -4114,7 +3788,7 @@ def ft_exit_binhcluc(df: pd.DataFrame) -> bool:
     return bool(pd.notna(mid) and float(last['close']) > float(mid))
 
 
-# --- 3) FT_EMASkipPump (تجنب شموع المضخة — berlinguyinca/EMASkipPump.py) ---
+# --- 2) FT_EMASkipPump (تجنب شموع المضخة — berlinguyinca/EMASkipPump.py) ---
 def ft_entry_emaskippump(df: pd.DataFrame) -> bool:
     """حجم عادي (<20× متوسط30 السابق) & close<EMA5 & close<EMA12 & close=قاع12 & close≤الحد السفلي."""
     last, _ = _ft_last(df)
@@ -4141,7 +3815,7 @@ def ft_exit_emaskippump(df: pd.DataFrame) -> bool:
     return bool(cl > float(e5) and cl > float(e12) and cl >= float(mx12) - 1e-12 and cl >= float(up2))
 
 
-# --- 4) FT_Quickie (Zelgadis — berlinguyinca/Quickie.py) ---
+# --- 3) FT_Quickie (Zelgadis — berlinguyinca/Quickie.py) ---
 def ft_entry_quickie(df: pd.DataFrame) -> bool:
     """ADX>30 & TEMA9<وسط بولنجر(إغلاق,20) & TEMA9 يلتفت صعودًا & SMA200 فوق السعر
     (ارتداد داخل هبوط أوسع — فكرة الاستراتيجية الأصلية)."""
@@ -4161,7 +3835,7 @@ def ft_exit_quickie(df: pd.DataFrame) -> bool:
     return bool(float(adx) > 70 and float(tema) > float(mid) and float(tema) < float(tema_p))
 
 
-# --- 5) FT_ADXMomentum (Gert Wohlgemuth — berlinguyinca/ADXMomentum.py v3) ---
+# --- 4) FT_ADXMomentum (Gert Wohlgemuth — berlinguyinca/ADXMomentum.py v3) ---
 def ft_entry_adxmomentum(df: pd.DataFrame) -> bool:
     """ADX>25 & MOM14>0 & +DI(25)>25 & +DI>-DI (زخم صاعد مثبت)."""
     last, _ = _ft_last(df)
@@ -4179,36 +3853,9 @@ def ft_exit_adxmomentum(df: pd.DataFrame) -> bool:
     return bool(float(adx) > 25 and float(mom) < 0 and float(mdi) > 25 and float(pdi) < float(mdi))
 
 
-# --- 6) FT_Bandtastic (Robert Roman — أصلية 15م من freqtrade-strategies) ---
-def ft_entry_bandtastic(df: pd.DataFrame) -> bool:
-    """close < الحد السفلي لبولنجر(20,1) & حجم>0 (الإعداد الافتراضي الموثق في الملف)."""
-    last, _ = _ft_last(df)
-    if last is None: return False
-    low1 = last.get('ft_tp_low1')
-    if pd.isna(low1): return False
-    return bool(float(last['close']) < float(low1) and float(last['volume']) > 0)
-
-def ft_exit_bandtastic(df: pd.DataFrame) -> bool:
-    """MFI>46 & close>الحد العلوي لبولنجر(20,2) (الأصلي حرفيًا)."""
-    last, _ = _ft_last(df)
-    if last is None: return False
-    mfi, up2 = last.get('ft_mfi14'), last.get('ft_tp_up2')
-    if pd.isna(mfi) or pd.isna(up2): return False
-    return bool(float(mfi) > 46 and float(last['close']) > float(up2))
-
-
 # --- سجل المواصفات بأعداداتها الكانونية الحرفية (minimal_roi/stoploss/trailing) ---
 # الوحدات: نسب freqtrade الأصلية (0.01 = 1%). مفاتيح minimal_roi بالدقائق.
 FREQTRADE_STRATEGIES: Dict[str, Dict[str, Any]] = {
-    'FT_BbandRsi': {
-        'name': 'FT_BbandRsi', 'key': 'FT_BBANDRSI', 'ar_name': 'بولنجر+RSI الأصلي (BbandRsi)',
-        'source': 'freqtrade-strategies/berlinguyinca/BbandRsi.py', 'timeframe_canon': '1h',
-        # [V9.36.0] -0.25 → -0.05: قيمة الريبو الأصلي لهدف ROI 10% على إطار أعلى — بوتنا
-        # يستهدف 0.5-3% برسوم 0.2%؛ MAGIC نزف -9.02% تحت وقف -25% قبل سقف الحماية
-        'minimal_roi': {0: 0.10}, 'stoploss': -0.05,
-        'trailing_stop': False, 'trailing_stop_positive': None,
-        'trailing_stop_positive_offset': None, 'trailing_only_offset_is_reached': False,
-        'entry_fn': ft_entry_bbandrsi, 'exit_fn': ft_exit_bbandrsi, 'family': 'reversal'},
     'FT_CombinedBinHAndCluc': {
         'name': 'FT_CombinedBinHAndCluc', 'key': 'FT_BINHCLUC', 'ar_name': 'BinH+Cluc المدمج الأصلي',
         'source': 'freqtrade-strategies/berlinguyinca/CombinedBinHAndCluc.py', 'timeframe_canon': '5m',
@@ -4226,7 +3873,7 @@ FREQTRADE_STRATEGIES: Dict[str, Dict[str, Any]] = {
     'FT_Quickie': {
         'name': 'FT_Quickie', 'key': 'FT_QUICKIE', 'ar_name': 'Quickie الأصلي (إغلاق سريع)',
         'source': 'freqtrade-strategies/berlinguyinca/Quickie.py', 'timeframe_canon': '5m',
-        # [V9.36.0] -0.25 → -0.05 (نفس منطق BbandRsi — قيمة أصلية لهدف 15%) — WLD أغلقت +1.73% عبر السلم
+        # [V9.36.0] -0.25 → -0.05 (قيمة أصلية لهدف ROI 15%) — WLD أغلقت +1.73% عبر السلم
         'minimal_roi': {10: 0.15, 15: 0.06, 30: 0.03, 100: 0.01}, 'stoploss': -0.05,
         'trailing_stop': False, 'trailing_stop_positive': None,
         'trailing_stop_positive_offset': None, 'trailing_only_offset_is_reached': False,
@@ -4239,14 +3886,6 @@ FREQTRADE_STRATEGIES: Dict[str, Dict[str, Any]] = {
         'trailing_stop': False, 'trailing_stop_positive': None,
         'trailing_stop_positive_offset': None, 'trailing_only_offset_is_reached': False,
         'entry_fn': ft_entry_adxmomentum, 'exit_fn': ft_exit_adxmomentum, 'family': 'trend'},
-    'FT_Bandtastic': {
-        'name': 'FT_Bandtastic', 'key': 'FT_BANDTASTIC', 'ar_name': 'Bandtastic الأصلي (15م أصلًا)',
-        'source': 'freqtrade-strategies/user_data/strategies/Bandtastic.py', 'timeframe_canon': '15m',
-        # [V9.36.0] -0.345 → -0.05: ZRO نزف -4.97% تحت وقف -34.5% الأصلي (هدف ROI 16.2%)
-        'minimal_roi': {0: 0.162, 69: 0.097, 229: 0.061, 566: 0.0}, 'stoploss': -0.05,
-        'trailing_stop': True, 'trailing_stop_positive': 0.01,
-        'trailing_stop_positive_offset': 0.058, 'trailing_only_offset_is_reached': False,
-        'entry_fn': ft_entry_bandtastic, 'exit_fn': ft_exit_bandtastic, 'family': 'reversal'},
 }
 
 # تهيئة مفاتيح التفعيل (كلها مفعلة افتراضيًا — تُقرأ تحت ft_strategies_lock)
@@ -4254,8 +3893,8 @@ for _ft_name in FREQTRADE_STRATEGIES:
     FT_STRATEGY_ENABLED.setdefault(_ft_name, True)
 
 # [V9.34.0] أسماء عرض عائلة FT العكسية (بالإملاء الكانوني) — الفلاتر تُستدعى باسم العرض
-# (FT_BbandRsi) بينما مفاتيح الفحص في FT_REVERSAL_KEYS بصيغة uppercase (FT_BBANDRSI،
-# ومفتاح BinHCluc مختلف حرفيًا عن اسم العرض FT_CombinedBinHAndCluc) — الفلتر يطابق الاثنين.
+# بينما مفاتيح الفحص في FT_REVERSAL_KEYS بصيغة uppercase (ومفتاح BinHCluc مختلف حرفيًا
+# عن اسم العرض FT_CombinedBinHAndCluc) — الفلتر يطابق الاثنين. [V9.37.0] بعد حذف BbandRsi.
 FT_REVERSAL_DISPLAY_NAMES: frozenset = frozenset(
     _nm.upper() for _nm, _spec in FREQTRADE_STRATEGIES.items() if _spec.get('key') in FT_REVERSAL_KEYS)
 
@@ -4293,19 +3932,14 @@ ENTRY_QUALITY_PROFILES: Dict[str, Dict[str, Optional[float]]] = {
     #                     max_bounce_atr سقف استهلاك الارتداد عن قاع 7 شموع — للعائلة العكسية
     #                     max_body_atr سقف جسم شمعة الدخول بوحدات ATR (EMASkipPump للجميع)
     #                     min_eqs أدنى درجة جودة مركبة 0-100
-    'MACD_EMA_Crossover':         {'min_excursion_pct': 0.60, 'max_ext_atr': 2.5, 'max_bounce_atr': None, 'max_body_atr': 2.0, 'min_eqs': 55},
     'EMA_RSI_Cross':              {'min_excursion_pct': 0.60, 'max_ext_atr': 2.5, 'max_bounce_atr': None, 'max_body_atr': 2.0, 'min_eqs': 55},
     'Pullback_MACD':              {'min_excursion_pct': 0.60, 'max_ext_atr': 2.0, 'max_bounce_atr': None, 'max_body_atr': 2.0, 'min_eqs': 55},
     'Bullish_Momentum':           {'min_excursion_pct': 0.70, 'max_ext_atr': 2.5, 'max_bounce_atr': None, 'max_body_atr': 2.5, 'min_eqs': 55},
-    'BB_Stoch_Reversal_Enhanced': {'min_excursion_pct': 0.55, 'max_ext_atr': None, 'max_bounce_atr': 1.5, 'max_body_atr': 2.0, 'min_eqs': 50},
-    'BB_Squeeze_Breakout':        {'min_excursion_pct': 0.85, 'max_ext_atr': 3.0, 'max_bounce_atr': None, 'max_body_atr': 2.5, 'min_eqs': 60},
     'SR_Breakout_Enhanced':       {'min_excursion_pct': 0.85, 'max_ext_atr': 3.0, 'max_bounce_atr': None, 'max_body_atr': 2.5, 'min_eqs': 60},
     # عائلة FT العكسية (قاع-صيد): بلا سقف ملاحقة (تشتري الغرقى شرعًا) — سقف الارتداد 1.5×ATR
-    'FT_BbandRsi':                {'min_excursion_pct': 0.55, 'max_ext_atr': None, 'max_bounce_atr': 1.5, 'max_body_atr': 2.0, 'min_eqs': 50},
     'FT_CombinedBinHAndCluc':     {'min_excursion_pct': 0.55, 'max_ext_atr': None, 'max_bounce_atr': 1.5, 'max_body_atr': 2.0, 'min_eqs': 50},
     'FT_EMASkipPump':             {'min_excursion_pct': 0.55, 'max_ext_atr': None, 'max_bounce_atr': 1.5, 'max_body_atr': 1.5, 'min_eqs': 50},
     'FT_Quickie':                 {'min_excursion_pct': 0.55, 'max_ext_atr': None, 'max_bounce_atr': 1.5, 'max_body_atr': 2.0, 'min_eqs': 50},
-    'FT_Bandtastic':              {'min_excursion_pct': 0.55, 'max_ext_atr': None, 'max_bounce_atr': 1.5, 'max_body_atr': 2.0, 'min_eqs': 50},
     'FT_ADXMomentum':             {'min_excursion_pct': 0.70, 'max_ext_atr': 2.5, 'max_bounce_atr': None, 'max_body_atr': 2.5, 'min_eqs': 55},
 }
 DEFAULT_ENTRY_QUALITY_PROFILE: Dict[str, Optional[float]] = {
@@ -5496,13 +5130,13 @@ def get_dashboard_html():
                     
                     <h4 class="text-lg font-bold mb-4 text-text-secondary">الاستراتيجيات المفعّلة</h4>
                     <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6 mt-6">
-                        <div class="flex items-center justify-between p-3 bg-black/20 rounded-lg opacity-50" title="متقاعدة في V9.34.0: 100% رفض فلتر عبر حياتها كلها (ميتة بنيويًا) وشخصيتها تغطيها عائلة FT العكسية الأفضل أداءً">
+                        <div class="flex items-center justify-between p-3 bg-black/20 rounded-lg opacity-50" title="حُذفت في V9.37.0: ميتة بنيويًا (100% رفض فلتر عبر حياتها كلها) وشخصيتها تغطيها عائلة FT العكسية الأفضل أداءً">
                             <span class="font-semibold">BB+Stoch (Enhanced)</span>
-                            <span class="text-xs font-mono text-accent-yellow">⚱️ متقاعدة</span>
+                            <span class="text-xs font-mono text-accent-yellow">⚱️ محذوفة</span>
                         </div>
-                        <div class="flex items-center justify-between p-3 bg-black/20 rounded-lg strategy-toggle">
+                        <div class="flex items-center justify-between p-3 bg-black/20 rounded-lg opacity-50" title="حُذفت في V9.37.0: PF 0.012 وWR 14.3% على 7 صفقات (-0.58$)">
                             <span class="font-semibold">MACD+EMA</span>
-                            <label class="flex items-center cursor-pointer"><div class="relative"><input type="checkbox" id="macd-ema-strategy-toggle" class="sr-only"><div class="toggle-bg block bg-gray-600 w-12 h-7 rounded-full"></div></div></label>
+                            <span class="text-xs font-mono text-accent-yellow">⚱️ محذوفة</span>
                         </div>
                         <div class="flex items-center justify-between p-3 bg-black/20 rounded-lg strategy-toggle-new">
                             <span class="font-semibold">EMA+RSI Cross</span>
@@ -5512,9 +5146,9 @@ def get_dashboard_html():
                             <span class="font-semibold">Pullback MACD</span>
                             <label class="flex items-center cursor-pointer"><div class="relative"><input type="checkbox" id="pullback-strategy-toggle" class="sr-only"><div class="toggle-bg block bg-gray-600 w-12 h-7 rounded-full"></div></div></label>
                         </div>
-                        <div class="flex items-center justify-between p-3 bg-black/20 rounded-lg strategy-toggle-new">
+                        <div class="flex items-center justify-between p-3 bg-black/20 rounded-lg opacity-50" title="حُذفت في V9.37.0: PF 0.025 وWR 11.8% على 17 صفقة (-1.20$) — أسوأ محصلة في تاريخ البوت">
                             <span class="font-semibold">BB Squeeze</span>
-                            <label class="flex items-center cursor-pointer"><div class="relative"><input type="checkbox" id="bb-squeeze-strategy-toggle" class="sr-only"><div class="toggle-bg block bg-gray-600 w-12 h-7 rounded-full"></div></div></label>
+                            <span class="text-xs font-mono text-accent-yellow">⚱️ محذوفة</span>
                         </div>
                         <div class="flex items-center justify-between p-3 bg-black/20 rounded-lg strategy-toggle-momentum">
                             <span class="font-semibold">زخم صعودي</span>
@@ -5671,11 +5305,8 @@ function updateMarketStatus() {
             document.getElementById('ob-ratio').value = data.settings.ob_ratio;
             document.getElementById('vol-multiplier').value = data.settings.vol_multiplier;
             document.getElementById('min-profit').value = data.settings.min_profit;
-            // [V9.34.0] BB+Stoch متقاعدة — عناصرها حُذفت من الإعدادات
-            document.getElementById('macd-ema-strategy-toggle').checked = data.settings.use_macd_ema_strategy;
             document.getElementById('ema-rsi-strategy-toggle').checked = data.settings.use_ema_rsi_strategy;
             document.getElementById('pullback-strategy-toggle').checked = data.settings.use_pullback_strategy;
-            document.getElementById('bb-squeeze-strategy-toggle').checked = data.settings.use_bb_squeeze_strategy;
             document.getElementById('bullish-momentum-strategy-toggle').checked = data.settings.use_bullish_momentum_strategy;
             document.getElementById('sr-breakout-strategy-toggle').checked = data.settings.use_sr_breakout_strategy;
         }
@@ -6071,12 +5702,8 @@ function saveSettings() {
         ob_ratio: parseFloat(document.getElementById('ob-ratio').value),
         vol_multiplier: parseFloat(document.getElementById('vol-multiplier').value),
         min_profit: parseFloat(document.getElementById('min-profit').value),
-        // [V9.34.0] BB+Stoch متقاعدة — تُرسل قيمتها المخزنة كما هي بلا عنصر واجهة
-        use_bb_stoch_strategy: true,
-        use_macd_ema_strategy: document.getElementById('macd-ema-strategy-toggle').checked,
         use_ema_rsi_strategy: document.getElementById('ema-rsi-strategy-toggle').checked,
         use_pullback_strategy: document.getElementById('pullback-strategy-toggle').checked,
-        use_bb_squeeze_strategy: document.getElementById('bb-squeeze-strategy-toggle').checked,
         use_bullish_momentum_strategy: document.getElementById('bullish-momentum-strategy-toggle').checked,
         use_sr_breakout_strategy: document.getElementById('sr-breakout-strategy-toggle').checked,
     };
@@ -6158,7 +5785,7 @@ function updateStrategyCandidates() {
             c.innerHTML = '<div class="text-text-secondary text-sm text-center py-4">بناء الدائرة الواسعة جارٍ (بعد الإقلاع)...</div>';
             return;
         }
-        const names = {MACD_EMA: 'تقاطعات MACD+EMA', BB_STOCH: 'الارتداد من القاع', EMA_RSI: 'تقاطع EMA+RSI', PULLBACK: 'شراء التراجع', BB_SQUEEZE: 'انفجار الانضغاط', BULLISH_MOMENTUM: 'زخم صاعد', SR_BREAKOUT: 'اختراق المقاومات', FT_BBANDRSI: 'بولنجر+RSI الأصلي', FT_BINHCLUC: 'BinH+Cluc الأصلي', FT_EMASKIPPUMP: 'EMA Skip Pump الأصلي', FT_QUICKIE: 'Quickie الأصلي', FT_ADXMOMENTUM: 'زخم ADX الأصلي', FT_BANDTASTIC: 'Bandtastic الأصلي'};
+        const names = {EMA_RSI: 'تقاطع EMA+RSI', PULLBACK: 'شراء التراجع', BULLISH_MOMENTUM: 'زخم صاعد', SR_BREAKOUT: 'اختراق المقاومات', FT_BINHCLUC: 'BinH+Cluc الأصلي', FT_EMASKIPPUMP: 'EMA Skip Pump الأصلي', FT_QUICKIE: 'Quickie الأصلي', FT_ADXMOMENTUM: 'زخم ADX الأصلي'};
         c.innerHTML = Object.entries(data.candidates).map(([key, list]) => {
             const chips = (list || []).map(n => {
                 const dim = n.examinable === false;
@@ -6314,11 +5941,8 @@ def get_market_status():
     with risk_per_trade_lock: risk = RISK_PER_TRADE_PERCENT
     with order_book_ratio_lock: ob_ratio = ORDER_BOOK_MIN_BID_ASK_RATIO
     with volume_filter_lock: vol_mult = VOLUME_FILTER_MULTIPLIER
-    with bb_stoch_strategy_lock: use_bb_stoch = USE_BB_STOCH_STRATEGY
-    with macd_ema_strategy_lock: use_macd_ema = USE_MACD_EMA_STRATEGY
     with ema_rsi_strategy_lock: use_ema_rsi = USE_EMA_RSI_STRATEGY
     with pullback_strategy_lock: use_pullback = USE_PULLBACK_STRATEGY
-    with bb_squeeze_strategy_lock: use_bb_squeeze = USE_BB_SQUEEZE_STRATEGY
     with bullish_momentum_strategy_lock: use_bullish_momentum = USE_BULLISH_MOMENTUM_STRATEGY
     with sr_breakout_strategy_lock: use_sr_breakout = USE_SR_BREAKOUT_STRATEGY
     with signal_cache_lock: open_trades = len(open_signals_cache)
@@ -6331,10 +5955,7 @@ def get_market_status():
         "settings": {
             "risk_percent": risk, "ob_ratio": ob_ratio, "vol_multiplier": vol_mult,
             "min_profit": MIN_PROFIT_PERCENT,
-            "use_bb_stoch_strategy": use_bb_stoch,
-            "use_macd_ema_strategy": use_macd_ema,
             "use_ema_rsi_strategy": use_ema_rsi, "use_pullback_strategy": use_pullback,
-            "use_bb_squeeze_strategy": use_bb_squeeze,
             "use_bullish_momentum_strategy": use_bullish_momentum,
             "use_sr_breakout_strategy": use_sr_breakout,
             "use_ft_strategies": FT_STRATEGIES_ENABLED,
@@ -6611,16 +6232,10 @@ def api_strategy_candidates():
         cand = {k: v for k, v in cand.items() if k not in DISABLED_STRATEGY_KEYS}
         display_names = {}
         try:
-            with macd_ema_strategy_lock:
-                if USE_MACD_EMA_STRATEGY: display_names['MACD_EMA'] = "MACD_EMA_Crossover"
-            with bb_stoch_strategy_lock:
-                if USE_BB_STOCH_STRATEGY: display_names['BB_STOCH'] = "BB_Stoch_Reversal_Enhanced"
             with ema_rsi_strategy_lock:
                 if USE_EMA_RSI_STRATEGY: display_names['EMA_RSI'] = "EMA_RSI_Cross"
             with pullback_strategy_lock:
                 if USE_PULLBACK_STRATEGY: display_names['PULLBACK'] = "Pullback_MACD"
-            with bb_squeeze_strategy_lock:
-                if USE_BB_SQUEEZE_STRATEGY: display_names['BB_SQUEEZE'] = "BB_Squeeze_Breakout"
             with bullish_momentum_strategy_lock:
                 if USE_BULLISH_MOMENTUM_STRATEGY: display_names['BULLISH_MOMENTUM'] = "Bullish_Momentum"
             with sr_breakout_strategy_lock:
@@ -6749,8 +6364,8 @@ def toggle_trading_status():
 @app.route('/api/settings/update', methods=['POST'])
 def update_settings():
     global RISK_PER_TRADE_PERCENT, ORDER_BOOK_MIN_BID_ASK_RATIO, VOLUME_FILTER_MULTIPLIER, \
-           MIN_PROFIT_PERCENT, USE_BB_STOCH_STRATEGY, USE_MACD_EMA_STRATEGY, USE_EMA_RSI_STRATEGY, \
-           USE_PULLBACK_STRATEGY, USE_BB_SQUEEZE_STRATEGY, USE_BULLISH_MOMENTUM_STRATEGY, USE_SR_BREAKOUT_STRATEGY
+           MIN_PROFIT_PERCENT, USE_EMA_RSI_STRATEGY, \
+           USE_PULLBACK_STRATEGY, USE_BULLISH_MOMENTUM_STRATEGY, USE_SR_BREAKOUT_STRATEGY
     try:
         data = request.get_json()
         
@@ -6759,11 +6374,8 @@ def update_settings():
         with volume_filter_lock: VOLUME_FILTER_MULTIPLIER = float(data.get('vol_multiplier', VOLUME_FILTER_MULTIPLIER))
         MIN_PROFIT_PERCENT = float(data.get('min_profit', MIN_PROFIT_PERCENT))
 
-        with bb_stoch_strategy_lock: USE_BB_STOCH_STRATEGY = bool(data.get('use_bb_stoch_strategy', USE_BB_STOCH_STRATEGY))
-        with macd_ema_strategy_lock: USE_MACD_EMA_STRATEGY = bool(data.get('use_macd_ema_strategy', USE_MACD_EMA_STRATEGY))
         with ema_rsi_strategy_lock: USE_EMA_RSI_STRATEGY = bool(data.get('use_ema_rsi_strategy', USE_EMA_RSI_STRATEGY))
         with pullback_strategy_lock: USE_PULLBACK_STRATEGY = bool(data.get('use_pullback_strategy', USE_PULLBACK_STRATEGY))
-        with bb_squeeze_strategy_lock: USE_BB_SQUEEZE_STRATEGY = bool(data.get('use_bb_squeeze_strategy', USE_BB_SQUEEZE_STRATEGY))
         with bullish_momentum_strategy_lock: USE_BULLISH_MOMENTUM_STRATEGY = bool(data.get('use_bullish_momentum_strategy', USE_BULLISH_MOMENTUM_STRATEGY))
         with sr_breakout_strategy_lock: USE_SR_BREAKOUT_STRATEGY = bool(data.get('use_sr_breakout_strategy', USE_SR_BREAKOUT_STRATEGY))
 
@@ -7881,20 +7493,15 @@ EVIDENCE_REFRESH_LOCK = Lock()
 def _evidence_strategy_table() -> List[Tuple[str, Any, str]]:
     # [V9.34.0] المفاتيح المتقاعدة مستبعدة من جدول الأدلة (لا فحص ولا بناء دليل لها)
     return [(k, fn, n) for (k, fn, n) in [
-        ('MACD_EMA', check_macd_ema_strategy, 'MACD_EMA_Crossover'),
-        ('BB_STOCH', check_bb_stoch_strategy_enhanced, 'BB_Stoch_Reversal_Enhanced'),
         ('EMA_RSI', check_ema_rsi_strategy, 'EMA_RSI_Cross'),
         ('PULLBACK', check_pullback_strategy, 'Pullback_MACD'),
-        ('BB_SQUEEZE', check_bb_squeeze_strategy, 'BB_Squeeze_Breakout'),
         ('BULLISH_MOMENTUM', check_bullish_momentum_strategy, 'Bullish_Momentum'),
         ('SR_BREAKOUT', check_support_resistance_strategy_enhanced, 'SR_Breakout_Enhanced'),
         # [V9.29.0] استراتيجيات freqtrade الأصلية — أدلة حسابية من إعادة التشغيل نفسها
-        ('FT_BBANDRSI', ft_entry_bbandrsi, 'FT_BbandRsi'),
         ('FT_BINHCLUC', ft_entry_binhcluc, 'FT_CombinedBinHAndCluc'),
         ('FT_EMASKIPPUMP', ft_entry_emaskippump, 'FT_EMASkipPump'),
         ('FT_QUICKIE', ft_entry_quickie, 'FT_Quickie'),
         ('FT_ADXMOMENTUM', ft_entry_adxmomentum, 'FT_ADXMomentum'),
-        ('FT_BANDTASTIC', ft_entry_bandtastic, 'FT_Bandtastic'),
     ] if k not in DISABLED_STRATEGY_KEYS]
 
 
@@ -8463,19 +8070,13 @@ def main_loop_enhanced():
 
             strategies_to_check = []
             # [V9.34.0] المفاتيح المتقاعدة (DISABLED_STRATEGY_KEYS) لا تدخل حلقة الفحص أصلًا —
-            # الافتراضي: BB_STOCH (ميتة بنيويًا: 100% رفض فلتر عبر حياتها كلها + مكررة بعائلة FT العكسية)
+            # [V9.37.0] استراتيجيات الأداء السيئ حُذفت من الكود كله (انظر STRATEGY_DISABLED_DEFAULT)
             def _strategy_enabled(key: str) -> bool:
                 return key not in DISABLED_STRATEGY_KEYS
-            with macd_ema_strategy_lock:
-                if USE_MACD_EMA_STRATEGY and _strategy_enabled('MACD_EMA'): strategies_to_check.append(('MACD_EMA', check_macd_ema_strategy, "MACD_EMA_Crossover"))
-            with bb_stoch_strategy_lock:
-                if USE_BB_STOCH_STRATEGY and _strategy_enabled('BB_STOCH'): strategies_to_check.append(('BB_STOCH', check_bb_stoch_strategy_enhanced, "BB_Stoch_Reversal_Enhanced"))
             with ema_rsi_strategy_lock:
                 if USE_EMA_RSI_STRATEGY and _strategy_enabled('EMA_RSI'): strategies_to_check.append(('EMA_RSI', check_ema_rsi_strategy, "EMA_RSI_Cross"))
             with pullback_strategy_lock:
                 if USE_PULLBACK_STRATEGY and _strategy_enabled('PULLBACK'): strategies_to_check.append(('PULLBACK', check_pullback_strategy, "Pullback_MACD"))
-            with bb_squeeze_strategy_lock:
-                if USE_BB_SQUEEZE_STRATEGY and _strategy_enabled('BB_SQUEEZE'): strategies_to_check.append(('BB_SQUEEZE', check_bb_squeeze_strategy, "BB_Squeeze_Breakout"))
             with bullish_momentum_strategy_lock:
                 if USE_BULLISH_MOMENTUM_STRATEGY and _strategy_enabled('BULLISH_MOMENTUM'): strategies_to_check.append(('BULLISH_MOMENTUM', check_bullish_momentum_strategy, "Bullish_Momentum"))
             with sr_breakout_strategy_lock:
@@ -8702,10 +8303,6 @@ def main_loop_enhanced():
                         if signal_source != 'filter_recommendation':
                             if strategy_used in FREQTRADE_STRATEGIES:
                                 pass  # [V9.29.0] نهج freqtrade الأصلي: شروط الدخول هي البوابة ذاتها — بلا تأكيد فريم أعلى ولا فلتر قمة
-                            elif strategy_used == 'BB_Stoch_Reversal_Enhanced':
-                                # استراتيجية ارتدادية: تجنب الشراء عند قمة آخر 24 ساعة
-                                if not check_price_peak_filter(df_with_indicators, entry_price):
-                                    continue
                             elif USE_HTF_CONFIRMATION:
                                 # استراتيجيات الاتجاه/الاختراق: تأكيد الترند الصاعد على فريم الساعة (مع كاش 15 دقيقة)
                                 if not is_htf_bullish_confirmation_cached(symbol):
