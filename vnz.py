@@ -49,7 +49,7 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-APP_VERSION: str = 'V9.39.0'  # [V9.39.0] اقتباس Elliott Waves: استراتيجية Elliott_Impulse (زيجزاج + قواعد الدافع الثلاث + منطقة موجة 4)  # [V9.21.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
+APP_VERSION: str = 'V9.40.0'  # [V9.40.0] سلّم قفل أرباح صاعد (STRONG_UPTREND يمنح الرابحين مساحة) + تهدئة أقصر للإغلاق الرابح + حفظ مفتاح التداول عبر النشر + شارة الوضع الورقي + جدول الأداء يعرض كل الاستراتيجيات الحية  # [V9.21.0] مصدر وحيد لرقم الإصدار
 logger = logging.getLogger(f'CryptoBot{APP_VERSION}')
 
 # زمن إقلاع العملية لحساب مدة التشغيل في لوحة التحكم
@@ -494,6 +494,11 @@ PROTECTION_PAIR_MIN_PROFIT: float = config('PROTECTION_PAIR_MIN_PROFIT', default
 PROTECTION_PAIR_STOP_MIN: int = config('PROTECTION_PAIR_STOP_MIN', default=360, cast=int)
 # 4) CooldownPeriod — تهدئة لكل زوج بعد أي إغلاق (تفحصها كل مسارات الدخول لا التوصيات حصرًا)
 PROTECTION_COOLDOWN_MIN: int = config('PROTECTION_COOLDOWN_MIN', default=240, cast=int)
+# [V9.40.0] تهدئة الإغلاق الرابح: فرص استمرار الصعود تُضيّع بقفل 240د على زوج أغلق رابحًا
+# في يوم صاعد (شكوى المستخدم: "البوت فوّت فرص ثمينة أثناء الصعود"). الإغلاق الرابح إشارة
+# نجاح للإعداد — تهدئة قصيرة (60د) تسمح بإعادة الركوب، والخاسر يحتفظ بالتهدئة الكاملة 240د.
+# 0 يعطّل التمييز (كل الإغلاقات بالمدة الكاملة). _add_protection_lock يحفظ الأطول دائمًا.
+PROTECTION_COOLDOWN_WIN_MIN: int = config('PROTECTION_COOLDOWN_WIN_MIN', default=60, cast=int)
 # 5) سقف مسافة الوقف (نمط stoploss الثابت في freqtrade — وقف ATR بلا سقف أنتج -10.67%)
 # [V9.36.0] 6.0 → 4.0: قياس 113 صفقة حية — 5 صفقات نزفت تحت -4% (MAGIC -9.02/MET -10.67/
 # ZRO -4.97/RLC -6.64/MINA -4.62 = -1.45$) بينما أسوأ خسارة لاستراتيجية رابحة -3.05% (ATOM/SR)
@@ -653,6 +658,17 @@ if _raw_ladder_env.lower() in ('off', 'disabled', '0', 'none', ''):
     PROFIT_LOCK_LADDER: List[Tuple[float, float]] = []
 else:
     PROFIT_LOCK_LADDER = _parse_profit_lock_ladder(_raw_ladder_env) or _parse_profit_lock_ladder(_LADDER_DEFAULT_RAW)
+# [V9.40.0] سلّم الصعود القوي (STRONG_UPTREND: EMA سريعة فوق البطيئة + ADX>25) — نفس شكوى
+# "أرباح ضئيلة في يوم صاعد": الأدراج الافتراضية تمنح 0.45-0.70% مساحة من القمة في منطقة
+# 0.75-2.0% وهي ضجيج شمعة 15د على الألت — الفائز يُقطع عند +0.30% والسوق يواصل. سلّم
+# الصعود يوسّع المساحة (0.55/0.90/1.20) مع بقاء كل قفل ≥ الرسوم (لا قفل خاسر صافٍ).
+# خارج STRONG_UPTREND يبقى السلّم الافتراضي المعاير على 113 صفقة حية كما هو.
+_LADDER_RALLY_DEFAULT_RAW = '[[0.75,0.20],[1.50,0.60],[2.50,1.30],[3.50,2.20],[5.00,3.40]]'
+_raw_ladder_rally_env = str(config('PROFIT_LOCK_LADDER_RALLY_JSON', default=_LADDER_RALLY_DEFAULT_RAW, cast=str)).strip()
+if _raw_ladder_rally_env.lower() in ('off', 'disabled', '0', 'none', ''):
+    PROFIT_LOCK_LADDER_RALLY: List[Tuple[float, float]] = []
+else:
+    PROFIT_LOCK_LADDER_RALLY = _parse_profit_lock_ladder(_raw_ladder_rally_env) or _parse_profit_lock_ladder(_LADDER_RALLY_DEFAULT_RAW)
 # الحاجز الزمني لكل استراتيجية بالدقائق (الباقية بعد تنظيف V9.37 — 0 يعطّل)
 # فلسفة: الاختراق يجب أن يعمل سريعًا (3-4س)، الاتجاهي يُعطى 5س، الارتدادي نطاق أوسع (6س)
 STRATEGY_TIME_LIMIT_DEFAULTS: Dict[str, int] = {
@@ -4600,15 +4616,29 @@ def _ft_exit_skip_expired(signal_id: int, symbol: str) -> bool:
         logger.debug(f"[FT خروج] {symbol}: إشارة خروج مؤجلة منذ {((now - first) / 60.0):.0f}د (ربح تحت الحد)")
         return False
 
+def _market_is_rally() -> bool:
+    """[V9.40.0] هل السوق في صعود قوي مؤكد؟ (overall_regime == STRONG_UPTREND —
+    يتطلب EMA سريعة فوق البطيئة + ADX>25 على تعدد الفريمات). قراءة محمية بالقفل،
+    وفشل القراءة يعني الوضع الافتراضي (لا صعود) — أمان أولًا."""
+    try:
+        with market_state_lock:
+            return str(current_market_state.get('overall_regime', '')) == 'STRONG_UPTREND'
+    except Exception:
+        return False
+
+
 def profit_lock_ladder_stop(entry: float, peak_price: float) -> Optional[float]:
     """[V9.33.0] أرضية الوقف من سلّم قفل الأرباح حسب قمة الصفقة (نمط custom_stoploss المتدرج
     من freqtrade). يعيد سعر وقف مقترح (دخول×(1+قفل%)) أو None إذا القمة تحت أول درجة
-    أو السلم معطّل. الاستدعاء يقرر الرفع فعليًا (قفل تصاعدي: لا ينزّل وقفًا أرفع موجود)."""
-    if not PROFIT_LOCK_LADDER or entry <= 0 or peak_price <= 0:
+    أو السلم معطّل. الاستدعاء يقرر الرفع فعليًا (قفل تصاعدي: لا ينزّل وقفًا أرفع موجود).
+    [V9.40.0] في STRONG_UPTREND يُستخدم سلّم الصعود الأوسع — ورفع الوقف المكتوب سابقًا
+    يبقى ساريًا في الصفقة (الاستدعاء لا ينزل وقفًا أرفع ولو انقلب الريم)."""
+    ladder = PROFIT_LOCK_LADDER_RALLY if _market_is_rally() else PROFIT_LOCK_LADDER
+    if not ladder or entry <= 0 or peak_price <= 0:
         return None
     peak_pct = (peak_price / entry - 1.0) * 100.0
     lock_pct: Optional[float] = None
-    for tier_peak, tier_lock in PROFIT_LOCK_LADDER:
+    for tier_peak, tier_lock in ladder:
         if peak_pct >= tier_peak - 1e-9:  # epsilon حدود عشرية: 1.24999% = درجة 1.25
             lock_pct = tier_lock
         else:
@@ -5186,7 +5216,7 @@ def get_dashboard_html():
             <div class="card p-4"><h3 class="font-bold mb-3 text-lg text-text-secondary">حالة السوق</h3><div id="overall-regime" class="text-2xl font-bold text-center">...</div></div>
             <div class="card p-4"><h3 class="font-bold mb-3 text-lg text-text-secondary">الجلسات النشطة</h3><div id="active-sessions-list" class="flex flex-wrap gap-2 items-center justify-center pt-2">...</div></div>
             <div class="card p-4"><h3 class="font-bold mb-3 text-lg text-text-secondary">الصفقات المفتوحة</h3><div id="open-trades-count" class="text-2xl font-bold text-center">...</div></div>
-            <div class="card p-4 flex flex-col justify-center items-center"><h3 class="font-bold text-lg text-text-secondary mb-2">التداول الحقيقي</h3><div class="flex items-center space-x-3 space-x-reverse"><span id="trading-status-text" class="font-bold text-lg"></span><label class="flex items-center cursor-pointer"><div class="relative"><input type="checkbox" id="trading-toggle" class="sr-only" onchange="toggleTrading()"><div class="toggle-bg block bg-gray-600 w-12 h-7 rounded-full"></div></div></label></div><div class="mt-2 text-xs text-text-secondary">رصيد USDT: <span id="usdt-balance" class="font-mono">...</span></div></div>
+            <div class="card p-4 flex flex-col justify-center items-center"><h3 class="font-bold text-lg text-text-secondary mb-2">التداول الحقيقي</h3><div class="flex items-center space-x-3 space-x-reverse"><span id="trading-status-text" class="font-bold text-lg"></span><label class="flex items-center cursor-pointer"><div class="relative"><input type="checkbox" id="trading-toggle" class="sr-only" onchange="toggleTrading()"><div class="toggle-bg block bg-gray-600 w-12 h-7 rounded-full"></div></div></label></div><div class="mt-2 text-xs text-text-secondary">رصيد USDT: <span id="usdt-balance" class="font-mono">...</span></div><div id="paper-mode-banner" style="display:none" class="mt-3 w-full text-center text-xs font-bold px-3 py-2 rounded-lg" >🧪 وضع تجريبي ورقي — الصفقات المعروضة للتقييم فقط، لا أوامر حقيقية على Binance</div></div>
         </section>
         <!-- [V9.23.0] الترشيح الذكي — برهان لا تكهن -->
         <section class="card p-4 mb-6">
@@ -5518,6 +5548,13 @@ function updateMarketStatus() {
         tradeToggle.checked = data.is_trading_enabled;
         tradeText.textContent = data.is_trading_enabled ? 'مُفعَّل' : 'غير مُفعَّل';
         tradeText.className = `font-bold text-lg ${data.is_trading_enabled ? 'text-accent-green' : 'text-accent-red'}`;
+        const paperBanner = document.getElementById('paper-mode-banner');
+        if (paperBanner) {
+            paperBanner.style.display = data.is_trading_enabled ? 'none' : 'block';
+            paperBanner.style.background = 'rgba(245,158,11,0.12)';
+            paperBanner.style.color = '#fbbf24';
+            paperBanner.style.border = '1px solid rgba(245,158,11,0.35)';
+        }
         document.getElementById('usdt-balance').textContent = (data.usdt_balance != null && !isNaN(parseFloat(data.usdt_balance))) ? parseFloat(data.usdt_balance).toFixed(2) : 'N/A';
 
         if(data.settings) {
@@ -6298,6 +6335,15 @@ def api_strategy_pnl():
                 'last_closed_at': str(s.get('last') or ''), 'status': status,
             })
         rows.sort(key=lambda r: (r['net_usdt'] if isinstance(r['net_usdt'], (int, float)) else 0), reverse=True)
+        # [V9.40.0] اعرض كل الاستراتيجيات الحية حتى بلا صفقات مغلقة منذ التصفير —
+        # شكوى المستخدم "الاستراتيجية الأخيرة غير موجودة": الجدول كان يُخفي 8 من 9
+        # بعد تصفير الإحصائيات فبدت الاستراتيجيات (منها Elliott_Impulse) محذوفة
+        known = {r['strategy'] for r in rows}
+        for _k, _fn, disp in _evidence_strategy_table():
+            if disp not in known:
+                rows.append({'strategy': disp, 'n': 0, 'pf': None, 'wr': None,
+                             'exp_pct': None, 'net_usdt': 0.0, 'last_closed_at': '',
+                             'status': 'active'})
         return jsonify({
             'strategies': rows,
             'retirement': {'enabled': retire.get('enabled'), 'min_n': retire.get('min_n'),
@@ -6602,7 +6648,60 @@ def toggle_trading_status():
         is_trading_enabled = not is_trading_enabled
         status_msg = "مُفعّل" if is_trading_enabled else "مُعطّل"
         log_and_notify('warning', f"🚨 تم تغيير حالة التداول الحقيقي إلى: {status_msg}", "TRADING_STATUS_CHANGE")
-        return jsonify({"message": f"Trading status set to {status_msg}"})
+    _persist_trading_flag()  # [V9.40.0] الحالة تبقى عبر النشر/إعادة التشغيل — لا انطفاء صامت
+    return jsonify({"message": f"Trading status set to {status_msg}"})
+
+
+# --- [V9.40.0] حفظ مفتاح التداول عبر إعادة التشغيل — علاج "الانطفاء الصامت":
+# is_trading_enabled افتراضي False عند كل إقلاع، فنشر V9.39.0 أعاد التشغيل فانطفأ
+# التداول الحقيقي دون إشعار وكل صفقات اليوم كانت ورقية بلا علم المستخدم. الآن الحالة
+# تُحفظ في bot_state (خارج نطاق تصفير الإحصائيات) وتُستعاد عند الإقلاع بإشعار صريح.
+TRADING_ENABLED_STATE_KEY = 'trading_enabled'
+
+
+def _persist_trading_flag() -> None:
+    """حفظ حالة التداول الحالية في bot_state (أفضل جهد — الفشل لا يغير الحالة الجارية)."""
+    try:
+        if not check_db_connection() or not conn:
+            return
+        with trading_status_lock:
+            payload = json.dumps({'enabled': bool(is_trading_enabled),
+                                  'updated_at': datetime.now(timezone.utc).isoformat()})
+        with db_conn_lock, conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO bot_state (key, value, updated_at) VALUES (%s, %s::jsonb, NOW()) "
+                "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW();",
+                (TRADING_ENABLED_STATE_KEY, payload))
+            conn.commit()
+    except Exception as e:
+        logger.debug(f"[حالة التداول] تعذر الحفظ: {e}")
+
+
+def _restore_trading_flag_at_boot() -> None:
+    """استعادة حالة التداول المحفوظة عند الإقلاع + إشعار صريح بالوضع (ورقي/حقيقي)
+    — غياب الحالة يعني الافتراضي الورقي (False) كما كان دائمًا."""
+    global is_trading_enabled
+    if not check_db_connection() or not conn:
+        return
+    try:
+        with db_conn_lock, conn.cursor() as cur:
+            cur.execute("SELECT value FROM bot_state WHERE key = %s;", (TRADING_ENABLED_STATE_KEY,))
+            row = cur.fetchone()
+        saved = row.get('value') if row and isinstance(row, dict) else None
+        if isinstance(saved, dict) and 'enabled' in saved:
+            with trading_status_lock:
+                is_trading_enabled = bool(saved['enabled'])
+    except Exception as e:
+        logger.debug(f"[حالة التداول] لا حالة محفوظة — الافتراضي الورقي: {e}")
+    try:
+        with trading_status_lock:
+            st = bool(is_trading_enabled)
+        log_and_notify('warning' if st else 'info',
+                       ("🎛️ حالة التداول عند الإقلاع: حقيقي مفعّل (مستعادة من DB)" if st
+                        else "🎛️ حالة التداول عند الإقلاع: ورقي تجريبي (التداول الحقيقي معطّل)"),
+                       "TRADING_STATUS_CHANGE")
+    except Exception:
+        pass
 
 # --- [V9.38.0] تصفير الإحصائيات — زر في اللوحة (طلب المستخدم: "اريد اضافة زر في لوحة
 # التحكم لتصفير الاحصائيات من قاعدة البيانات وريديس والبدء من جديد") ---
@@ -7423,12 +7522,19 @@ def _evaluate_protections_on_close():
                     "LowProfitPairs")
 
     # 4) CooldownPeriod: تهدئة لكل زوج بعد أي إغلاق (كل المسارات لا التوصيات حصرًا)
+    #    [V9.40.0] مدة حسب النتيجة: إغلاق رابح → تهدئة قصيرة (استمرار الصعود يُلتقط،
+    #    شكوى المستخدم: فرص ضائعة بعد الإغلاق الرابح) | خاسر/تعادل → المدة الكاملة.
+    #    _add_protection_lock يحفظ القفل الأطول — لا تقصير لقفل قائم أطول منها.
     latest_close = max((c['ts'] for c in closes), default=None)
     if latest_close is not None:
-        sym_latest = [c['symbol'] for c in closes if c['ts'] == latest_close]
-        for pair_sym in sym_latest:
-            _add_protection_lock('pair', pair_sym, PROTECTION_COOLDOWN_MIN,
-                                 f"تهدئة ما بعد الإغلاق ({PROTECTION_COOLDOWN_MIN} دقيقة)",
+        sym_latest = [c for c in closes if c['ts'] == latest_close]
+        for c_rec in sym_latest:
+            won = float(c_rec.get('profit_pct', 0.0)) > 0.0
+            cd_min = (PROTECTION_COOLDOWN_WIN_MIN
+                      if (won and PROTECTION_COOLDOWN_WIN_MIN > 0) else PROTECTION_COOLDOWN_MIN)
+            tag = ' — إغلاق رابح، إعادة ركوب مبكرة' if (won and cd_min < PROTECTION_COOLDOWN_MIN) else ''
+            _add_protection_lock('pair', c_rec['symbol'], cd_min,
+                                 f"تهدئة ما بعد الإغلاق ({cd_min} دقيقة){tag}",
                                  "CooldownPeriod")
 
 
@@ -7492,7 +7598,9 @@ def get_active_protections_snapshot() -> Dict[str, Any]:
             'stoploss_guard': f"{PROTECTION_SL_COUNT} وقفات/{PROTECTION_SL_LOOKBACK_MIN}د → تجميد {PROTECTION_SL_STOP_MIN}د",
             'max_drawdown': f"<= -{abs(PROTECTION_DD_MAX_PCT)}% عبر {PROTECTION_DD_TRADE_LIMIT}+ صفقات/{PROTECTION_DD_LOOKBACK_MIN}د → تجميد {PROTECTION_DD_STOP_MIN}د",
             'low_profit_pairs': f"{PROTECTION_PAIR_TRADES}+ صفقات بمجموع <{PROTECTION_PAIR_MIN_PROFIT}%/{PROTECTION_PAIR_LOOKBACK_MIN}د → قفل زوج {PROTECTION_PAIR_STOP_MIN}د",
-            'cooldown': f"{PROTECTION_COOLDOWN_MIN}د لكل زوج بعد أي إغلاق",
+            'cooldown': (f"{PROTECTION_COOLDOWN_WIN_MIN}د بعد إغلاق رابح / {PROTECTION_COOLDOWN_MIN}د بعد خاسر"
+                         if PROTECTION_COOLDOWN_WIN_MIN > 0 else
+                         f"{PROTECTION_COOLDOWN_MIN}د لكل زوج بعد أي إغلاق"),
             'max_sl_distance_pct': MAX_SL_DISTANCE_PCT,
             'stale_exit': f"> {STALE_TRADE_HOURS}س بربح < {STALE_MIN_PROFIT_PCT}% → إغلاق",
             # [V9.32.0] حد أدنى لخروج إشارة FT (علاج الخروج المبكر)
@@ -8865,6 +8973,11 @@ def initialize_bot_services():
             get_exchange_info_map()
             load_open_signals_to_cache()
             load_notifications_to_cache()
+            # [V9.40.0] استعادة حالة التداول المحفوظة + إشعار صريح — نهاية الانطفاء الصامت
+            try:
+                _restore_trading_flag_at_boot()
+            except Exception as tf_boot_err:
+                logger.debug(f"[حالة التداول] تعذر الاستعادة عند الإقلاع: {tf_boot_err}")
             # [V9.34.0] حاكم التقاعد: استعادة الحالة المحفوظة ثم إحصاء حي من DB
             # (قد تُعلَّق استراتيجية ضعيفة فور الإقلاع بدل انتظار أول إغلاق)
             try:
