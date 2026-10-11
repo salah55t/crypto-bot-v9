@@ -49,7 +49,7 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-APP_VERSION: str = 'V9.35.0'  # [V9.21.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
+APP_VERSION: str = 'V9.36.0'  # [V9.21.0] مصدر وحيد لرقم الإصدار — نهاية سلاسل النصوص المتفرقة
 logger = logging.getLogger(f'CryptoBot{APP_VERSION}')
 
 # زمن إقلاع العملية لحساب مدة التشغيل في لوحة التحكم
@@ -535,7 +535,10 @@ PROTECTION_PAIR_STOP_MIN: int = config('PROTECTION_PAIR_STOP_MIN', default=360, 
 # 4) CooldownPeriod — تهدئة لكل زوج بعد أي إغلاق (تفحصها كل مسارات الدخول لا التوصيات حصرًا)
 PROTECTION_COOLDOWN_MIN: int = config('PROTECTION_COOLDOWN_MIN', default=240, cast=int)
 # 5) سقف مسافة الوقف (نمط stoploss الثابت في freqtrade — وقف ATR بلا سقف أنتج -10.67%)
-MAX_SL_DISTANCE_PCT: float = config('MAX_SL_DISTANCE_PCT', default=6.0, cast=float)
+# [V9.36.0] 6.0 → 4.0: قياس 113 صفقة حية — 5 صفقات نزفت تحت -4% (MAGIC -9.02/MET -10.67/
+# ZRO -4.97/RLC -6.64/MINA -4.62 = -1.45$) بينما أسوأ خسارة لاستراتيجية رابحة -3.05% (ATOM/SR)
+# و-0.84% (BinHCluc PF 4.02) — سقف 4% لا يلمس صفقة صحية واحدة ويرصف نزفات السكاكين ~45%
+MAX_SL_DISTANCE_PCT: float = config('MAX_SL_DISTANCE_PCT', default=4.0, cast=float)
 # 6) الخروج الزمني (نمط ROI/custom_exit): صفقة عجوز بلا ربح تحرّر المكان وتقطع استنزاف الرسوم
 STALE_TRADE_HOURS: float = config('STALE_TRADE_HOURS', default=24.0, cast=float)
 STALE_MIN_PROFIT_PCT: float = config('STALE_MIN_PROFIT_PCT', default=0.2, cast=float)
@@ -584,7 +587,15 @@ FT_EXIT_SKIP_MAX_MIN: float = config('FT_EXIT_SKIP_MAX_MIN', default=90.0, cast=
 #    Evaluator/Util/trend_analysis.py (قبول 0.9-0.95 بتأخير 1-2) — السكين الذي ما زال
 #    يصنع قيعانًا جديدة يُرفض؛ الدخول فقط بعد تشكل القاع وبدء الارتداد.
 # القوائم قابلة للضبط عبر البيئة؛ "off" يعيد كل شيء لوضع ما قبل V9.34.
-STRATEGY_DISABLED_DEFAULT = ['BB_STOCH']
+# [V9.36.0] + MACD_EMA: n=7 وPF 0.012 وWR 14.3% و-0.58$ (RLC -6.64/MINA -4.62) —
+# حاكم التقاعد ينتظر n≥12 لكن إحصاءها قاطع عند 7 (المكاسب 1.2% من الخسائر) — تعطيل فوري
+STRATEGY_DISABLED_DEFAULT = ['BB_STOCH', 'MACD_EMA']
+
+# خريطة مفتاح التعطيل → اسم العرض (للحالة 'retired' في /api/strategy_pnl والتوثيق الموحد)
+STRATEGY_KEY_TO_DISPLAY: Dict[str, str] = {
+    'BB_STOCH': 'BB_Stoch_Reversal_Enhanced',
+    'MACD_EMA': 'MACD_EMA_Crossover',
+}
 
 def _parse_disabled_strategies(raw: str) -> List[str]:
     try:
@@ -630,7 +641,9 @@ FT_REVERSAL_BOUNCE_FILTER: bool = config('FT_REVERSAL_BOUNCE_FILTER', default=Tr
 #   قمة 0.75% → قفل 0.10% (تعادل تقريبا بدل -5% كاملة) | 1.25% → 0.45% (صافٍ موجب مضمون)
 #   2.0% → 1.0% | 3.0% → 1.8% | 4.5% → 3.0% — قابلة للضبط عبر PROFIT_LOCK_LADDER_JSON
 #   (تعطيل: "off" أو "[]" لا يعمل — استخدم off/disabled/0/none)
-_LADDER_DEFAULT_RAW = '[[0.75,0.10],[1.25,0.45],[2.0,1.0],[3.0,1.8],[4.5,3.0]]'
+# [V9.36.0] رفع درجتي 1-2 فوق الرسوم (0.2% ذهاب/إياب): 0.10% خام = خسارة صافية مضمونة
+# (GRAM -0.13$ وSTRK -0.11$ “قفل خاسر”) → 0.30% خام = +0.10% صافٍ، و0.45 → 0.55 = +0.35% صافٍ
+_LADDER_DEFAULT_RAW = '[[0.75,0.30],[1.25,0.55],[2.0,1.0],[3.0,1.8],[4.5,3.0]]'
 
 def _parse_profit_lock_ladder(raw: str) -> List[Tuple[float, float]]:
     try:
@@ -4190,7 +4203,9 @@ FREQTRADE_STRATEGIES: Dict[str, Dict[str, Any]] = {
     'FT_BbandRsi': {
         'name': 'FT_BbandRsi', 'key': 'FT_BBANDRSI', 'ar_name': 'بولنجر+RSI الأصلي (BbandRsi)',
         'source': 'freqtrade-strategies/berlinguyinca/BbandRsi.py', 'timeframe_canon': '1h',
-        'minimal_roi': {0: 0.10}, 'stoploss': -0.25,
+        # [V9.36.0] -0.25 → -0.05: قيمة الريبو الأصلي لهدف ROI 10% على إطار أعلى — بوتنا
+        # يستهدف 0.5-3% برسوم 0.2%؛ MAGIC نزف -9.02% تحت وقف -25% قبل سقف الحماية
+        'minimal_roi': {0: 0.10}, 'stoploss': -0.05,
         'trailing_stop': False, 'trailing_stop_positive': None,
         'trailing_stop_positive_offset': None, 'trailing_only_offset_is_reached': False,
         'entry_fn': ft_entry_bbandrsi, 'exit_fn': ft_exit_bbandrsi, 'family': 'reversal'},
@@ -4211,21 +4226,24 @@ FREQTRADE_STRATEGIES: Dict[str, Dict[str, Any]] = {
     'FT_Quickie': {
         'name': 'FT_Quickie', 'key': 'FT_QUICKIE', 'ar_name': 'Quickie الأصلي (إغلاق سريع)',
         'source': 'freqtrade-strategies/berlinguyinca/Quickie.py', 'timeframe_canon': '5m',
-        'minimal_roi': {10: 0.15, 15: 0.06, 30: 0.03, 100: 0.01}, 'stoploss': -0.25,
+        # [V9.36.0] -0.25 → -0.05 (نفس منطق BbandRsi — قيمة أصلية لهدف 15%) — WLD أغلقت +1.73% عبر السلم
+        'minimal_roi': {10: 0.15, 15: 0.06, 30: 0.03, 100: 0.01}, 'stoploss': -0.05,
         'trailing_stop': False, 'trailing_stop_positive': None,
         'trailing_stop_positive_offset': None, 'trailing_only_offset_is_reached': False,
         'entry_fn': ft_entry_quickie, 'exit_fn': ft_exit_quickie, 'family': 'reversal'},
     'FT_ADXMomentum': {
         'name': 'FT_ADXMomentum', 'key': 'FT_ADXMOMENTUM', 'ar_name': 'زخم ADX الأصلي (ADXMomentum)',
         'source': 'freqtrade-strategies/berlinguyinca/ADXMomentum.py', 'timeframe_canon': '1h',
-        'minimal_roi': {0: 0.01}, 'stoploss': -0.25,
+        # [V9.36.0] -0.25 → -0.05 (توجهي لم يتداول بعد — توحيد عائلة FT كلها على -5%)
+        'minimal_roi': {0: 0.01}, 'stoploss': -0.05,
         'trailing_stop': False, 'trailing_stop_positive': None,
         'trailing_stop_positive_offset': None, 'trailing_only_offset_is_reached': False,
         'entry_fn': ft_entry_adxmomentum, 'exit_fn': ft_exit_adxmomentum, 'family': 'trend'},
     'FT_Bandtastic': {
         'name': 'FT_Bandtastic', 'key': 'FT_BANDTASTIC', 'ar_name': 'Bandtastic الأصلي (15م أصلًا)',
         'source': 'freqtrade-strategies/user_data/strategies/Bandtastic.py', 'timeframe_canon': '15m',
-        'minimal_roi': {0: 0.162, 69: 0.097, 229: 0.061, 566: 0.0}, 'stoploss': -0.345,
+        # [V9.36.0] -0.345 → -0.05: ZRO نزف -4.97% تحت وقف -34.5% الأصلي (هدف ROI 16.2%)
+        'minimal_roi': {0: 0.162, 69: 0.097, 229: 0.061, 566: 0.0}, 'stoploss': -0.05,
         'trailing_stop': True, 'trailing_stop_positive': 0.01,
         'trailing_stop_positive_offset': 0.058, 'trailing_only_offset_is_reached': False,
         'entry_fn': ft_entry_bandtastic, 'exit_fn': ft_exit_bandtastic, 'family': 'reversal'},
@@ -6404,7 +6422,7 @@ def api_strategy_pnl():
     try:
         stats = _strategy_retire_db_stats()
         retire = strategy_retirement_snapshot()
-        retired_keys = {('BB_Stoch_Reversal_Enhanced' if k == 'BB_STOCH' else k) for k in DISABLED_STRATEGY_KEYS}
+        retired_keys = {STRATEGY_KEY_TO_DISPLAY.get(k, k) for k in DISABLED_STRATEGY_KEYS}
         rows = []
         for name, s in stats.items():
             if name in retired_keys:
