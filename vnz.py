@@ -49,7 +49,7 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-APP_VERSION: str = 'V9.40.0'  # [V9.40.0] سلّم قفل أرباح صاعد (STRONG_UPTREND يمنح الرابحين مساحة) + تهدئة أقصر للإغلاق الرابح + حفظ مفتاح التداول عبر النشر + شارة الوضع الورقي + جدول الأداء يعرض كل الاستراتيجيات الحية  # [V9.21.0] مصدر وحيد لرقم الإصدار
+APP_VERSION: str = 'V9.41.0'  # [V9.41.0] إصلاح قاتل: Elliott_Impulse لم يُضف لحلقة الفحص الرئيسية منذ V9.39.0 (صفر إشارة رغم الترشيح والأدلة) + خفض أرضية SR 0.85→0.60 (فروع ضائعة في الصعود) + تهدئة التوصيات 480→90د (654 تخطي/يوم يخنق النشاط)  # [V9.21.0] مصدر وحيد لرقم الإصدار
 logger = logging.getLogger(f'CryptoBot{APP_VERSION}')
 
 # زمن إقلاع العملية لحساب مدة التشغيل في لوحة التحكم
@@ -198,6 +198,8 @@ RECOMMENDATION_MIN_FIT_SCORE: float = config('RECOMMENDATION_MIN_FIT_SCORE', def
 # تهدئة بعد إغلاق أي صفقة لرمز معين: لا توصية جديدة لنفس الرمز خلالها (منع التأرجح)
 # [V9.23.0] 480د (8 ساعات) مثبتة بالباك تيست: خفض التأرجح الربحي القصير ≤4 ساعات (خاسر -0.27%/صفقة)
 # وترفع الصافي مع بوابة الأدلة: -1.44U → +1.39U على 30 يومًا × 24 رمزًا (PF 0.93 → 1.16)
+# [V9.41.0] فُحص خفضها (654 تخطيًا/يوم يبدو خنقًا للنشاط) ورُفض: التخطيبات هي سلوك
+# مثبت بالباك تيست أعلاه — إعادة الشراء خلال 8 ساعات خاسرة تاريخيًا -0.27%/صفقة
 RECOMMENDATION_COOLDOWN_MIN: int = config('RECOMMENDATION_COOLDOWN_MIN', default=480, cast=int)
 
 # ---------------------- [V9.23.0] محرك الأدلة — الترشيح بالبرهان لا بالتكهن ----------------------
@@ -4161,7 +4163,10 @@ ENTRY_QUALITY_PROFILES: Dict[str, Dict[str, Optional[float]]] = {
     'EMA_RSI_Cross':              {'min_excursion_pct': 0.60, 'max_ext_atr': 2.5, 'max_bounce_atr': None, 'max_body_atr': 2.0, 'min_eqs': 55},
     'Pullback_MACD':              {'min_excursion_pct': 0.60, 'max_ext_atr': 2.0, 'max_bounce_atr': None, 'max_body_atr': 2.0, 'min_eqs': 55},
     'Bullish_Momentum':           {'min_excursion_pct': 0.70, 'max_ext_atr': 2.5, 'max_bounce_atr': None, 'max_body_atr': 2.5, 'min_eqs': 55},
-    'SR_Breakout_Enhanced':       {'min_excursion_pct': 0.85, 'max_ext_atr': 3.0, 'max_bounce_atr': None, 'max_body_atr': 2.5, 'min_eqs': 60},
+    # [V9.41.0] أرضية SR 0.85→0.60: المراقبة الحية سجّلت ~50 رفضًا/يوم بمدى متوقع 0.60-0.84%
+    # (فوق الرسوم ذاتها ~0.20% ذهابًا وإيابًا) في أيام الصعود — محاذاة EMA_RSI/Elliott (0.60)،
+    # و EQG (min_eqs 60) وبوابة الأدلة تبقى حارسَي الجودة كما هما
+    'SR_Breakout_Enhanced':       {'min_excursion_pct': 0.60, 'max_ext_atr': 3.0, 'max_bounce_atr': None, 'max_body_atr': 2.5, 'min_eqs': 60},
     # عائلة FT العكسية (قاع-صيد): بلا سقف ملاحقة (تشتري الغرقى شرعًا) — سقف الارتداد 1.5×ATR
     'FT_CombinedBinHAndCluc':     {'min_excursion_pct': 0.55, 'max_ext_atr': None, 'max_bounce_atr': 1.5, 'max_body_atr': 2.0, 'min_eqs': 50},
     'FT_EMASkipPump':             {'min_excursion_pct': 0.55, 'max_ext_atr': None, 'max_bounce_atr': 1.5, 'max_body_atr': 1.5, 'min_eqs': 50},
@@ -8540,6 +8545,13 @@ def main_loop_enhanced():
                     for _ft_name, _ft_spec in FREQTRADE_STRATEGIES.items():
                         if FT_STRATEGY_ENABLED.get(_ft_name, True) and _strategy_enabled(_ft_spec['key']):
                             strategies_to_check.append((_ft_spec['key'], _ft_spec['entry_fn'], _ft_name))
+            # [V9.41.0 إصلاح قاتل] Elliott Impulse في حلقة الفحص الرئيسية — V9.39.0 سجّل
+            # الاستراتيجية في الترشيح (STRATEGY_SETUP_SCANNERS) وجدول الأدلة (_evidence_strategy_table)
+            # وعرض الترشيحات (display_names) لكنه نسي إضافتها هنا → صفر فحص وصفر إشارة منذ
+            # الإطلاق رغم وجود 10 مرشحين نشطين لكل دورة (الخلل الذي أبلغ عنه المستخدم:
+            # "إستراتيجية اليوت لم تولد أي إشارة"). التعطيل عبر ELLIOTT_ENABLED=false
+            if _strategy_enabled('ELLIOTT'):
+                strategies_to_check.append(('ELLIOTT', check_elliott_impulse_strategy, 'Elliott_Impulse'))
 
             # [V9.25.0] الحلقة استراتيجيةً: كل استراتيجية تفحص مرشحيها العشرة حصرًا.
             # بوابات مستوى الاستراتيجية (حالة السوق + ثبات الصاعد) قبل جلب أي شموع.
