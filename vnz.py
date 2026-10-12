@@ -49,7 +49,21 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-APP_VERSION: str = 'V9.41.0'  # [V9.41.0] إصلاح قاتل: Elliott_Impulse لم يُضف لحلقة الفحص الرئيسية منذ V9.39.0 (صفر إشارة رغم الترشيح والأدلة) + خفض أرضية SR 0.85→0.60 (فروع ضائعة في الصعود) + تهدئة التوصيات 480→90د (654 تخطي/يوم يخنق النشاط)  # [V9.21.0] مصدر وحيد لرقم الإصدار
+# [V9.21.0] مصدر وحيد لرقم الإصدار — [V9.42.0] المراجعة الاحترافية الشاملة (أكبر عملية إصلاح وتنقية):
+#   ① فيبوناتشي كامل لليوت: هدف امتداد 0.618×W3 من قاع W4 (وأهداف 1.0×W3 و 1.618×W1 موثقة للرحلة)
+#      + وقف بنيوي تحت قاع W4 (P4 − 0.25×ATR) بدل وقف ATR العام — منطق الفتح/الغلق الإحترافي
+#   ② زيجزاج تكييفي: عتبة الانعكاس = قيد(ATR% × 1.6، 0.35، 1.2) بدل 1.0% الثابتة التي
+#      كانت أكبر من تقلب 15م الفعلي فتخنق بنية الموجات (السبب الثاني لصفر إشارات اليوت)
+#   ③ منطقة فيبوناتشي الذهبية للتراجع Pullback: لا شراء إلا داخل تراجع [0.15, 0.618]
+#      من آخر دفعة ≥ 2×ATR — ضد المطاردة عند القمم وضد البنية المكسورة
+#   ④ حجم المركز على المسافة الحقيقية للوقف (ATR قبل التقييد) لا الوقف المقيد — قطع ذيل
+#      خسائر الفجوة (-6.26% MAGIC): الخسارة تعود إلى المخاطرة المعمم بها (0.85%)
+#   ⑤ حق النقض الانتقالي: الريم الانتقالي لم يعد يمنح ائتمانًا لعائلة الاستمرارية
+#      (EMA_RSI/Pullback/Momentum/ADX-Momentum) — الخلية الانتقالية كانت مصدر أسوأ الخسائر
+#   ⑥ سقف مطاردة EMA_RSI 2.5→2.0×ATR (محاذاة Pullback) + تنظيف كود ميت
+#   ملاحظة توثيقية: تهدئة التوصيات 480د بقيت كما ثبّتها باك-تيست V9.23.0 (فُحص خفضها ورُفض)
+#   ولا استراتيجية تُحذف بلا بيانات: حاكم التقاعد (n≥12، PF<0.55) هو الإعدام بالبيانات
+APP_VERSION: str = 'V9.42.0'
 logger = logging.getLogger(f'CryptoBot{APP_VERSION}')
 
 # زمن إقلاع العملية لحساب مدة التشغيل في لوحة التحكم
@@ -268,20 +282,23 @@ REGIME_AR: Dict[str, str] = {
 # adx = (حد_أدنى, مثالي, سقف): سلم صعود 0→25 للتوجهية، أو سقف يتحلل فوقه ×2/وحدة للنطاقية
 STRATEGY_PAIR_PROFILES: Dict[str, Dict[str, Any]] = {
     # التقاطعات الاتجاهية: اتجاه صاعد قائم بهيكل EMA سليم
+    # [V9.42.0] بلا transitional_ok: لا استمرارية في ريم لم يستقر (سابقًا ائتمان 15
+    # كان يفتح باب بناء خلايا انتقالية خاسرة — أسوأ خلايا التاريخ)
     'EMA_RSI_Cross':              {'regimes': ('trend_up',),        'adx': (18.0, 28.0, None), 'atr_pct': (0.30, 5.0), 'struct_up_bonus': True, 'pos_roc_bonus': True},
-    # Pullback — Raschke: اتجاه مثبت بأعمق من التقاطعات
+    # Pullback — Raschke: اتجاه مثبت بأعمق من التقاطعات + بلا transitional_ok
     'Pullback_MACD':              {'regimes': ('trend_up',),        'adx': (22.0, 32.0, None), 'atr_pct': (0.30, 5.0), 'struct_up_bonus': True, 'pos_roc_bonus': True},
     # الزخم: قادة الحركة الصاعدة — زخم سالب نقض قاسٍ (لا سكين ساقطة)
     'Bullish_Momentum':           {'regimes': ('trend_up',),        'adx': (20.0, 30.0, None), 'atr_pct': (0.40, 6.0), 'struct_up_bonus': True, 'pos_roc_bonus': True, 'require_pos_roc': True},
-    'SR_Breakout_Enhanced':       {'regimes': ('range', 'squeeze'), 'secondary_regimes': ('trend_up',), 'adx': (None, None, 34.0), 'atr_pct': (None, 5.0), 'low_bbwp_bonus': True},
+    'SR_Breakout_Enhanced':       {'regimes': ('range', 'squeeze'), 'secondary_regimes': ('trend_up',), 'adx': (None, None, 34.0), 'atr_pct': (None, 5.0), 'low_bbwp_bonus': True, 'transitional_ok': True},
     # --- [V9.29.0] استراتيجيات freqtrade الأصلية: عائلة الارتداد تشتري فوق الحد السفلي
-    'FT_CombinedBinHAndCluc':     {'regimes': ('range', 'trend_down'), 'secondary_regimes': ('trend_up', 'transitional'), 'adx': (None, None, None), 'atr_pct': (0.25, 4.0), 'range_bonus': True},
-    'FT_EMASkipPump':             {'regimes': ('range', 'trend_down'), 'secondary_regimes': ('trend_up', 'transitional'), 'adx': (None, None, None), 'atr_pct': (0.25, 4.0), 'range_bonus': True},
-    'FT_Quickie':                 {'regimes': ('range', 'trend_down'), 'secondary_regimes': ('trend_up', 'transitional'), 'adx': (None, None, None), 'atr_pct': (0.25, 4.0), 'range_bonus': True},
-    # زخم freqtrade الأصلي (ADX>25 + +DI>-DI + MOM>0) — اتجاه صاعد قائم
+    # [V9.42.0] عائلة الارتداد transitional_ok: شراء الانهيارات بيئي بغض النظر عن استقرار الريم
+    'FT_CombinedBinHAndCluc':     {'regimes': ('range', 'trend_down'), 'secondary_regimes': ('trend_up', 'transitional'), 'adx': (None, None, None), 'atr_pct': (0.25, 4.0), 'range_bonus': True, 'transitional_ok': True},
+    'FT_EMASkipPump':             {'regimes': ('range', 'trend_down'), 'secondary_regimes': ('trend_up', 'transitional'), 'adx': (None, None, None), 'atr_pct': (0.25, 4.0), 'range_bonus': True, 'transitional_ok': True},
+    'FT_Quickie':                 {'regimes': ('range', 'trend_down'), 'secondary_regimes': ('trend_up', 'transitional'), 'adx': (None, None, None), 'atr_pct': (0.25, 4.0), 'range_bonus': True, 'transitional_ok': True},
+    # زخم freqtrade الأصلي (ADX>25 + +DI>-DI + MOM>0) — اتجاه صاعد قائم + بلا transitional_ok
     'FT_ADXMomentum':             {'regimes': ('trend_up',), 'adx': (20.0, 30.0, None), 'atr_pct': (0.40, 6.0), 'struct_up_bonus': True, 'pos_roc_bonus': True},
     # [V9.39.0] Elliott Impulse — موجة 4 تُشترى في الصاعد القائم (انتقالي كثانوي: دافع يولد بعد تهدئة)
-    'Elliott_Impulse':            {'regimes': ('trend_up',), 'secondary_regimes': ('transitional',), 'adx': (18.0, 30.0, None), 'atr_pct': (0.35, 5.0), 'struct_up_bonus': True, 'pos_roc_bonus': True},
+    'Elliott_Impulse':            {'regimes': ('trend_up',), 'secondary_regimes': ('transitional',), 'adx': (18.0, 30.0, None), 'atr_pct': (0.35, 5.0), 'struct_up_bonus': True, 'pos_roc_bonus': True, 'transitional_ok': True},
 }
 
 # --- [V9.24.0] خريطة السوق العام → الاستراتيجيات المسموحة (حتمية لا تكهن) ---
@@ -3422,7 +3439,7 @@ def compute_symbol_regime(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             return None
         atr_pct = (atr / close) * 100.0
         # كفاءة كوفمان: صافي الحركة ÷ مجموع مقاطع الحركة (آخر 20 شمعة) — 0 فوضى، 1 سهم
-        w = closes_w = df['close'].astype(float).iloc[-21:]
+        closes_w = df['close'].astype(float).iloc[-21:]
         net = abs(float(closes_w.iloc[-1]) - float(closes_w.iloc[0]))
         gross = float(closes_w.diff().abs().sum())
         er = (net / gross) if gross > 0 else 0.0
@@ -3481,8 +3498,10 @@ def score_strategy_pair_fit(ri: Optional[Dict[str, Any]], strategy_name: str) ->
         score = 40.0
     elif prof.get('secondary_regimes') and regime in prof['secondary_regimes']:
         score = 25.0  # ائتمان ثانوي: بيئة مقبولة لكن ليست جوهر الاستراتيجية
-    elif regime == 'transitional':
-        score = 15.0  # ائتمان جزئي: الريم لم يستقر بعد
+    elif prof.get('transitional_ok') and regime == 'transitional':
+        score = 15.0  # [V9.42.0] ائتمان جزئي للانتقالي فقط لمن يسمح بصراحة (عائلة الارتداد
+        # والإليوت والاختراق) — عائلة الاستمرارية لا تشتري في ريم لم يستقر بعد:
+        # الخلية الانتقالية كانت مصدر أسوأ الخسائر التاريخية والحية (EMA_RSI×انتقالي)
     else:
         return 0.0  # ريم معاكس صراحةً — لا تُجبر استراتيجية على بيئة تكرهها
     # (ADX: 0-25) سلم صعود للتوجهية أو سقف متحلل للنطاقية
@@ -3654,6 +3673,11 @@ def _zigzag_pivots(closes: List[float], highs: List[float], lows: List[float],
 def _elliott_w4_setup_info(df: pd.DataFrame) -> Tuple[bool, Dict[str, Any]]:
     """فحص بنية الدافع الصاعد حيًا على 15m: P0→P3 صالح بقواعد إليوت الثلاث +
     موجة 4 مؤكدة الارتداد داخل المنطقة المفتاحية + شمعة دخول صاعدة سليمة.
+    [V9.42.0] عتبة الزيجزاج تكييفية بالتقلب (ATR% × 1.6، حدود [0.35، 1.2]%) —
+    العتبة الثابتة 1.0% كانت أكبر من تقلب 15م الفعلي في معظم الأزواج فتخنق بنية
+    الموجات (سبب صفر إشارات الثاني بعد خلل الربط V9.41.0). كما تُنتج الأدلة
+    أهداف فيبوناتشي الكاملة (0.618×W3 و 1.0×W3 و 1.618×W1 من قاع W4) والوقف
+    البنيوي (P4 − 0.25×ATR) ليستهلكهما محرك فتح الصفقة (نطاق فيبوناتشي الاحترافي).
     يعيد (نجاح، أدلة عربية رقمية) — حتمي بالكامل (نفس الشموع ⇒ نفس القرار)."""
     ev: Dict[str, Any] = {}
     try:
@@ -3664,7 +3688,21 @@ def _elliott_w4_setup_info(df: pd.DataFrame) -> Tuple[bool, Dict[str, Any]]:
         if n < 60:
             ev['reason'] = f'شموع غير كافية للزيجزاج ({n} < 60)'
             return False, ev
-        pivots = _zigzag_pivots(closes, highs, lows, ELLIOTT_ZZ_DEVIATION_PCT)
+        # [V9.42.0] العتبة التكيفية: ATR فعلي من الشموع المميزة إن توفر، وإلا القيمة الثابتة
+        atr_val: Optional[float] = None
+        try:
+            if 'atr' in df.columns and pd.notna(df['atr'].iloc[-1]):
+                _a = float(df['atr'].iloc[-1])
+                if _a > 0: atr_val = _a
+        except Exception:
+            atr_val = None
+        if atr_val is not None and closes[-1] > 0:
+            atr_pct = atr_val / closes[-1] * 100.0
+            dev_pct = min(1.2, max(0.35, atr_pct * 1.6))
+        else:
+            atr_pct = None
+            dev_pct = float(ELLIOTT_ZZ_DEVIATION_PCT)
+        pivots = _zigzag_pivots(closes, highs, lows, dev_pct)
         if len(pivots) < 6:
             ev['reason'] = f'محاور غير كافية لبنية الدافع ({len(pivots)} < 6)'
             return False, ev
@@ -3724,7 +3762,14 @@ def _elliott_w4_setup_info(df: pd.DataFrame) -> Tuple[bool, Dict[str, Any]]:
         ev.update({'w1': round(w1, 8), 'w3': round(w3, 8),
                    'w3_w1': round(w3 / w1, 3), 'w4_retrace_pct': round(retrace * 100, 1),
                    'p0': p0, 'p1': p1, 'p2': p2, 'p3': p3, 'p4': p4,
-                   'bars_since_p3': n - 1 - p3_idx})
+                   'bars_since_p3': n - 1 - p3_idx,
+                   # [V9.42.0] أدلة فيبوناتشي الاحترافية + عتبة الزيجزاج الفعلية
+                   'zz_dev_pct': round(dev_pct, 2), 'atr': atr_val,
+                   'atr_pct': round(atr_pct, 3) if atr_pct is not None else None,
+                   'fib_tp1': round(p4 + 0.618 * w3, 8),
+                   'fib_tp2': round(p4 + w3, 8),
+                   'fib_ext_1618': round(p4 + 1.618 * w1, 8) if w1 > 0 else None,
+                   'struct_stop': (round(p4 - 0.25 * atr_val, 8) if atr_val is not None else None)})
         return True, ev
     except Exception as e:
         ev['reason'] = f'خطأ: {e}'
@@ -3737,10 +3782,54 @@ def check_elliott_impulse_strategy(df: pd.DataFrame) -> bool:
     ok, ev = _elliott_w4_setup_info(df)
     if ok:
         logger.info(f"  -> [{df.name}] ✅ إشارة Elliott Impulse — W3/W1={ev.get('w3_w1')} "
-                    f"وتراجع W4={ev.get('w4_retrace_pct')}% داخل المنطقة المفتاحية.")
+                    f"وتراجع W4={ev.get('w4_retrace_pct')}% داخل المنطقة المفتاحية "
+                    f"(زيجزاج {ev.get('zz_dev_pct')}%، هدف فيبو {ev.get('fib_tp1')}).")
         return True
     logger.debug(f"  -> [{df.name}] Elliott Impulse: {ev.get('reason', '')}")
     return False
+
+
+def calculate_elliott_tp_sl(entry_price: float, ev: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """[V9.42.0] TP/SL فيبوناتشي الاحترافي لصفقات Elliott_Impulse — منطق الغلق من
+    بنية الدافع نفسها لا من وقف ATR العام:
+    - الهدف: امتداد 0.618×W3 من قاع W4 (إسقاط الموجة 5 الأدنى المعياري —
+      "الموجة 5 تساوي 0.618 من الموجة 3" أحد إسقاطات إليوت الكانونية)؛
+      أرضية الحد الأدنى للربح MIN_PROFIT_PERCENT تحمي من بنيات ضئيلة العائد.
+      (أهداف 1.0×W3 و 1.618×W1 تُوثق في التفاصيل لاستهلاكها بتمديد الرحلة).
+    - الوقف: البنيوي تحت قاع الموجة 4 (P4 − 0.25×ATR) — إبطال منطقة الموجة 4
+      هو نقيض أطروحة الدخول، وهو أضيق من وقف ATR العام فيرفع R:R دون توسيع خطر.
+    - المسافة الحقيقية للوقف تُعاد في risk_stop_distance ليحجم المركز على
+      المخاطرة الفعلية لا على الوقف المقيد (درس MAGIC -6.26%)."""
+    try:
+        p4 = float(ev.get('p4') or 0.0)
+        w3 = float(ev.get('w3') or 0.0)
+        w1 = float(ev.get('w1') or 0.0)
+        atr_v = float(ev.get('atr') or 0.0)
+        if p4 <= 0 or w3 <= 0 or entry_price <= 0:
+            return None
+        fib_tp1 = p4 + 0.618 * w3
+        target = max(fib_tp1, entry_price * (1.0 + MIN_PROFIT_PERCENT / 100.0))
+        if atr_v > 0:
+            stop = p4 - 0.25 * atr_v
+        else:
+            stop = min(p4, entry_price * 0.99)  # احتياط بلا ATR: تحت قاع W4 بمسافة معقولة
+        if stop >= entry_price:
+            return None
+        dist = entry_price - stop
+        if MAX_SL_DISTANCE_PCT > 0:
+            cap = entry_price * (MAX_SL_DISTANCE_PCT / 100.0)
+            if dist > cap:
+                stop = entry_price - cap
+                dist = cap
+        rr = (target - entry_price) / max(dist, 1e-9)
+        return {'target_price': round(target, 6), 'stop_loss': round(stop, 6),
+                'source': 'ELLIOTT_FIB_W4', 'rr_ratio': round(rr, 2),
+                'risk_stop_distance': round(dist, 6),
+                'fib_tp1': round(fib_tp1, 6), 'fib_tp2': round(p4 + w3, 6),
+                'fib_ext_1618': (round(p4 + 1.618 * w1, 6) if w1 > 0 else None),
+                'stop_basis': 'W4_structural' if atr_v > 0 else 'W4_floor'}
+    except Exception:
+        return None
 
 
 # --- [تحسين] دوال منطق الاستراتيجيات (تم تحسينها) ---
@@ -3755,13 +3844,69 @@ def check_ema_rsi_strategy(df: pd.DataFrame) -> bool:
         return True
     return False
 
+# [V9.42.0] منطقة فيبوناتشي الذهبية لاستراتيجية التراجع — القيم المعيارية للمحترفين:
+# الدفعة المرشح للاستمرار تُشترى داخل تصحيحها لا عند قمتها ولا بعد كسرها:
+#   0.15  = أدنى تراجع مقبول (شراء عند القمة نفسها = مطاردة — الشكوى الأولى من المستخدم)
+#   0.618 = النسبة الذهبية — حدود التصحيح الصحي للاتجاه الصحي (ما بعدها بنية مكسورة)
+# والتراجع يُقاس من آخر دفعة (قمة 40 شمعة → أدنى قاع بعدها) بشرط دفعة ذات معنى (≥ 2×ATR)
+PULLBACK_FIB_ZONE_MIN: float = config('PULLBACK_FIB_ZONE_MIN', default=0.15, cast=float)
+PULLBACK_FIB_ZONE_MAX: float = config('PULLBACK_FIB_ZONE_MAX', default=0.618, cast=float)
+PULLBACK_FIB_LOOKBACK: int = int(os.environ.get('PULLBACK_FIB_LOOKBACK', '40'))
+PULLBACK_FIB_MIN_IMPULSE_ATR: float = config('PULLBACK_FIB_MIN_IMPULSE_ATR', default=2.0, cast=float)
+
+
+def _pullback_fib_zone_info(df: pd.DataFrame) -> Tuple[bool, Dict[str, Any]]:
+    """[V9.42.0] فاحص النطاق الذهبي لفيبوناتشي للتراجع: يقيس تراجع آخر دفعة صاعدة
+    ويتحقق أنه داخل [PULLBACK_FIB_ZONE_MIN، PULLBACK_FIB_ZONE_MAX] من الدفعة.
+    يعيد (ok، أدلة رقمية). تعذر القياس (بيانات/ATR) أو دفعة أدنى من عتبة المعنى
+    = تمرير هادئ (البوابة لا تخنق إلا حين تستطيع القياس — درس V9.14)."""
+    ev: Dict[str, Any] = {'gate': 'PULLBACK_FIB'}
+    try:
+        if len(df) < PULLBACK_FIB_LOOKBACK + 5:
+            return True, {**ev, 'skipped': 'insufficient_data'}
+        last = df.iloc[-1]
+        atr_v = float(last['atr']) if ('atr' in last and pd.notna(last['atr'])) else None
+        if not atr_v or atr_v <= 0:
+            return True, {**ev, 'skipped': 'no_atr'}
+        win = df.iloc[-PULLBACK_FIB_LOOKBACK:]
+        highs = win['high'].astype(float)
+        lows = win['low'].astype(float)
+        sh_idx = int(highs.values.argmax())
+        swing_high = float(highs.iloc[sh_idx])
+        if sh_idx >= len(win) - 1:
+            return True, {**ev, 'skipped': 'at_high'}  # القمة آخر شمعة — لا دفعة مكتملة تُقاس
+        swing_low = float(lows.iloc[sh_idx:].min())
+        impulse = swing_high - swing_low
+        if impulse < PULLBACK_FIB_MIN_IMPULSE_ATR * atr_v:
+            return True, {**ev, 'skipped': 'no_meaningful_impulse',
+                          'impulse_atr': round(impulse / atr_v, 2)}
+        retrace = (swing_high - float(win['close'].astype(float).iloc[-1])) / impulse
+        ev.update({'swing_high': round(swing_high, 8), 'swing_low': round(swing_low, 8),
+                   'impulse': round(impulse, 8), 'retrace_pct': round(retrace * 100, 1)})
+        if not (PULLBACK_FIB_ZONE_MIN <= retrace <= PULLBACK_FIB_ZONE_MAX):
+            ev['reason_ar'] = (f"تراجع الدفعة {retrace * 100:.0f}% خارج النطاق الذهبي "
+                               f"[{PULLBACK_FIB_ZONE_MIN * 100:.0f}–{PULLBACK_FIB_ZONE_MAX * 100:.1f}%] (فيبوناتشي)")
+            return False, ev
+        return True, ev
+    except Exception as fib_err:
+        return True, {**ev, 'error': str(fib_err)}
+
+
 def check_pullback_strategy(df: pd.DataFrame) -> bool:
     if len(df) < 2: return False
     last, prev = df.iloc[-1], df.iloc[-2]
     uptrend_confirmed = last['close'] > last['ema_21'] and last['ema_21'] > last['ema_50']
     macd_cross_up = prev['macd'] < prev['macd_signal'] and last['macd'] > last['macd_signal']
     if uptrend_confirmed and macd_cross_up:
-        logger.info(f"  -> [{df.name}] ✅ إشارة استراتيجية Pullback MACD.")
+        # [V9.42.0] منطقة فيبوناتشي الذهبية: اشترِ التصحيح داخل الدفعة لا المطاردة عند القمة
+        fib_ok, fib_ev = _pullback_fib_zone_info(df)
+        if not fib_ok:
+            log_rejection(str(getattr(df, 'name', 'UNKNOWN')),
+                          "Pullback MACD خارج النطاق الذهبي لفيبوناتشي",
+                          {k: v for k, v in fib_ev.items() if k not in ('gate',)})
+            return False
+        logger.info(f"  -> [{df.name}] ✅ إشارة استراتيجية Pullback MACD "
+                    f"(تراجع فيبوناتشي {fib_ev.get('retrace_pct', '—')}% داخل النطاق الذهبي).")
         return True
     return False
 
@@ -3776,9 +3921,6 @@ def check_bullish_momentum_strategy(df: pd.DataFrame) -> bool:
     bullish_direction = last['plus_di'] > last['minus_di']
     rsi_is_bullish = 50 < last['rsi'] < 75
     
-    if len(df) < 8: 
-        return False
-        
     recent_highs = df['high'].iloc[-8:-1]
     recent_lows = df['low'].iloc[-8:-1]
     
@@ -4160,7 +4302,9 @@ ENTRY_QUALITY_PROFILES: Dict[str, Dict[str, Optional[float]]] = {
     #                     max_bounce_atr سقف استهلاك الارتداد عن قاع 7 شموع — للعائلة العكسية
     #                     max_body_atr سقف جسم شمعة الدخول بوحدات ATR (EMASkipPump للجميع)
     #                     min_eqs أدنى درجة جودة مركبة 0-100
-    'EMA_RSI_Cross':              {'min_excursion_pct': 0.60, 'max_ext_atr': 2.5, 'max_bounce_atr': None, 'max_body_atr': 2.0, 'min_eqs': 55},
+    'EMA_RSI_Cross':              {'min_excursion_pct': 0.60, 'max_ext_atr': 2.0, 'max_bounce_atr': None, 'max_body_atr': 2.0, 'min_eqs': 55},
+    # [V9.42.0] سقف مطاردة EMA_RSI 2.5→2.0×ATR: محاذاة Pullback — شراء التقاطع فوق
+    # EMA21 بـ 2.5×ATR هو شراء ممتد يُعاد تصحيحه فورًا (فائزون بضئيل وخاسرون كاملون)
     'Pullback_MACD':              {'min_excursion_pct': 0.60, 'max_ext_atr': 2.0, 'max_bounce_atr': None, 'max_body_atr': 2.0, 'min_eqs': 55},
     'Bullish_Momentum':           {'min_excursion_pct': 0.70, 'max_ext_atr': 2.5, 'max_bounce_atr': None, 'max_body_atr': 2.5, 'min_eqs': 55},
     # [V9.41.0] أرضية SR 0.85→0.60: المراقبة الحية سجّلت ~50 رفضًا/يوم بمدى متوقع 0.60-0.84%
@@ -4479,6 +4623,10 @@ def calculate_dynamic_tp_sl(df: pd.DataFrame, entry_price: float, is_long: bool 
         
         sl_distance = last['atr'] * atr_multiplier_sl
         tp_distance = last['atr'] * atr_multiplier_tp
+        # [V9.42.0] المسافة الحقيقية للمخاطرة (قبل سقف التقييد) — تُحمل في الصفقة ليحجم
+        # المركز على البعد الفعلي للوقف الديناميكي لا المقيد: السقف يقصّ سعر الوقف فقط
+        # (نمط freqtrade) لكنه لا يُكبّر المخاطرة بالدولار عند فجوة السعر عبر الوقف
+        risk_stop_distance = sl_distance
         # [V9.26.0] سقف مسافة الوقف — نمط freqtrade: وقف ثابت محدود النسبة دائمًا.
         # وقف ATR بلا سقف (2.5×ATR ×1.2 للأسواق المتقلبة) أنتج خسارة مفردة -10.67% (MET)
         # — خطر ذيل غير مقبول على محفظة صغيرة. السقف يقصّ الذيل فقط ولا يمس الوقوف العادية
@@ -4505,7 +4653,8 @@ def calculate_dynamic_tp_sl(df: pd.DataFrame, entry_price: float, is_long: bool 
             'target_price': round(take_profit, 6), 
             'stop_loss': round(stop_loss, 6),
             'source': 'DYNAMIC_ATR_BASED_V2', 
-            'rr_ratio': round(rr_ratio, 2)
+            'rr_ratio': round(rr_ratio, 2),
+            'risk_stop_distance': round(risk_stop_distance, 6)  # [V9.42.0] قبل التقييد
         }
     except Exception as e:
         logger.error(f"❌ [{df.name}] خطأ في حساب TP/SL الديناميكي: {e}", exc_info=True)
@@ -4566,6 +4715,8 @@ def ft_initial_tp_sl(entry_price: float, spec: Dict[str, Any]) -> Dict[str, Any]
     base_pct = abs(float(spec.get('stoploss') or -0.05)) * 100.0
     eff_pct = min(base_pct, MAX_SL_DISTANCE_PCT) if MAX_SL_DISTANCE_PCT > 0 else base_pct
     stop_loss = entry_price * (1.0 - eff_pct / 100.0)
+    # [V9.42.0] المسافة الحقيقية = الكانوني قبل تقييد السقف — للمخاطرة لا لسعر التنفيذ
+    risk_stop_distance = entry_price * (base_pct / 100.0)
     roi_tbl = spec.get('minimal_roi') or {}
     roi0 = float(roi_tbl.get(0, roi_tbl.get('0', 0.05))) * 100.0
     roi0 = min(max(roi0, 0.5), 30.0)
@@ -4574,7 +4725,8 @@ def ft_initial_tp_sl(entry_price: float, spec: Dict[str, Any]) -> Dict[str, Any]
     return {'target_price': round(target, 6), 'stop_loss': round(stop_loss, 6),
             'initial_stop_loss': round(stop_loss, 6),
             'source': f"FREQTRADE_{spec.get('name', 'FT')}", 'rr_ratio': round(rr, 2),
-            'ft_stop_pct': round(eff_pct, 3), 'ft_roi0_pct': round(roi0, 2)}
+            'ft_stop_pct': round(eff_pct, 3), 'ft_roi0_pct': round(roi0, 2),
+            'risk_stop_distance': round(risk_stop_distance, 6)}  # [V9.42.0] الكانوني قبل السقف
 
 def _ft_elapsed_minutes(signal: Dict[str, Any]) -> Optional[float]:
     """عمر الصفقة بالدقائق من طابعها الزمني (نفس منطق الخروج الزمني V9.26)."""
@@ -4762,16 +4914,41 @@ def adjust_quantity_to_lot_size(symbol: str, quantity: float) -> Optional[Decima
         logger.error(f"[{symbol}] خطأ في تعديل الكمية لـ LOT_SIZE: {e}", exc_info=True)
         return None
 
-def calculate_position_size(symbol: str, entry_price: float, stop_loss_price: float) -> Optional[Decimal]:
+def _risk_quantity(risk_amount_usdt: float, risk_per_coin: float) -> Optional[Decimal]:
+    """[V9.42.0] نواة حساب الكمية من المخاطرة — دالة نقية قابلة للاختبار:
+    الكمية = مبلغ المخاطرة ÷ مسافة الوقف لكل وحدة. مسافة الوقف هنا هي المسافة
+    الحقيقية (قبل تقييد السقف) — درس MAGIC -6.26%: كان التقييد يُكبّر الكمية ثم
+    فجوة السعر عبر الوقف المقيد تتجاوز المخاطرة المعمم بها إلى 1.5×."""
+    try:
+        if risk_amount_usdt <= 0 or risk_per_coin <= 0:
+            return None
+        return Decimal(str(risk_amount_usdt)) / Decimal(str(risk_per_coin))
+    except Exception:
+        return None
+
+
+def calculate_position_size(symbol: str, entry_price: float, stop_loss_price: float,
+                            risk_stop_distance: Optional[float] = None) -> Optional[Decimal]:
     if not client: return None
     try:
         with risk_per_trade_lock: current_risk_percent = RISK_PER_TRADE_PERCENT
         balance_response = safe_get_asset_balance('USDT')
         available_balance = Decimal(balance_response['free'])
         risk_amount_usdt = available_balance * (Decimal(str(current_risk_percent)) / Decimal('100'))
-        risk_per_coin = Decimal(str(entry_price)) - Decimal(str(stop_loss_price))
+        # [V9.42.0] المقام = المسافة الحقيقية للوقف (قبل السقف) عند توفرها — وإلا الوقف المعطى
+        risk_per_coin: Optional[Decimal] = None
+        if risk_stop_distance is not None:
+            try:
+                _d = Decimal(str(risk_stop_distance))
+                if _d > 0: risk_per_coin = _d
+            except Exception:
+                risk_per_coin = None
+        if risk_per_coin is None:
+            risk_per_coin = Decimal(str(entry_price)) - Decimal(str(stop_loss_price))
         if risk_per_coin <= 0: log_rejection(symbol, "Invalid Position Size"); return None
-        initial_quantity = risk_amount_usdt / risk_per_coin
+        initial_quantity = _risk_quantity(float(risk_amount_usdt), float(risk_per_coin))
+        if initial_quantity is None or initial_quantity <= 0:
+            log_rejection(symbol, "Invalid Position Size"); return None
         adjusted_quantity = adjust_quantity_to_lot_size(symbol, float(initial_quantity))
         if adjusted_quantity is None or adjusted_quantity <= 0: log_rejection(symbol, "Lot Size Adjustment Failed"); return None
         notional_value = adjusted_quantity * Decimal(str(entry_price))
@@ -8784,12 +8961,32 @@ def main_loop_enhanced():
                             continue
 
                         logger.info(f"  -> [{symbol}] ✅ نجح فلتر دفتر الطلبات. جاري تحضير الصفقة...")
+                        # [V9.42.0] حقول فيبوناتشي لليوت: كاشف الموجة في الحلقة يعيد bool فقط
+                        # ('ELLIOTT': None في STRATEGY_SETUP_SCANNERS ⇒ setup_ev فارغ) — نعيد
+                        # فحص البنية على نفس الشموع (حتمي: نفس df ⇒ نفس المحاور) لدمج
+                        # p4/w3/w1/fib_tp1/struct_stop في أدلة الإشارة قبل محرك الفتح
+                        if strategy_used == 'Elliott_Impulse':
+                            _ok_ell, _ell_ev = _elliott_w4_setup_info(df_with_indicators)
+                            if _ok_ell:
+                                signal_evidence_info = {**_ell_ev, **(signal_evidence_info or {})}
                         # [V9.29.0] صفقات freqtrade الأصلية: وقف/هدف من مواصفة الاستراتيجية نفسها
                         # (وقف الكانوني مقيّد بسقف الحماية 6%، والهدف = ROI عند 0 دقيقة)
                         _ft_spec_open = FREQTRADE_STRATEGIES.get(strategy_used)
                         if _ft_spec_open is not None:
                             tp_sl_data = ft_initial_tp_sl(entry_price, _ft_spec_open)
+                        elif (strategy_used == 'Elliott_Impulse'
+                              and isinstance(signal_evidence_info, dict)
+                              and signal_evidence_info.get('fib_tp1') is not None
+                              and signal_evidence_info.get('p4') is not None):
+                            # [V9.42.0] TP/SL فيبوناتشي لليوت: هدف امتداد 0.618×W3 من قاع W4
+                            # + وقف بنيوي تحت القاع — منطق الفتح/الغلق من بنية الدافع لا من ATR العام
+                            tp_sl_data = calculate_elliott_tp_sl(entry_price, signal_evidence_info)
+                            if tp_sl_data is not None:
+                                logger.info(f"  -> [{symbol}] 📐 TP/SL فيبوناتشي لليوت: هدف {tp_sl_data['target_price']:.6g} "
+                                            f"(0.618×W3 من قاع W4) ووقف بنيوي {tp_sl_data['stop_loss']:.6g} — R:R {tp_sl_data['rr_ratio']}")
                         else:
+                            tp_sl_data = calculate_dynamic_tp_sl(df_with_indicators, entry_price)
+                        if tp_sl_data is None and strategy_used == 'Elliott_Impulse':
                             tp_sl_data = calculate_dynamic_tp_sl(df_with_indicators, entry_price)
                         if not tp_sl_data: continue
 
@@ -8828,7 +9025,8 @@ def main_loop_enhanced():
                             log_rejection(symbol, "Execution Deferred (Binance Ban)", {'ban_remain_sec': int(ban_remain)})
                             continue
                         if is_enabled:
-                            quantity = calculate_position_size(symbol, entry_price, new_signal['stop_loss'])
+                            quantity = calculate_position_size(symbol, entry_price, new_signal['stop_loss'],
+                                                               new_signal.get('risk_stop_distance'))
                             if quantity and quantity > 0:
                                 order_result = place_order(symbol, Client.SIDE_BUY, quantity)
                                 if order_result:
